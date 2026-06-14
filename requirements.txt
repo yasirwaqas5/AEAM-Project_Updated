@@ -1,0 +1,49 @@
+# ============================================================
+# AEAM — Autonomous Enterprise AI Agent Mesh
+# Python dependencies
+# ============================================================
+
+# --- Web framework ---
+fastapi
+uvicorn[standard]
+
+# --- Data validation ---
+pydantic
+pydantic-settings
+
+# --- Database ---
+sqlalchemy
+psycopg2-binary
+
+# --- Cache / message broker ---
+redis
+
+# --- Environment ---
+python-dotenv
+
+# --- HTTP client ---
+requests
+
+# --- ML / Embeddings ---
+sentence-transformers
+numpy
+pandas
+scikit-learn
+
+# --- Forecasting ---
+prophet
+
+# --- Vector DB ---
+qdrant-client
+
+# --- Google Cloud ---
+google-cloud-secret-manager
+google-api-python-client
+
+# --- Authentication ---
+PyJWT[cryptography]
+cryptography
+
+# --- Observability ---
+structlog
+prometheus-client

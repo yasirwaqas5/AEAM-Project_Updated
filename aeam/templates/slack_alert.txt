@@ -1,0 +1,10 @@
+🚨 AEAM ALERT
+
+Event:    {event_type}
+Severity: {severity}
+
+Summary:
+{summary}
+
+Action:
+{action}

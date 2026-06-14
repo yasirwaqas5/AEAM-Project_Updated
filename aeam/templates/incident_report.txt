@@ -1,0 +1,25 @@
+You are an enterprise AI system generating an incident report.
+
+INCIDENT DETAILS:
+- Event:    {event_type}
+- Severity: {severity}
+- Metric:   {metric}
+
+FINDINGS:
+{findings}
+
+ROOT CAUSE:
+{root_cause}
+
+EVIDENCE:
+{evidence}
+
+ACTIONS TAKEN:
+{actions_taken}
+
+INSTRUCTIONS:
+- Generate a clear executive summary
+- Provide detailed explanation
+- Maintain professional tone
+- Avoid speculation
+- Be concise but informative

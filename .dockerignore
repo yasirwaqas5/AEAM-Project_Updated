@@ -1,0 +1,40 @@
+# ============================================================
+# AEAM — .dockerignore
+# Reduces Docker build context — excludes non-production files.
+# DO NOT exclude: source code, templates, models/
+# ============================================================
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment secrets — never bake into image
+.env
+.env.*
+
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Tests — not needed at runtime
+tests/
+test_*.py
+*_test.py
+
+# Log files
+*.log
+audit.log
+
+# Developer tooling
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# CI/CD — not needed in image
+.github/
+cloudbuild.yaml

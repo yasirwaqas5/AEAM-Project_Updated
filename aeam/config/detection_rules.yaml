@@ -1,0 +1,65 @@
+# aeam/config/detection_rules.yaml
+#
+# Human-defined deterministic detection thresholds for AEAM.
+#
+# These rules are the single source of truth for threshold-based anomaly
+# detection. They are loaded at startup and consumed by detector modules —
+# never hardcoded in application code.
+#
+# Schema
+# ------
+# Each top-level key is a metric domain (e.g. "sales", "complaints").
+# Values are flat mappings of threshold name → numeric value.
+#
+# Units
+# -----
+#   *_percent         : percentage points (0–100)
+#   *_threshold       : absolute count of events / units
+#   absolute_minimum  : absolute currency / unit floor
+#   *_days            : integer number of calendar days
+#
+# Editing guidelines
+# ------------------
+# - All values must be positive numbers.
+# - Changes here take effect on the next application restart (no hot-reload).
+# - Add a comment for any non-obvious threshold explaining the business rationale.
+version: 1.0
+# ---------------------------------------------------------------------------
+# Sales
+# ---------------------------------------------------------------------------
+sales:
+  # Trigger an alert if same-day revenue falls more than 15% vs. the prior day.
+  daily_drop_percent: 15
+
+  # Trigger an alert if 7-day rolling revenue falls more than 20% vs. the
+  # equivalent prior week window.
+  weekly_drop_percent: 20
+
+  # Trigger a CRITICAL alert regardless of percentage if daily revenue drops
+  # below this absolute floor (currency units match the reporting currency).
+  absolute_minimum: 50000
+
+# ---------------------------------------------------------------------------
+# Complaints
+# ---------------------------------------------------------------------------
+complaints:
+  # Trigger an alert if the number of new complaints received in a single day
+  # exceeds this count. Counts inbound tickets across all channels.
+  daily_increase_threshold: 30
+
+  # Number of calendar days used to compute the rolling complaint rate baseline.
+  # Increasing this value smooths out short-term spikes; decreasing it makes
+  # detection more reactive.
+  rolling_window_days: 7
+
+# ---------------------------------------------------------------------------
+# Inventory
+# ---------------------------------------------------------------------------
+inventory:
+  # Trigger a HIGH-severity alert when on-hand stock for any SKU falls at or
+  # below this unit count.
+  low_stock_threshold: 50
+
+  # Trigger a CRITICAL-severity alert when on-hand stock falls at or below
+  # this unit count. Must be strictly less than low_stock_threshold.
+  critical_threshold: 10
