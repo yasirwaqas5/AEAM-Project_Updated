@@ -104,21 +104,23 @@ class EmbeddingService:
         for cosine similarity to equal the dot product.
 
         Args:
-            text: Input string to encode. If empty or whitespace-only, returns
-                  an empty list.
+            text: Input string to encode. Must not be empty or whitespace-only.
 
         Returns:
-            A ``list[float]`` of length 384, or an empty list if input is empty.
+            A ``list[float]`` of length 384.
+
+        Raises:
+            ValueError: If ``text`` is empty or whitespace-only.
 
         Example::
 
             vec = service.encode_text("Memory leak in payment service")
             assert len(vec) == 384
-            empty = service.encode_text("")
-            assert empty == []
         """
         if not text or not text.strip():
-            return []
+            raise ValueError(
+                "encode_text() requires a non-empty, non-whitespace string."
+            )
 
         embedding = self._model.encode(
             text,
@@ -134,37 +136,45 @@ class EmbeddingService:
 
         Processes all texts in a single forward pass, which is significantly
         more efficient than calling :meth:`encode_text` in a loop for large
-        batches. Empty or whitespace-only strings are silently skipped; the
-        output list contains vectors only for the non‑empty inputs, preserving
-        order relative to the original list (empty entries produce no vector).
+        batches. Output order matches input order.
 
         Args:
-            texts: List of input strings. May be empty or contain empty strings.
+            texts: List of input strings. Must not be empty. Each element must
+                   be a non-empty, non-whitespace string.
 
         Returns:
-            A ``list[list[float]]`` of vectors for the non‑empty inputs. If the
-            input list is empty or all strings are empty, returns an empty list.
+            A ``list[list[float]]`` of length ``len(texts)``, where each inner
+            list has length 384.
+
+        Raises:
+            ValueError: If ``texts`` is empty, or if any element is empty or
+                        whitespace-only. The index of the offending element is
+                        included in the error message.
 
         Example::
 
             vecs = service.encode_batch([
                 "CPU spike detected",
-                "",
+                "Memory usage elevated",
                 "Disk I/O saturated",
             ])
-            # vecs contains two vectors (for first and last items)
-            assert len(vecs) == 2
+            assert len(vecs) == 3
             assert len(vecs[0]) == 384
         """
         if not texts:
-            return []
+            raise ValueError(
+                "encode_batch() requires a non-empty list of strings."
+            )
 
-        clean_texts = [t for t in texts if t and t.strip()]
-        if not clean_texts:
-            return []
+        for i, text in enumerate(texts):
+            if not text or not text.strip():
+                raise ValueError(
+                    f"encode_batch() received an empty or whitespace-only string "
+                    f"at index {i}."
+                )
 
         embeddings = self._model.encode(
-            clean_texts,
+            texts,
             normalize_embeddings=True,
             convert_to_numpy=True,
             batch_size=32,

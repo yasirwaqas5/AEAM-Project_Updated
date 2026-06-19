@@ -213,12 +213,9 @@ class ActionAgent:
         self._settings: Any = settings
 
         # Build action registry — all integrations called through this dict.
-        # SlackActions: use settings if provided (new style), else fallback to secret_manager.
-        slack_handler: SlackActions
-        if settings is not None:
-            slack_handler = SlackActions(secret_manager=secret_manager)
-        else:
-            slack_handler = SlackActions(secret_manager=secret_manager)
+        # Pass both settings and secret_manager to SlackActions; it will prefer settings.
+        slack_handler = SlackActions(settings=settings, secret_manager=secret_manager)
+
         # Start with base registry (excluding Jira for now)
         self._registry: dict[str, Any] = {
             "slack":   slack_handler,
@@ -230,8 +227,6 @@ class ActionAgent:
         # Conditionally add Jira if settings provide JIRA_URL
         if settings and hasattr(settings, 'JIRA_URL') and settings.JIRA_URL:
             self._registry["jira"] = JiraActions(settings=settings)
-            # 🔧 FIX: removed the manual circuit breaker assignment here
-            # The circuit breakers are built below from the final registry.
             logger.info("Jira action registered.")
         else:
             # Jira not configured; omit from registry

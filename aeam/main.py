@@ -49,7 +49,7 @@ from aeam.security.audit_logger import AuditLogger
 from aeam.connectors.sheets import SheetsConnector
 
 # Action Agent imports (Phase 6)
-from aeam.agents.action.action_agent import ActionAgent
+from aeam.agents.action.action_agent import ActionAgent, CircuitBreaker
 from aeam.agents.action.slack_actions import SlackActions
 from aeam.integrations.secret_manager import SecretManager
 from aeam.core.idempotency import IdempotencyManager
@@ -216,13 +216,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     settings = Settings()  # pyright: ignore[reportCallIssue]
 
-    # ========== DEBUG BLOCK – REMOVE AFTER FIXING JIRA_ISSUE_TYPE ==========
-    import os
-    import dotenv
-    dotenv.load_dotenv()
-    print("DEBUG JIRA_ISSUE_TYPE from os.environ:", repr(os.environ.get("JIRA_ISSUE_TYPE")))
-    # ========== END DEBUG BLOCK ==========
-
     logger.info("Settings loaded | environment=%r", settings.ENVIRONMENT)
 
     container = _build_container(settings)
@@ -232,7 +225,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Orchestrator Wiring (Phase 3)
     # -----------------------------
     llm_service = LLMService(settings=settings)
-    print(f"DEBUG: LLM service created, use_mock={llm_service.use_mock}, enabled={settings.LLM_ENABLED}")
     # Ensure compatibility with DecisionEngine's protocol
     # if not isinstance(llm_service, DecisionEngine.LLMService):
     #     from aeam.agents.orchestrator.decision_engine import LLMService as ProtocolLLM
@@ -282,6 +274,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         # SlackActions registration is now handled inside ActionAgent.__init__
         logger.info("ActionAgent initialised with Slack action.")
+
+        # Register Jira if credentials are present
+        if settings.JIRA_URL and settings.JIRA_API_TOKEN:
+            from aeam.agents.action.jira_actions import JiraActions
+            jira = JiraActions(settings=settings)
+            # Directly add to registry and circuit breakers
+            action_agent._registry["jira"] = jira   # <-- register the whole instance
+            action_agent._circuit_breakers["jira"] = CircuitBreaker(
+                failure_threshold=3,
+                timeout_seconds=60,
+            )
+            logger.info("Jira action registered.")
     else:
         logger.info("No Slack bot token – ActionAgent not created.")
 

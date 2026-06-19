@@ -18,6 +18,7 @@ ShortTermMemory and IncidentStateMachine.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from typing import TYPE_CHECKING, Any
@@ -30,6 +31,7 @@ from aeam.core.event_bus import EventBus
 from aeam.core.event_models import Event
 from aeam.memory.long_term import LongTermMemory
 from aeam.memory.short_term import ShortTermMemory
+from aeam.services.llm_service import LLMService
 
 if TYPE_CHECKING:
     from aeam.agents.report.report_agent import ReportAgent
@@ -220,7 +222,7 @@ class Orchestrator:
             memory=self._stm,
         )
 
-        # ✅ NEW: store LLM response if present
+        # ✅ NEW: store LLM response if present (from the decision engine)
         if decision_result.get("source") == "llm":
             self._stm.set("llm_response", decision_result.get("llm_response", ""))
 
@@ -297,6 +299,46 @@ class Orchestrator:
 
         # Always run the KPI placeholder (can be replaced later with actual KPI Agent)
         self._run_kpi_investigation_placeholder()
+
+        # ---------- Force LLM reasoning at depth >= 3 ----------
+        if depth >= 3 and self._settings.LLM_ENABLED:
+            logger.info("investigate | triggering LLM reasoning at depth %d", depth)
+            try:
+                llm = LLMService(settings=self._settings)
+
+                # Build a structured prompt
+                prompt = f"""
+You are an expert business analyst. Based on the following incident details,
+provide a concise root cause analysis and recommended actions.
+
+Incident:
+- Metric: {self._active_event.metric}
+- Current value: {self._active_event.current_value}
+- Expected value: {self._active_event.expected_value}
+- Severity: {self._active_event.severity}
+- Detection methods: {', '.join(self._active_event.detection_methods)}
+
+Short‑Term Memory findings:
+{self._stm.serialize_for_llm()}
+
+Return a JSON object with:
+- root_cause (string)
+- confidence (float 0-1)
+- recommended_action (string)
+"""
+                raw = llm.query(prompt, temperature=0.2, max_tokens=500)
+                insight = json.loads(raw)
+
+                # Update STM with the LLM output
+                self._stm.set("root_cause", insight.get("root_cause", "Unknown"))
+                self._stm.set("confidence", insight.get("confidence", 0.0))
+                self._stm.set("llm_response", raw)
+
+                logger.info("investigate | LLM reasoning stored successfully")
+            except Exception as exc:
+                logger.warning("investigate | LLM reasoning failed: %s", exc)
+                # Keep the existing placeholder root cause (already set in _run_kpi_investigation_placeholder)
+
         self.evaluate()
 
     def evaluate(self) -> None:
@@ -336,7 +378,6 @@ class Orchestrator:
             # Phase 6: Execute external actions if ActionAgent is available.
             if self._action is not None:
                 incident_id = self._stm.get("incident_id")
-                # Send actions for HIGH/CRITICAL incidents
                 severity = self._active_event.severity.upper() if self._active_event else "UNKNOWN"
                 if severity in ("HIGH", "CRITICAL"):
                     # Slack alert
@@ -350,7 +391,8 @@ class Orchestrator:
                             f"Current value: {self._active_event.current_value}\n"
                             f"Expected value: {self._active_event.expected_value}\n"
                             f"Detection methods: {', '.join(self._active_event.detection_methods)}\n"
-                            f"Root cause: {self._stm.get('root_cause', 'Unknown')}"
+                            f"Root cause: {self._stm.get('root_cause', 'Unknown')}\n"
+                            f"LLM Insight: {self._stm.get('llm_response', 'Not available')[:200]}..."
                         ),
                         "severity": self._active_event.severity,
                     }
@@ -370,9 +412,11 @@ class Orchestrator:
                             incident_id, exc,
                         )
 
+                    # DEBUG: print the condition status
+                    print(f">>> JIRA CONDITION CHECK: URL={'OK' if self._settings.JIRA_URL else 'MISSING'}  TOKEN={'OK' if self._settings.JIRA_API_TOKEN else 'MISSING'}")
+
                     # Jira ticket creation (if Jira is configured)
                     if self._settings.JIRA_URL and self._settings.JIRA_API_TOKEN:
-                        # Map AEAM severity to Jira priority names
                         priority_map = {
                             "HIGH": "High",
                             "CRITICAL": "Highest",
@@ -582,7 +626,7 @@ class Orchestrator:
         new_confidence = min(current_confidence + 0.3, 1.0)
         self._stm.set("confidence", round(new_confidence, 2))
 
-        # On the second pass, simulate root cause identification.
+        # On the second pass, simulate root cause identification (placeholder).
         if depth >= 2 and not self._stm.get("root_cause"):
             self._stm.set(
                 "root_cause",

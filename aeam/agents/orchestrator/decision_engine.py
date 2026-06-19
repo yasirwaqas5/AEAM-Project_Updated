@@ -177,7 +177,7 @@ class DecisionEngine:
             "HIGH": {
                 "decision": "INVESTIGATE",
                 "agents": ["KPI", "RAG"],
-                "confidence": 0.90,
+                "confidence": 0.90,   # <-- restored to original value
             },
         }
 

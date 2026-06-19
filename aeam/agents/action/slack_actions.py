@@ -49,28 +49,30 @@ class SlackActions:
     """
     Slack alert integration for the AEAM Action layer.
 
-    Retrieves the bot token from the injected ``secret_manager``, builds a
-    Block Kit message with a severity-coloured attachment, and POSTs to the
-    Slack ``chat.postMessage`` API. Raises on HTTP errors or on a Slack API
-    ``"ok": false`` response.
+    Retrieves the bot token and default channel either from the injected
+    ``settings`` object (preferred) or from a ``secret_manager``.
+    Builds a Block Kit message with a severity-coloured attachment, and POSTs
+    to the Slack ``chat.postMessage`` API. Raises on HTTP errors or on a
+    Slack API ``"ok": false`` response.
 
     This class:
     - Contains no retry logic (ActionAgent handles retries).
     - Makes no LLM calls.
     - Contains no decision or Orchestrator logic.
 
-    Secrets expected from ``secret_manager``:
-    - ``"slack_bot_token"`` — Slack Bot OAuth token (``xoxb-...``).
-
     Args:
-        secret_manager: Secrets provider with a ``get(key: str) -> str`` interface.
+        settings:       Optional application settings object (provides
+                        ``SLACK_BOT_TOKEN`` and ``SLACK_CHANNEL``).
+        secret_manager: Optional secrets provider with a ``get(key)`` method.
+                        Used as fallback if ``settings`` is not provided.
 
     Raises:
-        ValueError: If ``secret_manager`` is None.
+        ValueError: If neither ``settings`` nor ``secret_manager`` is provided,
+                    or if the token cannot be obtained.
 
     Example::
 
-        slack = SlackActions(secret_manager=secret_manager)
+        slack = SlackActions(settings=settings)
         result = slack.execute({
             "channel":  "#ops-alerts",
             "message":  "CPU spike detected on web-01.",
@@ -79,19 +81,29 @@ class SlackActions:
         # {"ts": "1712345678.000100", "channel": "C01234ABCD"}
     """
 
-    def __init__(self, secret_manager: Any) -> None:
+    def __init__(self, settings: Any = None, secret_manager: Any = None) -> None:
         """
-        Initialise SlackActions with an injected secrets provider.
+        Initialise SlackActions with either a settings object or a secret manager.
 
         Args:
-            secret_manager: Secrets provider. Must not be None.
+            settings:       Application settings (preferred).
+            secret_manager: Secrets provider (fallback).
 
         Raises:
-            ValueError: If ``secret_manager`` is None.
+            ValueError: If neither is provided or token cannot be retrieved.
         """
-        if secret_manager is None:
-            raise ValueError("secret_manager must not be None.")
-        self._secrets: Any = secret_manager
+        if settings is not None:
+            self.token = getattr(settings, "SLACK_BOT_TOKEN", "")
+            self.channel = getattr(settings, "SLACK_CHANNEL", "#aeam-alerts")
+            if not self.token:
+                raise ValueError("settings.SLACK_BOT_TOKEN must be non-empty.")
+        elif secret_manager is not None:
+            self.token = secret_manager.get("slack_bot_token")
+            self.channel = "#aeam-alerts"
+            if not self.token:
+                raise ValueError("secret_manager returned empty slack_bot_token.")
+        else:
+            raise ValueError("Either settings or secret_manager must be provided.")
 
     # ------------------------------------------------------------------
     # ActionAgent registry interface
@@ -118,8 +130,9 @@ class SlackActions:
         Send a formatted incident alert to a Slack channel.
 
         Steps:
-        1. Retrieve ``slack_bot_token`` from ``SecretManager``.
+        1. Use the stored token from initialisation.
         2. Validate required parameters (``channel``, ``message``).
+           If ``channel`` is not provided, fall back to ``self.channel``.
         3. Build a Block Kit message payload with a severity-coloured
            attachment sidebar.
         4. POST to ``https://slack.com/api/chat.postMessage``.
@@ -136,8 +149,8 @@ class SlackActions:
         Args:
             params: Dict containing:
 
-                - ``"channel"``    *(required)* — Slack channel name or ID
-                  (e.g. ``"#ops-alerts"`` or ``"C01234ABCD"``).
+                - ``"channel"``    *(optional)* — Slack channel name or ID.
+                  Defaults to ``self.channel``.
                 - ``"message"``    *(required)* — main alert body text.
                 - ``"severity"``   *(optional)* — one of ``"CRITICAL"``,
                   ``"HIGH"``, ``"MEDIUM"``, ``"LOW"``. Defaults to ``"MEDIUM"``.
@@ -155,8 +168,7 @@ class SlackActions:
                 }
 
         Raises:
-            ValueError:               If ``channel`` or ``message`` is missing
-                                      or blank.
+            ValueError:               If ``message`` is missing or blank.
             requests.HTTPError:       If the HTTP request fails (non-200).
             requests.Timeout:         If the request exceeds 10 seconds.
             requests.ConnectionError: If the Slack API is unreachable.
@@ -173,13 +185,15 @@ class SlackActions:
                 "incident_id": "INC-42",
             })
         """
-        # Step 1: retrieve token.
-        bot_token: str = self._secrets.get("slack_bot_token")
+        # Step 1: token is already stored in self.token.
+        bot_token: str = self.token
 
-        # Step 2: validate required parameters.
+        # Step 2: validate required parameters (channel uses default).
         channel: str = params.get("channel", "").strip()
         if not channel:
-            raise ValueError("params['channel'] must be a non-empty string.")
+            channel = self.channel
+            if not channel:
+                raise ValueError("No channel provided and no default channel available.")
 
         message: str = params.get("message", "").strip()
         if not message:
