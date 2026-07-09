@@ -174,6 +174,10 @@ def list_agent_logs(request: Request):
                 "retry_count": meta.get("retry_count"),
                 "failure_reason": meta.get("failure_reason"),
                 "validation_result": meta.get("validation_result"),
+                # Granular payload validation errors (e.g. Slack invalid_blocks
+                # detail list), when the failure originated from a structured
+                # NonRetryableActionError.
+                "validation_details": meta.get("details"),
                 "timestamp": (
                     row["timestamp"].isoformat()
                     if hasattr(row["timestamp"], "isoformat")

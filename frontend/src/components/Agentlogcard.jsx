@@ -1,4 +1,4 @@
-import { Card, Badge, Field, Icon, stateColor, fmtTime, fmtRelative, fmtMs } from "./ui";
+import { Card, Badge, Field, Icon, Collapsible, stateColor, fmtTime, fmtRelative, fmtMs } from "./ui";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * A single agent-execution log entry, rendered as an enterprise card:
@@ -9,7 +9,8 @@ import { Card, Badge, Field, Icon, stateColor, fmtTime, fmtRelative, fmtMs } fro
 export default function AgentLogCard({ log }) {
   const {
     agent, incident_id, status,
-    execution_time_ms, retry_count, failure_reason, validation_result, timestamp,
+    execution_time_ms, retry_count, failure_reason, validation_result,
+    validation_details, timestamp,
   } = log;
 
   const statusColor = stateColor(status);
@@ -43,6 +44,19 @@ export default function AgentLogCard({ log }) {
           <Icon name="alert" size={14} color="#ff5f57" style={{ marginTop: 1 }} />
           <span><strong style={{ color: "#ff5f57" }}>Reason:</strong> {failure_reason ?? "Unknown failure"}</span>
         </div>
+      )}
+
+      {/* Granular payload validation errors (e.g. Slack invalid_blocks detail) */}
+      {Array.isArray(validation_details) && validation_details.length > 0 && (
+        <Collapsible summary={`Payload validation details (${validation_details.length})`}>
+          <ul style={{ margin: 0, paddingLeft: "1.1rem", display: "flex", flexDirection: "column", gap: "0.3rem" }}>
+            {validation_details.map((d, i) => (
+              <li key={i} style={{ fontSize: "0.74rem", color: "var(--muted)", fontFamily: "var(--font-mono)" }}>
+                {typeof d === "string" ? d : JSON.stringify(d)}
+              </li>
+            ))}
+          </ul>
+        </Collapsible>
       )}
 
       {/* Meta grid */}

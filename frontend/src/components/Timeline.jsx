@@ -1,27 +1,59 @@
-import { Icon, STATE, parseMaybeJSON, getRetrievedCount } from "./ui";
+import {
+  Icon, STATE,
+  getRetrievedCount, getValidationStatus, getActionOutcome, actionLabel,
+} from "./ui";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Incident timeline — the fixed AEAM pipeline
  *   Trigger → Investigation → RAG → Validation → Action → Jira → Slack → Email
- * Each stage's state is derived from fields persisted on the incident. Stages
- * whose outcome the incident record does not capture (Jira / Email per-channel
- * results) are shown as "pending" rather than asserted, so the flow is never
- * misrepresented.
+ * Every stage's state is derived from the incident's audit_summary (see
+ * aeam/agents/orchestrator/orchestrator.py::finalize_incident) — Jira/Slack/
+ * Email each reflect their OWN real executed/skipped outcome and reason
+ * instead of being inferred from a single shared boolean.
  * ────────────────────────────────────────────────────────────────────────── */
 
+/**
+ * Resolve a timeline stage's outcome, checking every alias that could have
+ * produced it (e.g. the Slack stage must reflect either a "slack" or a
+ * "marketing_slack" runbook step — both post through the same real Slack
+ * integration, just to different channels). Checks executed first across
+ * all aliases, then skipped/failed across all aliases, so a FAILED
+ * marketing_slack attempt is never mistaken for "not part of the runbook."
+ */
+function outcomeFor(actionTypes, outcome) {
+  const types = Array.isArray(actionTypes) ? actionTypes : [actionTypes];
+
+  for (const t of types) {
+    if (outcome.executed.includes(t)) {
+      return { state: "done", detail: actionLabel(t) };
+    }
+  }
+  for (const t of types) {
+    const skip = outcome.skipped.find((s) => s.action === t);
+    if (skip) return { state: "failed", detail: `${actionLabel(t)} — ${skip.reason}` };
+  }
+  return { state: "pending", detail: "not part of this incident's runbook" };
+}
+
 function buildStages(incident) {
-  const rag = parseMaybeJSON(incident?.llm_response);
-  const ragFindings = rag?.findings || {};
   const retrieved = getRetrievedCount(incident);
-  const validationPassed = ragFindings.validation_passed;
-  const actionTaken = !!incident?.action_taken;
+  const validation = getValidationStatus(incident);
+  const outcome = getActionOutcome(incident);
   const requiresHuman = !!incident?.requires_human;
   const hasDepth = incident?.investigation_depth != null;
 
-  const ragState = retrieved > 0 || rag ? "done" : "pending";
+  const ragState = retrieved > 0 ? "done" : (validation.status === "SKIPPED" ? "pending" : "failed");
+
   const validationState =
-    validationPassed === true ? "done" :
-    validationPassed === false ? "failed" : (rag ? "pending" : "idle");
+    validation.status === "PASSED" ? "done" :
+    validation.status === "FAILED" ? "failed" :
+    validation.status === "SKIPPED" ? "skipped" : "pending";
+
+  const anyActionExecuted = outcome.executed.length > 0;
+
+  const jira = outcomeFor("jira", outcome);
+  const slack = outcomeFor(["slack", "marketing_slack"], outcome);
+  const email = outcomeFor("email", outcome);
 
   return [
     { key: "trigger", icon: "bolt", label: "Trigger", state: "done",
@@ -31,13 +63,14 @@ function buildStages(incident) {
     { key: "rag", icon: "database", label: "RAG Retrieval", state: ragState,
       detail: `${retrieved} chunk${retrieved !== 1 ? "s" : ""} retrieved` },
     { key: "validation", icon: "shield", label: "Validation", state: validationState,
-      detail: validationPassed === true ? "grounding passed" : validationPassed === false ? "grounding failed" : "—" },
-    { key: "action", icon: "zap", label: "Action", state: actionTaken ? "done" : (requiresHuman ? "skipped" : "pending"),
-      detail: requiresHuman ? "escalated to human" : actionTaken ? "actions dispatched" : "no action" },
-    { key: "jira", icon: "ticket", label: "Jira", state: "pending", detail: "ticket status not recorded" },
-    { key: "slack", icon: "message", label: "Slack", state: actionTaken ? "done" : "pending",
-      detail: actionTaken ? "alert sent" : "—" },
-    { key: "email", icon: "mail", label: "Email", state: "pending", detail: "requires GCP credentials" },
+      detail: `${validation.status} — ${validation.reason}` },
+    { key: "action", icon: "zap", label: "Action", state: anyActionExecuted ? "done" : (requiresHuman ? "skipped" : "pending"),
+      detail: anyActionExecuted
+        ? `${outcome.executed.length} action${outcome.executed.length !== 1 ? "s" : ""} executed`
+        : (requiresHuman ? "escalated to human" : "no action") },
+    { key: "jira", icon: "ticket", label: "Jira", state: jira.state, detail: jira.detail },
+    { key: "slack", icon: "message", label: "Slack", state: slack.state, detail: slack.detail },
+    { key: "email", icon: "mail", label: "Email", state: email.state, detail: email.detail },
   ];
 }
 
@@ -70,7 +103,7 @@ function StageRow({ stage, last }) {
             borderRadius: 20, padding: "0.1rem 0.5rem",
           }}>{stage.state}</span>
         </div>
-        <div style={{ fontSize: "0.73rem", color: "var(--muted)", marginTop: "0.25rem" }}>{stage.detail}</div>
+        <div style={{ fontSize: "0.73rem", color: "var(--muted)", marginTop: "0.25rem", wordBreak: "break-word" }}>{stage.detail}</div>
       </div>
     </div>
   );

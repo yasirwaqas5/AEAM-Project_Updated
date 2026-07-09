@@ -12,7 +12,9 @@ Constraints:
 - No LLM calls.
 - Forecasting only via injected ForecastAgent.
 - No orchestrator logic.
-- No database writes.
+- No direct database access — metric persistence (Phase 5) is delegated to
+  an injected LongTermMemory, the same indirection ForecastAgent already
+  uses to read that same data back for training.
 - No external API calls.
 - All dependencies are injected; no globals.
 """
@@ -24,7 +26,7 @@ import time
 import uuid
 from aeam.monitoring.logging_config import get_logger
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from aeam.agents.kpi.rule_engine import RuleEngine
 from aeam.agents.kpi.statistical_detector import StatisticalDetector
@@ -33,6 +35,7 @@ from aeam.core.deduplication import EventDeduplicator
 from aeam.core.event_bus import EventBus
 from aeam.core.event_models import Event
 from aeam.core.priority_queue import EventPriorityQueue
+from aeam.monitoring.metrics import agent_execution_time, end_timer, start_timer
 from aeam.pipelines.structured_data_pipeline import StructuredDataPipeline
 
 # Type hint only – actual import will be resolved at runtime
@@ -41,6 +44,48 @@ if TYPE_CHECKING:
     from aeam.agents.forecast.forecast_agent import ForecastAgent
 
 logger = get_logger(__name__, agent="monitor")
+
+
+# ---------------------------------------------------------------------------
+# KPI row-source protocol
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class KPIRowSource(Protocol):
+    """
+    Structural protocol for a tabular KPI feed used by :meth:`MonitorAgent._run_cycle`.
+
+    ``aeam.connectors.sheets.SheetsConnector`` already satisfies this protocol
+    without any change — this exists so ``MonitorAgent`` depends on an
+    abstract data source (mirroring ``ForecastAgent``'s ``HistoricalDataSource``
+    pattern) instead of importing a concrete connector directly.
+    """
+
+    def fetch_rows(self, sheet_name: str) -> list[dict[str, Any]]:
+        """
+        Return data rows as a list of dicts keyed by column header.
+
+        Implementations must degrade to an empty list on any failure or when
+        disabled — never raise.
+        """
+        ...
+
+
+@runtime_checkable
+class MetricsSink(Protocol):
+    """
+    Structural protocol for the metric-persistence half of LongTermMemory.
+
+    ``aeam.memory.long_term.LongTermMemory`` already satisfies this without
+    any change — this exists so ``MonitorAgent`` depends on the same narrow
+    abstraction ``ForecastAgent`` uses (``HistoricalDataSource``), not the
+    concrete DB-backed class.
+    """
+
+    def store_metrics(self, metrics: list[dict[str, Any]]) -> None:
+        """Persist metric observation dicts (``metric``, ``value``, ``timestamp``)."""
+        ...
 
 
 class MonitorAgent:
@@ -71,6 +116,20 @@ class MonitorAgent:
         settings:             Application configuration (provides
                               ``MONITOR_INTERVAL_SECONDS`` and
                               ``MAX_INVESTIGATION_DEPTH``).
+        kpi_source:           Optional :class:`KPIRowSource` (e.g. a
+                              ``SheetsConnector``) polled once per cycle by
+                              :meth:`_run_cycle`. When ``None`` (default),
+                              the cycle is a safe no-op tick — matching the
+                              agent's prior placeholder behaviour and keeping
+                              every existing caller (tests, ``run_simulation.py``)
+                              unaffected.
+        long_term_memory:     Optional :class:`MetricsSink` (e.g. a
+                              ``LongTermMemory`` instance). When provided,
+                              :meth:`_run_cycle` persists each cycle's latest
+                              observation per metric via ``store_metrics()``,
+                              so :class:`ForecastAgent` has real training
+                              history to read back. ``None`` (default) skips
+                              persistence — unchanged prior behaviour.
 
     Example::
 
@@ -97,6 +156,8 @@ class MonitorAgent:
         forecast_agent: 'ForecastAgent',  # injected Phase 5 dependency
         pipeline: StructuredDataPipeline,
         settings: Settings,
+        kpi_source: KPIRowSource | None = None,
+        long_term_memory: MetricsSink | None = None,
     ) -> None:
         self._bus = event_bus
         self._queue = queue
@@ -106,6 +167,13 @@ class MonitorAgent:
         self._forecast = forecast_agent
         self._pipeline = pipeline
         self._settings = settings
+        self._kpi_source = kpi_source
+        self._ltm = long_term_memory
+        # Worksheet tab name derived from "SHEET_RANGE" (e.g. "Sheet1!A2:C10"
+        # -> "Sheet1"), matching the range operators already configured for
+        # the live KPI feed. Falls back to "Sheet1" if unset.
+        sheet_range = getattr(settings, "SHEET_RANGE", "") or ""
+        self._kpi_sheet_name = sheet_range.split("!")[0] if "!" in sheet_range else "Sheet1"
 
     # ------------------------------------------------------------------
     # Public API
@@ -202,6 +270,8 @@ class MonitorAgent:
         )
 
         # Step 5: forecast detection (Phase 5).
+        forecast_result: dict[str, Any] | None = None
+        t = start_timer()
         try:
             forecast_result = self._forecast.analyze(
                 metric_name=metric_name,
@@ -212,6 +282,8 @@ class MonitorAgent:
         except Exception as exc:
             # Forecast failure should not break the pipeline; log and continue.
             logger.error("ForecastAgent.analyze failed: %s", exc, exc_info=True)
+        finally:
+            end_timer(agent_execution_time.labels(agent="forecast"), t)
 
         logger.debug(
             "process_kpi | metric=%s | current=%.4f | signals=%s",
@@ -238,6 +310,7 @@ class MonitorAgent:
             detection_methods=signals,
             rule_details=rule_result,
             stat_details=stat_result,
+            forecast_details=forecast_result,
         )
 
         # Step 8: deduplication.
@@ -274,6 +347,7 @@ class MonitorAgent:
         detection_methods: list[str],
         rule_details: dict[str, Any],
         stat_details: dict[str, Any],
+        forecast_details: dict[str, Any] | None = None,
     ) -> Event:
         """
         Construct an immutable :class:`~aeam.core.event_models.Event`.
@@ -290,11 +364,21 @@ class MonitorAgent:
                                ``["rule:sales.daily_drop_percent", "statistical:z_score"]``).
             rule_details:      Raw result dict from :class:`RuleEngine`.
             stat_details:      Raw result dict from :class:`StatisticalDetector`.
+            forecast_details:  Raw result dict from :class:`ForecastAgent.analyze`
+                               (Phase 5), when the forecast step ran successfully.
+                               ``None`` if the forecast step raised or was skipped.
 
         Returns:
             A frozen, immutable :class:`~aeam.core.event_models.Event`.
         """
         severity = self._derive_severity(len(detection_methods))
+
+        metadata: dict[str, Any] = {
+            "rule": rule_details,
+            "statistical": stat_details,
+        }
+        if forecast_details is not None:
+            metadata["forecast"] = forecast_details
 
         return Event(
             event_id=str(uuid.uuid4()),
@@ -305,10 +389,7 @@ class MonitorAgent:
             detection_methods=detection_methods,
             severity=severity,
             timestamp=datetime.now(tz=timezone.utc),
-            metadata={
-                "rule": rule_details,
-                "statistical": stat_details,
-            },
+            metadata=metadata,
         )
 
     # ------------------------------------------------------------------
@@ -319,12 +400,97 @@ class MonitorAgent:
         """
         Execute a single monitoring cycle.
 
-        In the base implementation this is a no-op placeholder — KPI
-        observations are pushed into the agent externally via
-        :meth:`process_kpi`. Override this method in subclasses to pull
-        data from a data source on each tick.
+        When no ``kpi_source`` was injected, this remains a no-op tick
+        (unchanged prior behaviour). When one is configured, pulls the
+        latest rows for every metric domain known to the :class:`RuleEngine`
+        (``rule_engine.loaded_domains`` — e.g. ``"sales"``, ``"complaints"``,
+        ``"inventory"``) and feeds each through :meth:`process_kpi`.
+
+        A metric domain with fewer than two data points, or a data source
+        returning no rows (disabled connector, transient failure), is
+        silently skipped — never raises, so a single bad cycle never kills
+        the monitoring thread (enforced by the caller, :meth:`start`).
         """
-        logger.debug("MonitorAgent cycle tick.")
+        if self._kpi_source is None:
+            logger.debug("MonitorAgent cycle tick — no KPI data source configured.")
+            return
+
+        rows = self._kpi_source.fetch_rows(self._kpi_sheet_name)
+        if not rows:
+            logger.debug(
+                "MonitorAgent cycle tick — no rows from KPI source | sheet=%s",
+                self._kpi_sheet_name,
+            )
+            return
+
+        for metric_name in self._rule_engine.loaded_domains:
+            series = self._extract_series(rows, metric_name)
+            if len(series) < 2:
+                continue
+
+            current = series[-1]
+            history = series[:-1]
+            previous = history[-1]
+
+            if self._ltm is not None:
+                try:
+                    self._ltm.store_metrics([{
+                        "metric": metric_name,
+                        "value": current,
+                        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                    }])
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "MonitorAgent cycle | metric=%s | store_metrics failed: %s",
+                        metric_name, exc, exc_info=True,
+                    )
+
+            try:
+                self.process_kpi(
+                    metric_name=metric_name,
+                    current=current,
+                    previous=previous,
+                    history=history,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "MonitorAgent cycle | metric=%s | process_kpi failed: %s",
+                    metric_name, exc, exc_info=True,
+                )
+
+    @staticmethod
+    def _extract_series(rows: list[dict[str, Any]], metric_name: str) -> list[float]:
+        """
+        Extract a chronological float series for ``metric_name`` from ``rows``.
+
+        Matches a row's column header to ``metric_name`` case-insensitively.
+        Cells that are blank or non-numeric are dropped (not interpolated —
+        :meth:`process_kpi` already runs ``history`` through
+        :meth:`StructuredDataPipeline.clean_missing`).
+
+        Args:
+            rows:        Row dicts as returned by :class:`KPIRowSource.fetch_rows`,
+                         in sheet order (assumed chronological, oldest first).
+            metric_name: Metric domain to extract (e.g. ``"sales"``).
+
+        Returns:
+            List of floats in chronological order. Empty if no matching
+            column or no parseable values.
+        """
+        target = metric_name.strip().lower()
+        values: list[float] = []
+        for row in rows:
+            raw = next(
+                (v for k, v in row.items() if k.strip().lower() == target),
+                None,
+            )
+            if raw is None or str(raw).strip() == "":
+                continue
+            try:
+                values.append(float(raw))
+            except (TypeError, ValueError):
+                continue
+        return values
 
     @staticmethod
     def _collect_signals(

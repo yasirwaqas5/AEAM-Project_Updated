@@ -389,6 +389,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             forecast_agent=forecast_agent,          # <-- Pass the properly initialized forecast_agent
             pipeline=container.pipeline,
             settings=settings,
+            kpi_source=container.sheets_connector,  # Phase 5: live KPI feed (may be None/disabled)
+            long_term_memory=long_term_memory,      # Hardening: persist observations for forecast training
         )
         # Start the monitor agent in a background thread
         monitor_thread = threading.Thread(target=monitor_agent.start, daemon=True)

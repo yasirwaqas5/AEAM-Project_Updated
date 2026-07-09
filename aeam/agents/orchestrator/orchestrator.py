@@ -25,12 +25,27 @@ from typing import TYPE_CHECKING, Any
 
 from aeam.agents.orchestrator.decision_engine import DecisionEngine
 from aeam.agents.orchestrator.evaluation_engine import EvaluationEngine
+from aeam.agents.orchestrator.investigation_status import derive_investigation_status
+from aeam.agents.orchestrator.notifications import format_jira_description, format_slack_message
+from aeam.agents.orchestrator.runbooks import get_runbook, resolve_action_step
 from aeam.agents.orchestrator.state_machine import IncidentState, IncidentStateMachine
+from aeam.agents.rag.cause_quality import best_meaningful_cause
+from aeam.agents.rag.rag_agent import parse_llm_json
 from aeam.config.settings import Settings
 from aeam.core.event_bus import EventBus
 from aeam.core.event_models import Event
 from aeam.memory.long_term import LongTermMemory
 from aeam.memory.short_term import ShortTermMemory
+from aeam.monitoring.metrics import (
+    action_failure_total,
+    action_success_total,
+    active_incidents,
+    agent_execution_time,
+    end_timer,
+    incidents_total,
+    investigation_duration,
+    start_timer,
+)
 from aeam.services.llm_service import LLMService
 
 if TYPE_CHECKING:
@@ -117,6 +132,10 @@ class Orchestrator:
 
         # Track the active event for the duration of a handle_event() call.
         self._active_event: Event | None = None
+        # Wall-clock start of the current incident lifecycle, for the
+        # investigation_duration histogram (set in handle_event(), consumed
+        # and cleared in finalize_incident()).
+        self._investigation_started_at: float | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -147,6 +166,11 @@ class Orchestrator:
         incident_id = str(uuid.uuid4())
         self._sm.reset()
         self._active_event = event
+
+        # Metrics: one incident counted, one active investigation started.
+        incidents_total.labels(event_type=event.event_type, severity=event.severity).inc()
+        active_incidents.inc()
+        self._investigation_started_at = start_timer()
 
         logger.info(
             "Orchestrator.handle_event | incident_id=%s | event_id=%s | "
@@ -266,10 +290,12 @@ class Orchestrator:
         if "RAG" in agents and self._rag is not None:
             logger.info("investigate | invoking RAG agent")
 
+            t = start_timer()
             rag_result = self._rag.investigate(
                 event=self._active_event,
                 memory=self._stm,
             )
+            end_timer(agent_execution_time.labels(agent="rag"), t)
 
             # RAG Agent actual contract (rag_agent.py:278-282):
             #   findings: dict with possible_causes/overall_confidence/etc.
@@ -282,20 +308,31 @@ class Orchestrator:
 
             # Derive root_cause from the actual contract structure.
             # RAGAgent returns findings as a dict with possible_causes.
+            #
+            # Root-cause quality gate: the highest-CONFIDENCE cause is not
+            # always the most descriptive one (e.g. a chunk-boundary artifact
+            # can produce a high-confidence but content-free single word).
+            # Walk causes in confidence order and take the first one that
+            # actually passes is_meaningful_root_cause() — defense-in-depth
+            # alongside the corpus-level chunking fix.
             rag_root_cause = ""
             if isinstance(rag_findings, dict):
                 possible_causes = rag_findings.get("possible_causes", []) or []
                 if possible_causes:
-                    # Take the highest-confidence grounded cause.
                     sorted_causes = sorted(
                         possible_causes,
                         key=lambda c: float(c.get("confidence", 0.0) or 0.0),
                         reverse=True,
                     )
-                    top_cause = sorted_causes[0]
-                    rag_root_cause = str(top_cause.get("cause", "")).strip()
+                    chosen = best_meaningful_cause(sorted_causes)
+                    if chosen is not None:
+                        rag_root_cause = str(chosen.get("cause", "")).strip()
 
-            # Record the RAG pass in the findings log (audit trail).
+            # Record the RAG pass in the findings log (audit trail) —
+            # unconditionally, on every pass whether it succeeded or failed,
+            # so query attempts, validation outcome, and evidence are always
+            # available to the dashboard/evidence/timeline instead of
+            # silently disappearing whenever RAG fails to find a root cause.
             self._stm.append("findings", {
                 "type": "rag",
                 "depth": depth,
@@ -303,6 +340,10 @@ class Orchestrator:
                 "root_cause": rag_root_cause,
                 "data": rag_findings,
             })
+            # Persist the full RAG result for this pass unconditionally
+            # (previously only set on success, which is why a failed pass
+            # left the dashboard with nothing to show).
+            self._stm.set("llm_response", json.dumps(rag_result, default=str))
 
             # Promote the grounded root cause into STM so finalize_incident()
             # persists it — and so the KPI placeholder does not overwrite it.
@@ -313,8 +354,6 @@ class Orchestrator:
                     "confidence",
                     round(max(existing_conf, rag_confidence), 2),
                 )
-                # Persist grounded reasoning + evidence for the dashboard.
-                self._stm.set("llm_response", json.dumps(rag_result, default=str))
 
             # Map possible_causes into STM evidence with full grounding metadata.
             if isinstance(rag_findings, dict):
@@ -358,20 +397,35 @@ class Orchestrator:
                 )
                 raw = llm.query(prompt, temperature=0.2, max_tokens=500)
 
-                # Extract the JSON portion (trim any surrounding text)
-                start = raw.find('{')
-                end = raw.rfind('}') + 1
-                if start != -1 and end > start:
-                    raw = raw[start:end]
+                # Resilient parse (markdown fences, leading/trailing prose,
+                # minor formatting issues) — same parser RAG uses, so a
+                # recoverable formatting slip succeeds on attempt 1 instead
+                # of silently relying on a later investigation depth to
+                # paper over it.
+                insight = parse_llm_json(raw)
 
-                insight = json.loads(raw)
+                if insight is None:
+                    logger.warning(
+                        "investigate | LLM reasoning response could not be "
+                        "parsed as JSON | depth=%d", depth,
+                    )
+                    # Structured, visible failure record — never fabricate a
+                    # root cause from unparseable output. The placeholder
+                    # root cause already set by
+                    # _run_kpi_investigation_placeholder() is left intact.
+                    self._stm.append("findings", {
+                        "type": "llm_reasoning_error",
+                        "depth": depth,
+                        "reason": "LLM response could not be parsed as JSON.",
+                        "raw_response": raw,
+                    })
+                else:
+                    # Update STM with the LLM output
+                    self._stm.set("root_cause", insight.get("root_cause", "Unknown"))
+                    self._stm.set("confidence", insight.get("confidence", 0.0))
+                    self._stm.set("llm_response", raw)
 
-                # Update STM with the LLM output
-                self._stm.set("root_cause", insight.get("root_cause", "Unknown"))
-                self._stm.set("confidence", insight.get("confidence", 0.0))
-                self._stm.set("llm_response", raw)
-
-                logger.info("investigate | LLM reasoning stored successfully")
+                    logger.info("investigate | LLM reasoning stored successfully")
             except Exception as exc:
                 logger.warning("investigate | LLM reasoning failed: %s", exc)
                 # Keep the existing placeholder root cause (already set in _run_kpi_investigation_placeholder)
@@ -412,46 +466,11 @@ class Orchestrator:
             self.investigate()
 
         elif eval_decision == "STOP":
-            # Phase 6: Execute external actions if ActionAgent is available.
-            if self._action is not None:
-                incident_id = self._stm.get("incident_id")
-                severity = self._active_event.severity.upper() if self._active_event else "UNKNOWN"
-                if severity in ("HIGH", "CRITICAL"):
-                    # Slack alert
-                    params = {
-                        "channel": "#aeam-alerts",
-                        "message": (
-                            f"🚨 AEAM Incident Resolved\n"
-                            f"Incident: {incident_id}\n"
-                            f"Metric: {self._active_event.metric}\n"
-                            f"Severity: {self._active_event.severity}\n"
-                            f"Current value: {self._active_event.current_value}\n"
-                            f"Expected value: {self._active_event.expected_value}\n"
-                            f"Detection methods: {', '.join(self._active_event.detection_methods)}\n"
-                            f"Root cause: {self._stm.get('root_cause', 'Unknown')}\n"
-                            f"LLM Insight: {self._stm.get('llm_response', 'Not available')[:200]}..."
-                        ),
-                        "severity": self._active_event.severity,
-                    }
-                    try:
-                        action_result = self._action.execute(
-                            action_type="slack",
-                            parameters=params,
-                            incident_id=incident_id,
-                        )
-                        logger.info(
-                            "Action executed | incident_id=%s | result=%s",
-                            incident_id, action_result,
-                        )
-                    except Exception as exc:
-                        logger.error(
-                            "Action failed | incident_id=%s | error=%s",
-                            incident_id, exc,
-                        )
-
-                else:
-                    logger.debug("No action triggered for severity=%s", severity)
-
+            # All external notifications/actions are dispatched exactly once,
+            # from finalize_incident() (see notifications.py for the
+            # structured Slack/Jira formatters). Sending an alert here too
+            # would both duplicate that notification and dump raw serialized
+            # findings as message text instead of a structured summary.
             self.finalize_incident()
 
         elif eval_decision == "ESCALATE":
@@ -474,150 +493,280 @@ class Orchestrator:
 
     def finalize_incident(self) -> None:
         """
-        Close the incident, persist it, generate reports and alerts, and clean up.
+        Close the incident, execute its safe runbook, notify, persist, and clean up.
 
         Steps:
         1. Transition FSM to ``COMPLETE``.
-        2. Assemble a persistence payload from STM and the active event.
-        3. Persist via :meth:`~aeam.memory.long_term.LongTermMemory.record_incident`.
-        4. If a ReportAgent is available, generate a human-readable report and
-           alert from the current memory state.
-        5. If an ActionAgent is available, send the alert to Slack, create a
-           Jira ticket, and send the detailed report via email.
-        6. Log the resulting ``incident_id``.
-        7. Clear STM.
-        8. Reset ``_active_event`` to ``None``.
+        2. Derive the canonical investigation status (see
+           :mod:`~aeam.agents.orchestrator.investigation_status`), the
+           validation outcome of the latest RAG pass, and the event's safe
+           runbook (see :mod:`~aeam.agents.orchestrator.runbooks`).
+        3. Execute the runbook's action plan via ActionAgent. Only actions
+           that actually return ``SUCCESS`` are recorded as executed; every
+           skipped or failed action is recorded with its reason — this
+           method never claims an action ran unless ActionAgent confirmed it.
+        4. Send Slack/Jira notifications built from explicit named fields
+           (see :mod:`~aeam.agents.orchestrator.notifications`) — never a
+           raw JSON dump of findings or the LLM response.
+        5. Always attempt an email report last (independent of the runbook;
+           a missing-credentials failure is expected and already reported
+           with a structured reason by EmailActions).
+        6. Append one consolidated ``audit_summary`` findings entry — the
+           single source of truth the frontend reads for status, evidence,
+           and executed actions.
+        7. Persist via :meth:`~aeam.memory.long_term.LongTermMemory.record_incident`
+           (schema unchanged — everything new lives inside the existing
+           ``findings`` JSON column).
+        8. Clear STM and reset ``_active_event``.
         """
         if self._sm.get_state() == IncidentState.COMPLETE:
             logger.info("finalize_incident | already COMPLETE; skipping duplicate finalize")
             return
 
         logger.info("finalize_incident | transitioning to COMPLETE")
-
         self._sm.transition(IncidentState.COMPLETE)
 
-        # Assemble persistence payload — safe even if keys are missing.
+        # Metrics: one active investigation ended. The COMPLETE-state guard
+        # above already prevents finalize_incident() from running twice for
+        # the same incident, so this dec()/observe() pair can never double-count.
+        active_incidents.dec()
+        if self._investigation_started_at is not None:
+            end_timer(investigation_duration, self._investigation_started_at)
+            self._investigation_started_at = None
+
         event_data: dict[str, Any] = self._stm.get("event") or {}
+        incident_id: str = self._stm.get("incident_id", "unknown")
+        root_cause = self._stm.get("root_cause")
+        requires_human = bool(self._stm.get("requires_human"))
+        confidence = self._stm.get("confidence")
+
+        # --- Derive validation status + latest RAG snapshot for reporting. ---
+        latest_rag = self._latest_rag_finding()
+        query_attempts = self._collect_query_attempts()
+
+        if latest_rag is None:
+            validation_status = "SKIPPED"
+            validation_reason = "RAG was not invoked for this investigation."
+        elif latest_rag.get("validation_passed") is True:
+            validation_status = "PASSED"
+            validation_reason = "Grounded response validated successfully."
+        else:
+            validation_status = "FAILED"
+            validation_reason = latest_rag.get("error") or "Validation failed."
+
+        had_error = bool(latest_rag and latest_rag.get("error") and not root_cause)
+        investigation_status = derive_investigation_status(
+            root_cause=root_cause,
+            requires_human=requires_human,
+            had_error=had_error,
+        )
+
+        possible_causes = (latest_rag or {}).get("possible_causes", []) or []
+        evidence_count = (latest_rag or {}).get("retrieved_count", 0) or 0
+        top_confidence = max(
+            (float(c.get("confidence", 0.0) or 0.0) for c in possible_causes),
+            default=None,
+        )
+        chunk_ids = sorted({
+            c.get("chunk_id") for c in possible_causes if c.get("chunk_id")
+        })
+
+        runbook = get_runbook(event_data.get("event_type", ""))
+
+        # --- Execute the safe runbook action plan. ---
+        executed_actions: list[str] = []
+        skipped_actions: list[dict[str, str]] = []
+
+        def _run_step(step: str, params: dict[str, Any]) -> None:
+            if self._action is None:
+                skipped_actions.append({
+                    "action": step, "reason": "ActionAgent not available.",
+                })
+                return
+            registry_type, extra_params = resolve_action_step(step)
+            merged_params = {**params, **extra_params}
+            t = start_timer()
+            try:
+                result = self._action.execute(
+                    action_type=registry_type,
+                    parameters=merged_params,
+                    incident_id=incident_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                end_timer(agent_execution_time.labels(agent=f"action:{registry_type}"), t)
+                action_failure_total.labels(action_type=registry_type).inc()
+                skipped_actions.append({"action": step, "reason": str(exc)})
+                logger.error(
+                    "finalize_incident | action %s raised: %s", step, exc,
+                )
+                return
+
+            end_timer(agent_execution_time.labels(agent=f"action:{registry_type}"), t)
+
+            if result.get("status") == "SUCCESS":
+                action_success_total.labels(action_type=registry_type).inc()
+                executed_actions.append(step)
+                logger.debug(
+                    "finalize_incident | action %s SUCCESS | incident_id=%s",
+                    step, incident_id,
+                )
+            else:
+                action_failure_total.labels(action_type=registry_type).inc()
+                result_detail: dict[str, Any] = result.get("result") or {}
+                reason = (
+                    result.get("failure_reason")
+                    or result_detail.get("reason")
+                    or result_detail.get("error")
+                    or result.get("status", "unknown")
+                )
+                skipped_actions.append({"action": step, "reason": str(reason)})
+                logger.debug(
+                    "finalize_incident | action %s SKIPPED | reason=%s | incident_id=%s",
+                    step, reason, incident_id,
+                )
+
+        priority_map = {
+            "HIGH": "High", "CRITICAL": "Highest", "MEDIUM": "Medium", "LOW": "Low",
+        }
+        event_severity = str(event_data.get("severity") or "").upper()
+        is_business_event = event_data.get("event_type") in ("SALES_DROP", "SALES_SPIKE")
+
+        # Non-notification steps first, so Slack/Jira can honestly report
+        # what already ran before they themselves send.
+        for step in runbook["action_plan"]:
+            if step in ("jira", "slack", "marketing_slack"):
+                continue
+            params: dict[str, Any] = {"incident_id": incident_id}
+            if step == "diagnostics":
+                params.update({
+                    "kind": "analytics_snapshot" if is_business_event else "diagnostics",
+                    "metric": event_data.get("metric"),
+                    "current_value": event_data.get("current_value"),
+                    "expected_value": event_data.get("expected_value"),
+                    "root_cause": root_cause,
+                })
+            elif step == "monitoring":
+                params.update({
+                    "metric": event_data.get("metric"),
+                    "window_minutes": 120,
+                    "reason": f"Elevated monitoring after {event_severity} incident.",
+                })
+            _run_step(step, params)
+
+        # Notification steps — built from explicit named fields only.
+        notify_payload: dict[str, Any] = {
+            "incident_id": incident_id,
+            "metric": event_data.get("metric", "unknown"),
+            "severity": event_data.get("severity", "unknown"),
+            "current_value": event_data.get("current_value"),
+            "expected_value": event_data.get("expected_value"),
+            "investigation_status": investigation_status,
+            "root_cause": root_cause,
+            "confidence": confidence,
+            "evidence_count": evidence_count,
+            "recommended_actions": runbook["recommended_actions"],
+            "requires_human": requires_human,
+        }
+
+        for step in runbook["action_plan"]:
+            if step not in ("jira", "slack", "marketing_slack"):
+                continue
+            notify_payload["executed_actions"] = list(executed_actions)
+            if step == "jira":
+                _run_step("jira", {
+                    "summary": (
+                        f"Incident {incident_id}: "
+                        f"{event_data.get('metric', 'unknown')} anomaly"
+                    ),
+                    "description": format_jira_description({
+                        **notify_payload,
+                        "retrieval_completed": latest_rag is not None,
+                        "validation_status": validation_status,
+                        "top_confidence": top_confidence,
+                        "chunk_ids": chunk_ids,
+                        "llm_reasoning": (latest_rag or {}).get("raw_llm_response"),
+                    }),
+                    "priority": priority_map.get(event_severity, "Medium"),
+                })
+            else:  # "slack" or "marketing_slack" alias
+                _run_step(step, {
+                    "message": format_slack_message(notify_payload),
+                    "severity": event_data.get("severity", "MEDIUM"),
+                })
+
+        # Always attempt the email report last, independent of the runbook —
+        # a missing-credentials failure is expected (see CLAUDE.md) and
+        # already reported with a structured reason by EmailActions itself.
+        if self._report is not None:
+            t = start_timer()
+            try:
+                report = self._report.generate_report(memory=self._stm)
+                end_timer(agent_execution_time.labels(agent="report"), t)
+            except Exception as exc:  # noqa: BLE001
+                end_timer(agent_execution_time.labels(agent="report"), t)
+                report = {"detailed_report": f"Report generation failed: {exc}"}
+        else:
+            report = {"detailed_report": "ReportAgent not available."}
+
+        _run_step("email", {
+            "to": ["ops@company.com"],
+            "subject": f"AEAM Incident - {event_data.get('event_type', 'unknown')}",
+            "body": report.get("detailed_report", ""),
+        })
+
+        # --- Consolidated audit summary: the single source of truth the
+        # frontend reads instead of reconstructing state from scattered
+        # findings entries. Stored inside the existing "findings" JSON
+        # column — no schema change.
+        self._stm.append("findings", {
+            "type": "audit_summary",
+            "investigation_status": investigation_status,
+            "root_cause": root_cause,
+            "validation_status": validation_status,
+            "validation_reason": validation_reason,
+            "reranking": "not_applicable",
+            "escalation_reason": self._escalation_reason(investigation_status),
+            "query_attempts": query_attempts,
+            "evidence_count": evidence_count,
+            "top_confidence": top_confidence,
+            "chunk_ids": chunk_ids,
+            "recommended_actions": runbook["recommended_actions"],
+            "executed_actions": executed_actions,
+            "skipped_actions": skipped_actions,
+        })
+
+        # --- Assemble persistence payload (schema unchanged). ---
         payload: dict[str, Any] = {
-            "event_id":           event_data.get("event_id"),
-            "event_type":         event_data.get("event_type"),
-            "metric":             event_data.get("metric"),
-            "severity":           event_data.get("severity"),
-            "current_value":      event_data.get("current_value"),
-            "expected_value":     event_data.get("expected_value"),
-            "detection_methods":  event_data.get("detection_methods", []),
-            "timestamp":          event_data.get("timestamp"),
+            "event_id":            event_data.get("event_id"),
+            "event_type":          event_data.get("event_type"),
+            "metric":              event_data.get("metric"),
+            "severity":            event_data.get("severity"),
+            "current_value":       event_data.get("current_value"),
+            "expected_value":      event_data.get("expected_value"),
+            "detection_methods":   event_data.get("detection_methods", []),
+            "timestamp":           event_data.get("timestamp"),
             "investigation_depth": self._stm.get("investigation_depth"),
-            "root_cause":         self._stm.get("root_cause"),
-            "confidence":         self._stm.get("confidence"),
-            "action_taken":       self._stm.get("action_taken"),
-            "requires_human":     self._stm.get("requires_human"),
-            "findings":           self._stm.get("findings", []),
-            # ✅ NEW: persist LLM reasoning
-            "llm_response":       self._stm.get("llm_response", ""),
+            "root_cause":          root_cause,
+            "confidence":          confidence,
+            # Reflects reality now: True only if >=1 action actually
+            # succeeded (previously hardcoded False regardless of outcome).
+            "action_taken":        bool(executed_actions),
+            "requires_human":      requires_human,
+            "findings":            self._stm.get("findings", []),
+            "llm_response":        self._stm.get("llm_response", ""),
         }
 
         try:
-            incident_id = self._ltm.record_incident(payload)
-            logger.info("finalize_incident | persisted | incident_id=%s", incident_id)
+            db_incident_id = self._ltm.record_incident(payload)
+            logger.info("finalize_incident | persisted | incident_id=%s", db_incident_id)
         except Exception as exc:  # noqa: BLE001
             logger.error("finalize_incident | LTM persist failed: %s", exc)
-            incident_id = self._stm.get("incident_id", "unknown")
 
-        # Phase 7: Generate human‑readable reports and alerts.
-        if self._report is not None:
-            try:
-                report = self._report.generate_report(memory=self._stm)
-                alert = self._report.generate_alert(memory=self._stm)
-
-                logger.info(
-                    "finalize_incident | report and alert generated | incident_id=%s",
-                    incident_id,
-                )
-
-                # Phase 6: Send via ActionAgent.
-                if self._action is not None:
-                    # Send Slack alert.
-                    slack_result = self._action.execute(
-                        action_type="slack",
-                        parameters={
-                            "channel": self._settings.SLACK_CHANNEL,
-                            "message": alert["message"],
-                            "severity": alert["severity"],
-                        },
-                        incident_id=incident_id,
-                    )
-                    logger.debug(
-                        "finalize_incident | slack alert sent | result=%s",
-                        slack_result,
-                    )
-
-                    priority_map = {
-                        "HIGH": "High",
-                        "CRITICAL": "Highest",
-                        "MEDIUM": "Medium",
-                        "LOW": "Low",
-                    }
-                    event_severity = str(event_data.get("severity") or "").upper()
-                    evidence = self._stm.get("evidence", []) or []
-                    evidence_lines = "\n".join(
-                        f"- [{item.get('source', 'evidence')}] "
-                        f"{item.get('cause') or item.get('result') or item} "
-                        f"(chunk_id={item.get('chunk_id', 'n/a')}, "
-                        f"confidence={item.get('confidence', 'n/a')})"
-                        for item in evidence
-                    ) or "No retrieved evidence recorded."
-                    jira_result = self._action.execute(
-                        action_type="jira",
-                        parameters={
-                            "summary": (
-                                f"Incident {incident_id}: "
-                                f"{event_data.get('metric', 'unknown')} anomaly"
-                            ),
-                            "description": (
-                                f"Automated investigation for incident {incident_id}\n\n"
-                                f"Metric: {event_data.get('metric')}\n"
-                                f"Severity: {event_data.get('severity')}\n"
-                                f"Current value: {event_data.get('current_value')}\n"
-                                f"Expected value: {event_data.get('expected_value')}\n"
-                                "Detection methods: "
-                                f"{', '.join(event_data.get('detection_methods', []))}\n"
-                                f"Root cause: {self._stm.get('root_cause', 'Unknown')}\n\n"
-                                f"Retrieved evidence:\n{evidence_lines}\n\n"
-                                f"LLM Reasoning: {self._stm.get('llm_response', 'Not available')}"
-                            ),
-                            "priority": priority_map.get(event_severity, "Medium"),
-                        },
-                        incident_id=incident_id,
-                    )
-                    logger.debug(
-                        "finalize_incident | jira ticket dispatched | result=%s",
-                        jira_result,
-                    )
-
-                    # Send email with detailed report.
-                    email_result = self._action.execute(
-                        action_type="email",
-                        parameters={
-                            "to": ["ops@company.com"],
-                            "subject": f"AEAM Incident - {alert['event_type']}",
-                            "body": report["detailed_report"],
-                        },
-                        incident_id=incident_id,
-                    )
-                    logger.debug(
-                        "finalize_incident | email sent | result=%s",
-                        email_result,
-                    )
-                else:
-                    logger.debug(
-                        "finalize_incident | ActionAgent not available — skipping notifications."
-                    )
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "finalize_incident | report/notification generation failed: %s",
-                    exc,
-                )
+        logger.info(
+            "finalize_incident | status=%s | root_cause=%r | executed=%s | skipped=%s",
+            investigation_status, root_cause, executed_actions,
+            [s["action"] for s in skipped_actions],
+        )
 
         # Clean up.
         self._stm.clear()
@@ -627,6 +776,82 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _escalation_reason(self, investigation_status: str) -> str | None:
+        """
+        Return the ACTUAL reason this incident was escalated, or None if it
+        was not escalated at all.
+
+        requires_human (and therefore ESCALATED) can be set via two
+        independent paths that must not be conflated:
+        1. The EvaluationEngine hit MAX_INVESTIGATION_DEPTH without a
+           sufficient score -- an explicit "type": "escalation" marker is
+           appended to findings for this path (see evaluate()).
+        2. The RAG agent's own LLM output set requires_human_review=True
+           on a pass that otherwise found a root cause (e.g. borderline
+           confidence) -- no depth-limit marker exists for this path.
+
+        Returns:
+            A specific, accurate reason string, or None if not escalated.
+        """
+        if investigation_status != "ESCALATED":
+            return None
+
+        findings = self._stm.get("findings", []) or []
+        if any(isinstance(f, dict) and f.get("type") == "escalation" for f in findings):
+            return "Max investigation depth reached without resolution."
+
+        return (
+            "Flagged for human review by the RAG investigation "
+            "(borderline confidence or ambiguous grounded finding)."
+        )
+
+    def _latest_rag_finding(self) -> dict[str, Any] | None:
+        """
+        Return the ``data`` dict of the most recent RAG pass recorded in
+        STM findings for the current incident.
+
+        Returns:
+            The last ``type == "rag"`` finding's ``data`` dict, or ``None``
+            if RAG has not been invoked at all this incident.
+        """
+        findings = self._stm.get("findings", []) or []
+        latest: dict[str, Any] | None = None
+        for entry in findings:
+            if isinstance(entry, dict) and entry.get("type") == "rag":
+                data = entry.get("data")
+                if isinstance(data, dict):
+                    latest = data
+        return latest
+
+    def _collect_query_attempts(self) -> list[dict[str, Any]]:
+        """
+        Reconstruct every distinct RAG query attempt made this incident, in
+        order, from STM findings — used for the audit trail / Retrieval
+        Summary shown in the Evidence panel.
+
+        Returns:
+            Ordered list of ``{"attempt", "strategy", "query",
+            "retrieved_count", "threshold"}`` dicts, oldest first. The
+            exhaustion marker (``query_strategy == "exhausted"``) is
+            excluded since it carries no new query of its own.
+        """
+        findings = self._stm.get("findings", []) or []
+        attempts: list[dict[str, Any]] = []
+        for entry in findings:
+            if not isinstance(entry, dict) or entry.get("type") != "rag":
+                continue
+            data = entry.get("data") or {}
+            if not isinstance(data, dict) or data.get("query_strategy") == "exhausted":
+                continue
+            attempts.append({
+                "attempt":         data.get("query_attempt"),
+                "strategy":        data.get("query_strategy"),
+                "query":           data.get("query"),
+                "retrieved_count": data.get("retrieved_count", 0),
+                "threshold":       data.get("threshold"),
+            })
+        return attempts
 
     def _run_kpi_investigation_placeholder(self) -> None:
         """

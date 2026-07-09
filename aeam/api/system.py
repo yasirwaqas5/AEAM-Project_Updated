@@ -24,8 +24,6 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from aeam.monitoring.metrics import active_incidents
-
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/system", tags=["System"])
@@ -46,8 +44,14 @@ def get_status(request: Request) -> JSONResponse:
     Return a lightweight snapshot of system health.
 
     Derives status from:
-    - ``active_incidents`` — read from the Prometheus ``active_incidents``
-      Gauge via its internal ``_value`` counter (no external scrape needed).
+    - ``active_incidents`` — count of UNRESOLVED incidents (those with
+      ``requires_human = true``) from the persistent incident store. This is
+      deliberately NOT the live Prometheus ``active_incidents`` gauge: the
+      gauge tracks investigations executing *right now*, but because the
+      pipeline is synchronous (``POST /trigger`` returns only after
+      ``finalize_incident()`` has already decremented it) it is never
+      observably non-zero to a dashboard poll. See
+      :func:`_count_unresolved_incidents`.
     - ``agents_active`` — static count of registered agent types (5).
     - ``last_event_time`` — taken from the container's priority queue size
       as a proxy; falls back to the current UTC timestamp when the queue
@@ -78,12 +82,12 @@ def get_status(request: Request) -> JSONResponse:
     try:
         container = request.app.state.container
 
-        # --- active_incidents from Prometheus Gauge ---
-        # _value.get() returns the current gauge value without a scrape.
-        try:
-            incident_count: int = int(active_incidents._value.get())
-        except Exception:  # noqa: BLE001
-            incident_count = 0
+        # --- active_incidents = UNRESOLVED incidents (persistent) ---
+        # NOT the live Prometheus gauge (which is inc'd and dec'd within one
+        # synchronous handle_event() call and is therefore always 0 to a
+        # poller). An operator's "Active Incidents" means the backlog still
+        # needing attention, so count unresolved incidents from the store.
+        incident_count: int = _count_unresolved_incidents(container)
 
         # --- overall status from settings ---
         db_url: str = str(container.settings.DATABASE_URL or "").strip()
@@ -120,6 +124,42 @@ def get_status(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _count_unresolved_incidents(container: Any) -> int:
+    """
+    Count incidents still requiring human attention (``requires_human = true``).
+
+    This is the persistent "unresolved incidents" backlog an operator cares
+    about — distinct from the live ``active_incidents`` Prometheus gauge, which
+    only tracks investigations executing at this instant (always 0 between the
+    synchronous trigger→finalize cycles).
+
+    Reads through the shared engine already held on the container (the same
+    pattern used by :mod:`aeam.api.incidents`). Any failure degrades to 0 so
+    the status endpoint never 500s on a metrics read.
+
+    The predicate ``WHERE requires_human`` is portable across PostgreSQL
+    (native boolean column) and SQLite (0/1 numeric affinity); NULLs are
+    correctly excluded (an unknown flag is not "unresolved").
+
+    Args:
+        container: The ``AppContainer`` from ``request.app.state.container``.
+
+    Returns:
+        Non-negative count of unresolved incidents, or 0 on any read error.
+    """
+    from sqlalchemy import text
+
+    try:
+        with container.db._engine.connect() as conn:
+            value = conn.execute(
+                text("SELECT COUNT(*) FROM incidents WHERE requires_human")
+            ).scalar()
+        return int(value or 0)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("get_status | unresolved-incident count failed: %s", exc)
+        return 0
+
 
 def _derive_last_event_time(container: Any) -> str:
     """

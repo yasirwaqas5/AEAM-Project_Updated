@@ -43,6 +43,8 @@ from aeam.agents.action.slack_actions import SlackActions
 from aeam.agents.action.email_actions import EmailActions
 from aeam.agents.action.webhook_actions import WebhookActions
 from aeam.agents.action.sheets_actions import GoogleSheetsActions
+from aeam.agents.action.diagnostics_actions import DiagnosticsActions
+from aeam.agents.action.monitoring_actions import MonitoringActions
 
 logger = logging.getLogger(__name__)
 
@@ -222,10 +224,12 @@ class ActionAgent:
 
         # Start with base registry (excluding Jira for now)
         self._registry: dict[str, Any] = {
-            "slack":   slack_handler,
-            "email":   EmailActions(secret_manager=secret_manager),
-            "webhook": WebhookActions(secret_manager=secret_manager),
-            "sheets":  GoogleSheetsActions(secret_manager=secret_manager),
+            "slack":       slack_handler,
+            "email":       EmailActions(secret_manager=secret_manager),
+            "webhook":     WebhookActions(secret_manager=secret_manager),
+            "sheets":      GoogleSheetsActions(secret_manager=secret_manager),
+            "diagnostics": DiagnosticsActions(secret_manager=secret_manager),
+            "monitoring":  MonitoringActions(secret_manager=secret_manager),
         }
 
         # Conditionally add Jira if settings provide JIRA_URL

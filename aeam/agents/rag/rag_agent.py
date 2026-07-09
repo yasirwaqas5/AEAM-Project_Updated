@@ -44,6 +44,17 @@ _LLM_MAX_TOKENS: int = 1000
 # Maximum characters of chunk text included in the LLM prompt.
 _MAX_CONTEXT_CHARS: int = 3000
 
+# Maximum number of DISTINCT query variants to try before giving up rather
+# than repeating an identical search. Query rewriting is fully deterministic
+# (no LLM, no hallucination) — see _formulate_query_variant().
+_MAX_QUERY_ATTEMPTS: int = 3
+
+_QUERY_STRATEGY_NAMES: dict[int, str] = {
+    1: "original",
+    2: "rewritten",
+    3: "broadened",
+}
+
 # JSON fence pattern for response parsing.
 _JSON_FENCE_RE: re.Pattern[str] = re.compile(
     r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE
@@ -68,6 +79,29 @@ _EVENT_TYPE_NL: dict[str, str] = {
     "QUEUE_BACKLOG":      "queue backlog consumer lag processing delay",
     "DEPLOYMENT_FAILURE": "deployment failure rollback health check crash",
     "AUTH_FAILURE":       "authentication failure login error token rejection",
+}
+
+# Deterministic, hand-curated BROAD phrases used only for query attempt 3
+# (the widest-net search). Intentionally short (2-3 words) — short queries
+# score measurably higher on cosine similarity against this corpus than the
+# long, keyword-stuffed descriptions in _EVENT_TYPE_NL (see retrieval
+# threshold benchmark). This is a static lookup table, not an LLM call — the
+# rewrite is fully deterministic and never hallucinates new vocabulary.
+_EVENT_TYPE_BROAD: dict[str, str] = {
+    "DB_LATENCY":         "database performance",
+    "SALES_DROP":         "sales revenue",
+    "SALES_SPIKE":        "sales revenue",
+    "KPI_ANOMALY":        "performance anomaly",
+    "CPU_HIGH":           "resource exhaustion",
+    "MEMORY_HIGH":        "resource exhaustion",
+    "DISK_IO":            "resource exhaustion",
+    "NETWORK_ERROR":      "connectivity failure",
+    "ERROR_RATE":         "service failure",
+    "LATENCY_HIGH":       "performance degradation",
+    "CACHE_MISS":         "cache failure",
+    "QUEUE_BACKLOG":      "processing delay",
+    "DEPLOYMENT_FAILURE": "deployment failure",
+    "AUTH_FAILURE":       "authentication failure",
 }
 
 _METADATA_QUERY_LABELS: dict[str, str] = {
@@ -128,6 +162,102 @@ _METADATA_QUERY_IGNORED: frozenset[str] = frozenset({
 
 _QUERY_TOKEN_RE: re.Pattern[str] = re.compile(r"[_\-/]+")
 _QUERY_CAMEL_RE: re.Pattern[str] = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+# ---------------------------------------------------------------------------
+# Resilient LLM JSON parsing
+# ---------------------------------------------------------------------------
+#
+# Shared by RAGAgent.investigate() and Orchestrator.investigate() (depth>=3
+# LLM reasoning) — one parser, reused, instead of two divergent ad-hoc ones.
+
+_SMART_QUOTES_TABLE: dict[int, str] = str.maketrans({
+    "“": '"', "”": '"',  # “ ”
+    "‘": "'", "’": "'",  # ‘ ’
+})
+_TRAILING_COMMA_RE: re.Pattern[str] = re.compile(r",(\s*[}\]])")
+_PY_TRUE_RE: re.Pattern[str] = re.compile(r"\bTrue\b")
+_PY_FALSE_RE: re.Pattern[str] = re.compile(r"\bFalse\b")
+_PY_NONE_RE: re.Pattern[str] = re.compile(r"\bNone\b")
+
+
+def _sanitize_json_candidate(text: str) -> str:
+    """
+    Best-effort fix-up for minor, recoverable LLM JSON formatting mistakes.
+
+    Does NOT attempt to fix structural problems (missing braces, truncated
+    output) — only cosmetic deviations from strict JSON that a real model
+    commonly produces:
+    - Smart/curly quotes copied from a markdown render.
+    - Trailing commas before a closing ``}``/``]``.
+    - Python literals (``True``/``False``/``None``) instead of JSON's
+      (``true``/``false``/``null``).
+    """
+    text = text.translate(_SMART_QUOTES_TABLE)
+    text = _TRAILING_COMMA_RE.sub(r"\1", text)
+    text = _PY_TRUE_RE.sub("true", text)
+    text = _PY_FALSE_RE.sub("false", text)
+    text = _PY_NONE_RE.sub("null", text)
+    return text
+
+
+def _try_parse_dict(candidate: str) -> dict[str, Any] | None:
+    """Try strict ``json.loads`` on ``candidate``, then again after sanitizing."""
+    for text in (candidate, _sanitize_json_candidate(candidate)):
+        try:
+            result = json.loads(text.strip())
+            if isinstance(result, dict):
+                return result
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def parse_llm_json(raw: str) -> dict[str, Any] | None:
+    """
+    Parse ``raw`` LLM output as a JSON object, tolerating common formatting
+    slips instead of only strict JSON.
+
+    Strategies (attempted in order, each tried strict-then-sanitized):
+    1. Direct parse of the full stripped string.
+    2. Extract from a markdown ``` or ```json fence (leading explanations
+       and trailing text outside the fence are discarded).
+    3. Substring between the first ``{`` and last ``}`` (handles leading
+       explanations / trailing text with no fence at all).
+
+    Never raises and never fabricates a result — returns ``None`` when every
+    strategy genuinely fails, so callers can surface a structured error
+    instead of silently hallucinating field values.
+
+    Args:
+        raw: Raw string returned by the LLM.
+
+    Returns:
+        Parsed dict, or ``None`` if all strategies fail.
+    """
+    if not raw or not raw.strip():
+        return None
+
+    # Strategy 1: direct parse.
+    result = _try_parse_dict(raw)
+    if result is not None:
+        return result
+
+    # Strategy 2: markdown fence.
+    fence_match = _JSON_FENCE_RE.search(raw)
+    if fence_match:
+        result = _try_parse_dict(fence_match.group(1))
+        if result is not None:
+            return result
+
+    # Strategy 3: brace substring.
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end > start:
+        result = _try_parse_dict(raw[start: end + 1])
+        if result is not None:
+            return result
+
+    return None
 
 
 class RAGAgent:
@@ -261,28 +391,55 @@ class RAGAgent:
             event.event_id, event.metric, event.severity,
         )
 
-        # Step 1: formulate query.
-        query = self._formulate_query(event)
-        logger.debug("RAGAgent | query=%r", query)
+        # Step 0: check whether all deterministic query variants are already
+        # exhausted (every prior attempt this incident returned 0 chunks).
+        # This is the adaptive-loop fix: rather than repeating an identical
+        # search at every remaining investigation depth, RAG becomes a no-op
+        # once it has genuinely tried every variant, and the orchestrator's
+        # existing depth/evaluation loop proceeds to escalate on schedule.
+        prior_attempts = self._extract_prior_rag_attempts(memory)
+        if (
+            len(prior_attempts) >= _MAX_QUERY_ATTEMPTS
+            and all(a.get("retrieved_count", 0) == 0 for a in prior_attempts)
+        ):
+            logger.info(
+                "RAGAgent | query variants exhausted (%d attempts, 0 chunks each) — "
+                "skipping repeat search | event_id=%s",
+                len(prior_attempts), event.event_id,
+            )
+            return self._exhausted_result(prior_attempts)
+
+        # Step 1: formulate this attempt's query (deterministic rewrite/broaden).
+        attempt: int = min(len(prior_attempts) + 1, _MAX_QUERY_ATTEMPTS)
+        query, strategy = self._formulate_query_variant(event, attempt)
+        threshold: float = getattr(self._retrieval, "similarity_threshold", None)
+        logger.debug(
+            "RAGAgent | attempt=%d | strategy=%s | query=%r", attempt, strategy, query,
+        )
 
         # Step 2: retrieve chunks.
         try:
             chunks = self._retrieval.search(query=query, top_k=self._top_k)
         except Exception as exc:  # noqa: BLE001
             logger.error("RAGAgent | retrieval failed: %s", exc)
-            return self._error_result(f"Retrieval failed: {exc}")
+            return self._error_result(
+                f"Retrieval failed: {exc}",
+                query=query, attempt=attempt, strategy=strategy, threshold=threshold,
+            )
 
         # 🔐 Defensive clamp – ensure we never exceed top_k.
         chunks = chunks[:self._top_k]
 
         logger.info(
-            "RAGAgent | retrieved %d chunks for event_id=%s",
-            len(chunks), event.event_id,
+            "RAGAgent | retrieved %d chunks for event_id=%s | attempt=%d | strategy=%s",
+            len(chunks), event.event_id, attempt, strategy,
         )
 
         if not chunks:
             logger.info("RAGAgent | no relevant chunks found; skipping LLM.")
-            return self._no_context_result()
+            return self._no_context_result(
+                query=query, attempt=attempt, strategy=strategy, threshold=threshold,
+            )
 
         # Step 3: assemble prompt.
         prompt = self._assemble_prompt(event=event, chunks=chunks, memory=memory)
@@ -298,15 +455,19 @@ class RAGAgent:
             logger.debug("RAGAgent | LLM response length=%d", len(raw_response))
         except Exception as exc:  # noqa: BLE001
             logger.error("RAGAgent | LLM call failed: %s", exc)
-            return self._error_result(f"LLM call failed: {exc}")
+            return self._error_result(
+                f"LLM call failed: {exc}",
+                query=query, attempt=attempt, strategy=strategy, threshold=threshold,
+            )
 
         # Step 5: parse JSON response.
-        parsed: dict[str, Any] | None = self._parse_json(raw_response)
+        parsed: dict[str, Any] | None = parse_llm_json(raw_response)
         if parsed is None:
             logger.warning("RAGAgent | could not parse LLM response as JSON.")
             return self._error_result(
                 "LLM response could not be parsed as JSON.",
                 raw_response=raw_response,
+                query=query, attempt=attempt, strategy=strategy, threshold=threshold,
             )
 
         # Step 6: validate.
@@ -322,12 +483,25 @@ class RAGAgent:
             return self._error_result(
                 f"Validation failed: {reason}",
                 raw_response=raw_response,
+                query=query, attempt=attempt, strategy=strategy, threshold=threshold,
             )
 
         # Step 7: assemble return structure.
         overall_confidence: float = float(parsed.get("overall_confidence", 0.0))
         possible_causes: list[dict[str, Any]] = parsed.get("possible_causes", [])
         requires_human: bool = bool(parsed.get("requires_human_review", False))
+
+        cited_chunk_ids = {c.get("chunk_id") for c in possible_causes if c.get("cause")}
+        retrieved_chunks_meta: list[dict[str, Any]] = [
+            {
+                "chunk_id":     c.get("chunk_id"),
+                "similarity":   c.get("similarity"),
+                "source":       c.get("metadata", {}).get("source", "unknown"),
+                "text_preview": (c.get("text", "") or "")[:160],
+                "cited":        c.get("chunk_id") in cited_chunk_ids,
+            }
+            for c in chunks
+        ]
 
         findings: dict[str, Any] = {
             "possible_causes":       possible_causes,
@@ -336,6 +510,11 @@ class RAGAgent:
             "retrieved_count":       len(chunks),
             "validation_passed":     True,
             "raw_llm_response":      raw_response,
+            "query":                 query,
+            "query_attempt":         attempt,
+            "query_strategy":        strategy,
+            "threshold":             threshold,
+            "retrieved_chunks":      retrieved_chunks_meta,
         }
 
         hypotheses: list[str] = [
@@ -547,59 +726,13 @@ class RAGAgent:
         )
 
     @staticmethod
-    def _parse_json(raw: str) -> dict[str, Any] | None:
-        """
-        Parse ``raw`` LLM output as JSON using three fallback strategies.
-
-        Strategies (attempted in order):
-        1. Direct ``json.loads`` on the stripped string.
-        2. Extract from a markdown ``` or ```json fence.
-        3. Substring between the first ``{`` and last ``}``.
-
-        Args:
-            raw: Raw string returned by the LLM.
-
-        Returns:
-            Parsed dict, or ``None`` if all strategies fail.
-        """
-        if not raw or not raw.strip():
-            return None
-
-        # Strategy 1: direct parse.
-        try:
-            result = json.loads(raw.strip())
-            if isinstance(result, dict):
-                return result
-        except json.JSONDecodeError:
-            pass
-
-        # Strategy 2: markdown fence.
-        fence_match = _JSON_FENCE_RE.search(raw)
-        if fence_match:
-            try:
-                result = json.loads(fence_match.group(1).strip())
-                if isinstance(result, dict):
-                    return result
-            except json.JSONDecodeError:
-                pass
-
-        # Strategy 3: brace substring.
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start != -1 and end > start:
-            try:
-                result = json.loads(raw[start: end + 1])
-                if isinstance(result, dict):
-                    return result
-            except json.JSONDecodeError:
-                pass
-
-        return None
-
-    @staticmethod
     def _error_result(
         reason: str,
         raw_response: str | None = None,
+        query: str | None = None,
+        attempt: int | None = None,
+        strategy: str | None = None,
+        threshold: float | None = None,
     ) -> dict[str, Any]:
         """
         Build a safe error result that matches the full ``investigate()`` schema.
@@ -607,6 +740,10 @@ class RAGAgent:
         Args:
             reason:       Human-readable failure description.
             raw_response: Raw LLM response string if available.
+            query:        The query attempted on this pass, if formulated.
+            attempt:      Which query attempt (1-3) this was.
+            strategy:     Query strategy name ("original"/"rewritten"/"broadened").
+            threshold:    Similarity threshold in effect for this pass.
 
         Returns:
             Full return dict with safe defaults.
@@ -619,6 +756,10 @@ class RAGAgent:
             "validation_passed":     False,
             "raw_llm_response":      raw_response,
             "error":                 reason,
+            "query":                 query,
+            "query_attempt":         attempt,
+            "query_strategy":        strategy,
+            "threshold":             threshold,
         }
         return {
             "findings":       findings,
@@ -631,9 +772,20 @@ class RAGAgent:
         }
 
     @staticmethod
-    def _no_context_result() -> dict[str, Any]:
+    def _no_context_result(
+        query: str | None = None,
+        attempt: int | None = None,
+        strategy: str | None = None,
+        threshold: float | None = None,
+    ) -> dict[str, Any]:
         """
         Build a result dict for the case where no chunks were retrieved.
+
+        Args:
+            query:     The query attempted on this pass.
+            attempt:   Which query attempt (1-3) this was.
+            strategy:  Query strategy name ("original"/"rewritten"/"broadened").
+            threshold: Similarity threshold in effect for this pass.
 
         Returns:
             Full return dict with requires_human_review=True and zero confidence.
@@ -646,6 +798,10 @@ class RAGAgent:
             "validation_passed":     False,
             "raw_llm_response":      None,
             "error":                 "No relevant context retrieved from vector store.",
+            "query":                 query,
+            "query_attempt":         attempt,
+            "query_strategy":        strategy,
+            "threshold":             threshold,
         }
         return {
             "findings":       findings,
@@ -656,6 +812,135 @@ class RAGAgent:
                 "confidence":   0.0,
             },
         }
+
+    @staticmethod
+    def _exhausted_result(prior_attempts: list[dict[str, Any]]) -> dict[str, Any]:
+        """
+        Build a result dict for the case where all query variants have
+        already been tried (each returning 0 chunks) — no new search is run.
+
+        Args:
+            prior_attempts: The previously attempted
+                            ``{"query", "query_strategy", "retrieved_count"}``
+                            entries, carried through unchanged for the audit
+                            trail.
+
+        Returns:
+            Full return dict with ``requires_human_review=True``, zero
+            confidence, and an ``error`` explaining exhaustion.
+        """
+        findings: dict[str, Any] = {
+            "possible_causes":       [],
+            "overall_confidence":    0.0,
+            "requires_human_review": True,
+            "retrieved_count":       0,
+            "validation_passed":     False,
+            "raw_llm_response":      None,
+            "error": (
+                f"All {len(prior_attempts)} query variants exhausted; "
+                "no relevant documents matched."
+            ),
+            "query":            None,
+            "query_attempt":    None,
+            "query_strategy":   "exhausted",
+            "prior_attempts":   prior_attempts,
+        }
+        return {
+            "findings":       findings,
+            "confidence":     0.0,
+            "memory_updates": {
+                "rag_findings": findings,
+                "hypotheses":   [],
+                "confidence":   0.0,
+            },
+        }
+
+    @staticmethod
+    def _extract_prior_rag_attempts(memory: ShortTermMemory) -> list[dict[str, Any]]:
+        """
+        Reconstruct the list of query attempts already made this incident.
+
+        Scans ``memory.get("findings", [])`` for entries the Orchestrator
+        appends with ``type == "rag"`` (one per investigation depth this
+        agent was invoked) and extracts each pass's query/strategy/retrieval
+        count from its nested ``data`` dict (the findings dict this agent
+        itself returned on that pass).
+
+        Args:
+            memory: Active ShortTermMemory for the current investigation.
+
+        Returns:
+            Ordered list of ``{"query", "query_strategy", "retrieved_count"}``
+            dicts, oldest first. Empty list if RAG has not run yet this
+            incident (or memory has no findings recorded).
+        """
+        raw_findings = memory.get("findings", []) or []
+        attempts: list[dict[str, Any]] = []
+        for entry in raw_findings:
+            if not isinstance(entry, dict) or entry.get("type") != "rag":
+                continue
+            data = entry.get("data") or {}
+            if not isinstance(data, dict):
+                continue
+            # Skip an already-exhausted marker so it is never double-counted.
+            if data.get("query_strategy") == "exhausted":
+                continue
+            attempts.append({
+                "query":           data.get("query"),
+                "query_strategy":  data.get("query_strategy"),
+                "retrieved_count": data.get("retrieved_count", 0),
+            })
+        return attempts
+
+    @staticmethod
+    def _formulate_query_variant(event: Event, attempt: int) -> tuple[str, str]:
+        """
+        Build the query for a given attempt number using a deterministic,
+        non-hallucinating rewrite/broaden strategy.
+
+        Strategy by attempt:
+        1. ``"original"``  — identical to :meth:`_formulate_query`: event
+           description + metric + full metadata context. Most specific.
+        2. ``"rewritten"`` — event description + metric only, metadata
+           dropped. Shorter queries measurably score higher cosine
+           similarity against this corpus than metadata-heavy ones.
+        3. ``"broadened"`` — a short, hand-curated 2-3 word category phrase
+           from :data:`_EVENT_TYPE_BROAD` only. Widest net.
+
+        All three variants are static lookups/string concatenation — no LLM
+        call, no invented vocabulary.
+
+        Args:
+            event:   The event under investigation.
+            attempt: Attempt number, 1-3 (values outside this range are
+                     clamped).
+
+        Returns:
+            Tuple of ``(query_string, strategy_name)``.
+        """
+        attempt = max(1, min(attempt, _MAX_QUERY_ATTEMPTS))
+        strategy = _QUERY_STRATEGY_NAMES[attempt]
+
+        if attempt == 1:
+            return RAGAgent._formulate_query(event), strategy
+
+        if attempt == 2:
+            event_desc = _EVENT_TYPE_NL.get(
+                event.event_type,
+                event.event_type.replace("_", " ").lower(),
+            )
+            metric_nl = RAGAgent._normalise_query_fragment(event.metric)
+            parts = [event_desc]
+            if metric_nl:
+                parts.append(metric_nl)
+            return " ".join(parts), strategy
+
+        # attempt == 3: broadened.
+        broad = _EVENT_TYPE_BROAD.get(
+            event.event_type,
+            event.event_type.replace("_", " ").lower(),
+        )
+        return broad, strategy
 
     def __repr__(self) -> str:
         return (

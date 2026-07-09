@@ -72,6 +72,19 @@ export function fmtMs(ms) {
 }
 
 // ─── Incident-shape helpers (derive fields the API does not store directly) ──
+//
+// The backend packs everything new (canonical status, query attempts,
+// validation outcome, recommended/executed actions, evidence ranking) into
+// ONE consolidated `audit_summary` entry inside the existing `findings` JSON
+// column (see aeam/agents/orchestrator/orchestrator.py::finalize_incident).
+// Every helper below reads that entry FIRST, and falls back to the older
+// heuristics (root_cause/requires_human/llm_response) only for incidents
+// persisted before this change — so old rows never break the UI.
+//
+// The 5-state status vocabulary mirrors
+// aeam/agents/orchestrator/investigation_status.py EXACTLY (same priority
+// order: ESCALATED > RESOLVED > FAILED > COMPLETE, plus INVESTIGATING for
+// a live/unfinished record). Keep these two files in sync if either changes.
 
 export function parseMaybeJSON(value) {
   if (value == null) return null;
@@ -82,50 +95,218 @@ export function parseMaybeJSON(value) {
   return null;
 }
 
-/** Derive an investigation status from persisted incident fields. */
-export function deriveStatus(incident) {
-  if (!incident) return { key: "unknown", label: "Unknown", color: STATE.idle };
-  if (incident.requires_human) return { key: "escalated", label: "Escalated", color: STATE.failed };
-  if (incident.root_cause) return { key: "resolved", label: "Resolved", color: STATE.done };
-  return { key: "investigating", label: "Investigating", color: STATE.active };
+/** Parsed findings array (empty array if absent/unparseable). */
+export function getFindings(incident) {
+  const findings = parseMaybeJSON(incident?.findings);
+  return Array.isArray(findings) ? findings : [];
 }
 
-/** Extract retrieved-evidence chunks from an incident's RAG payload. */
-export function getEvidence(incident) {
-  const rag = parseMaybeJSON(incident?.llm_response);
-  let causes = rag?.findings?.possible_causes;
-  if (!Array.isArray(causes)) {
-    const findings = parseMaybeJSON(incident?.findings);
-    if (Array.isArray(findings)) {
-      const ragEntry = findings.find((f) => f?.type === "rag");
-      causes = ragEntry?.data?.possible_causes;
-    }
+/** The single consolidated audit_summary findings entry, or null. */
+export function getAuditSummary(incident) {
+  const findings = getFindings(incident);
+  // Last one wins in case finalize_incident somehow ran twice (defensive).
+  for (let i = findings.length - 1; i >= 0; i--) {
+    if (findings[i]?.type === "audit_summary") return findings[i];
   }
+  return null;
+}
+
+const STATUS_LABELS = {
+  INVESTIGATING: "Investigating",
+  RESOLVED: "Resolved",
+  ESCALATED: "Escalated",
+  FAILED: "Failed",
+  COMPLETE: "Complete",
+};
+const STATUS_COLORS = {
+  INVESTIGATING: STATE.active,
+  RESOLVED: STATE.done,
+  ESCALATED: STATE.failed,
+  FAILED: STATE.failed,
+  COMPLETE: STATE.idle,
+};
+
+/** Derive the canonical 5-state investigation status for an incident. */
+export function deriveStatus(incident) {
+  if (!incident) return { key: "UNKNOWN", label: "Unknown", color: STATE.idle };
+
+  const audit = getAuditSummary(incident);
+  if (audit?.investigation_status) {
+    const key = audit.investigation_status;
+    return { key, label: STATUS_LABELS[key] || key, color: STATUS_COLORS[key] || STATE.idle };
+  }
+
+  // Fallback for incidents predating audit_summary — same priority order
+  // as derive_investigation_status() on the backend, minus the FAILED case
+  // (older rows carry no explicit error signal to detect that from).
+  if (incident.requires_human) return { key: "ESCALATED", label: "Escalated", color: STATE.failed };
+  if (incident.root_cause) return { key: "RESOLVED", label: "Resolved", color: STATE.done };
+  return { key: "COMPLETE", label: "Complete", color: STATE.idle };
+}
+
+/** The `data` dict of the most recent RAG pass recorded in findings. */
+export function getLatestRagData(incident) {
+  const findings = getFindings(incident);
+  let latest = null;
+  for (const entry of findings) {
+    if (entry?.type === "rag" && entry.data) latest = entry.data;
+  }
+  return latest;
+}
+
+/** Extract retrieved-evidence chunks (LLM-cited causes) from an incident. */
+export function getEvidence(incident) {
+  const latest = getLatestRagData(incident);
+  if (Array.isArray(latest?.possible_causes)) return latest.possible_causes;
+  // Legacy fallback: llm_response held the raw RAGAgent result directly.
+  const rag = parseMaybeJSON(incident?.llm_response);
+  const causes = rag?.findings?.possible_causes;
   return Array.isArray(causes) ? causes : [];
 }
 
 /** Count of retrieved evidence chunks recorded for the incident. */
 export function getRetrievedCount(incident) {
+  const audit = getAuditSummary(incident);
+  if (typeof audit?.evidence_count === "number") return audit.evidence_count;
+  const latest = getLatestRagData(incident);
+  if (typeof latest?.retrieved_count === "number") return latest.retrieved_count;
   const rag = parseMaybeJSON(incident?.llm_response);
-  const direct = rag?.findings?.retrieved_count;
-  if (typeof direct === "number") return direct;
-  const findings = parseMaybeJSON(incident?.findings);
-  if (Array.isArray(findings)) {
-    const ragEntry = findings.find((f) => f?.type === "rag");
-    if (typeof ragEntry?.data?.retrieved_count === "number") return ragEntry.data.retrieved_count;
-  }
-  const evidence = getEvidence(incident);
-  return evidence.length;
+  if (typeof rag?.findings?.retrieved_count === "number") return rag.findings.retrieved_count;
+  return getEvidence(incident).length;
 }
 
-/** Derive a recommended action (UI hint) from persisted fields. */
+/**
+ * Every RAG query attempt made this incident, in order — used to render
+ * the Retrieval Summary when no evidence was found.
+ * Each entry: {attempt, strategy, query, retrieved_count, threshold}.
+ */
+export function getQueryAttempts(incident) {
+  const audit = getAuditSummary(incident);
+  if (Array.isArray(audit?.query_attempts) && audit.query_attempts.length) {
+    return audit.query_attempts;
+  }
+  // Fallback: reconstruct from raw findings (works for incidents recorded
+  // after the adaptive-query change but before audit_summary existed).
+  return getFindings(incident)
+    .filter((f) => f?.type === "rag" && f.data && f.data.query_strategy !== "exhausted")
+    .map((f) => ({
+      attempt: f.data.query_attempt,
+      strategy: f.data.query_strategy,
+      query: f.data.query,
+      retrieved_count: f.data.retrieved_count ?? 0,
+      threshold: f.data.threshold,
+    }));
+}
+
+/** {status: "PASSED"|"FAILED"|"SKIPPED"|"PENDING", reason} */
+export function getValidationStatus(incident) {
+  const audit = getAuditSummary(incident);
+  if (audit?.validation_status) {
+    return { status: audit.validation_status, reason: audit.validation_reason || "" };
+  }
+  // Fallback for pre-audit_summary incidents.
+  const latest = getLatestRagData(incident);
+  if (!latest) return { status: "SKIPPED", reason: "RAG was not invoked for this investigation." };
+  if (latest.validation_passed === true) {
+    return { status: "PASSED", reason: "Grounded response validated successfully." };
+  }
+  return { status: "FAILED", reason: latest.error || "Validation failed." };
+}
+
+/** Recommended actions (advisory text, plural — the runbook may list several). */
+export function getRecommendedActions(incident) {
+  const audit = getAuditSummary(incident);
+  if (Array.isArray(audit?.recommended_actions) && audit.recommended_actions.length) {
+    return audit.recommended_actions;
+  }
+  if (incident?.requires_human) return ["Escalate to human review"];
+  if (incident?.root_cause) return ["Continue monitoring"];
+  return ["Investigate the affected metric and recent related changes"];
+}
+
+/** Singular convenience wrapper — joined recommended actions as one string. */
 export function getRecommendedAction(incident) {
-  const rag = parseMaybeJSON(incident?.llm_response);
-  if (rag?.recommended_action) return rag.recommended_action;
-  if (rag?.findings?.recommended_action) return rag.findings.recommended_action;
-  if (incident?.requires_human) return "Escalate to human review";
-  if (incident?.action_taken) return "Automated Slack alert dispatched";
-  return "Continue monitoring";
+  return getRecommendedActions(incident).join("; ");
+}
+
+/**
+ * {executed: string[], skipped: {action, reason}[]} — ONLY actions
+ * ActionAgent confirmed with status SUCCESS are ever listed as executed.
+ */
+export function getActionOutcome(incident) {
+  const audit = getAuditSummary(incident);
+  if (audit) {
+    return {
+      executed: Array.isArray(audit.executed_actions) ? audit.executed_actions : [],
+      skipped: Array.isArray(audit.skipped_actions) ? audit.skipped_actions : [],
+    };
+  }
+  // Fallback: the old schema only had a single boolean.
+  return incident?.action_taken
+    ? { executed: ["slack"], skipped: [] }
+    : { executed: [], skipped: [] };
+}
+
+const ACTION_LABELS = {
+  jira: "Created Jira ticket",
+  slack: "Posted Slack alert",
+  marketing_slack: "Notified marketing",
+  email: "Sent email report",
+  diagnostics: "Captured diagnostics snapshot",
+  monitoring: "Flagged for increased monitoring",
+  webhook: "Triggered webhook",
+  sheets: "Logged to spreadsheet",
+};
+
+export function actionLabel(actionType) {
+  return ACTION_LABELS[actionType] || actionType;
+}
+
+/**
+ * Top-ranked retrieved evidence with similarity/confidence/source/reason,
+ * for the Evidence panel's ranking view. Cross-references the raw retrieved
+ * chunk metadata (similarity, source) against which chunk_ids the LLM
+ * actually cited as a cause (confidence, "reason selected").
+ */
+export function getTopEvidence(incident) {
+  const latest = getLatestRagData(incident);
+  const retrievedChunks = Array.isArray(latest?.retrieved_chunks) ? latest.retrieved_chunks : [];
+  const causesByChunk = new Map(
+    (Array.isArray(latest?.possible_causes) ? latest.possible_causes : [])
+      .filter((c) => c?.chunk_id)
+      .map((c) => [c.chunk_id, c]),
+  );
+
+  if (retrievedChunks.length) {
+    return retrievedChunks
+      .map((c) => {
+        const cause = causesByChunk.get(c.chunk_id);
+        return {
+          chunk_id: c.chunk_id,
+          similarity: c.similarity,
+          confidence: cause?.confidence ?? null,
+          source: c.source,
+          preview: c.text_preview,
+          cited: !!c.cited,
+          reasonSelected: c.cited
+            ? `Cited as contributing cause (confidence ${fmtPct(cause?.confidence)})`
+            : "Retrieved but not cited by the LLM",
+        };
+      })
+      .sort((a, b) => (b.similarity ?? 0) - (a.similarity ?? 0));
+  }
+
+  // Legacy fallback: only cause/chunk_id/confidence are available (no
+  // similarity/source since retrieved_chunks didn't exist yet).
+  return getEvidence(incident).map((c) => ({
+    chunk_id: c.chunk_id,
+    similarity: null,
+    confidence: c.confidence,
+    source: null,
+    preview: c.cause,
+    cited: true,
+    reasonSelected: `Cited as contributing cause (confidence ${fmtPct(c.confidence)})`,
+  }));
 }
 
 // ─── Icons (inline SVG, no dependency) ──────────────────────────────────────
