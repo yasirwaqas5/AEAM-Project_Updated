@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 from aeam.monitoring.logging_config import get_logger
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -69,7 +70,7 @@ class IngestionPipeline:
         qdrant_client:     Connected :class:`qdrant_client.QdrantClient` instance.
         chunker:           :class:`~aeam.agents.rag.chunking.TextChunker` instance.
                            Defaults to ``TextChunker()`` (sentence strategy,
-                           chunk_size=512, overlap=50).
+                           chunk_size=300, overlap=50).
         collection:        Qdrant collection name to ingest into.
                            Defaults to ``"aeam_documents"``.
 
@@ -111,7 +112,7 @@ class IngestionPipeline:
             embedding_service: Loaded embedding model wrapper. Must not be None.
             qdrant_client:     Connected Qdrant client. Must not be None.
             chunker:           Text chunker. Defaults to
-                               ``TextChunker(strategy="sentence", chunk_size=512,
+                               ``TextChunker(strategy="sentence", chunk_size=300,
                                overlap=50)`` if not provided.
             collection:        Target Qdrant collection name. Must not be empty.
 
@@ -129,7 +130,7 @@ class IngestionPipeline:
         self._embed: EmbeddingService = embedding_service
         self._qdrant: QdrantClient = qdrant_client
         self._chunker: TextChunker = chunker or TextChunker(
-            chunk_size=512,
+            chunk_size=300,
             overlap=50,
             strategy="sentence",
         )
@@ -137,6 +138,34 @@ class IngestionPipeline:
 
         # Ensure the target collection exists before any ingest call.
         self._ensure_collection()
+
+    def _split_markdown_into_sections(self, text: str) -> list[tuple[str, str]]:
+        """
+        Split markdown text into sections based on '## ' headers.
+        Returns a list of (section_title, section_text) tuples.
+        If no '## ' headers are found, returns an empty list.
+        """
+        if not text.strip():
+            return []
+        # Split by lines starting with '## ' (markdown level 2 header)
+        parts = re.split(r'\n## ', text)
+        # The first part is the preamble (before any ## header)
+        sections = []
+        if parts[0].strip():
+            # If there's preamble, treat it as a section with no title? We'll skip it for now.
+            # Alternatively, we could use the first line as a title, but we'll ignore preamble.
+            pass
+        for part in parts[1:]:  # Skip preamble
+            lines = part.splitlines()
+            if not lines:
+                continue
+            # First line is the header
+            header = lines[0].strip()
+            # Rest is the content
+            content = '\n'.join(lines[1:]).strip()
+            if content:
+                sections.append((header, content))
+        return sections
 
     # ------------------------------------------------------------------
     # Public API
@@ -279,7 +308,7 @@ class IngestionPipeline:
         )
 
         logger.info(
-            "ingest_document | upserted %d points → collection=%r",
+            "ingest_document | upserted %d points -> collection=%r",
             len(points), self._collection,
         )
 
@@ -376,12 +405,21 @@ class IngestionPipeline:
                     size=VECTOR_DIMENSION,
                     distance=DISTANCE_METRIC,
                 ),
+                optimizers_config=qmodels.OptimizersConfigDiff(
+                    indexing_threshold=1,
+                ),
             )
             logger.info(
                 "IngestionPipeline | collection created: %r", self._collection
             )
         except UnexpectedResponse as exc:
             if exc.status_code == 409:
+                self._qdrant.update_collection(
+                    collection_name=self._collection,
+                    optimizers_config=qmodels.OptimizersConfigDiff(
+                        indexing_threshold=1,
+                    ),
+                )
                 logger.debug(
                     "IngestionPipeline | collection already exists: %r",
                     self._collection,

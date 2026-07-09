@@ -243,7 +243,8 @@ class Orchestrator:
         })
 
         # --- Step 4: transition to DECIDING ---
-        self._sm.transition(IncidentState.DECIDING)
+        if self._sm.get_state() != IncidentState.DECIDING:
+            self._sm.transition(IncidentState.DECIDING)
 
         # --- Step 5: act on decision ---
         if action == "STOP":
@@ -270,31 +271,66 @@ class Orchestrator:
                 memory=self._stm,
             )
 
-            rag_findings = rag_result.get("findings", {})
-            rag_confidence = float(rag_result.get("confidence", 0.0))
-            memory_updates = rag_result.get("memory_updates", {})
+            # RAG Agent actual contract (rag_agent.py:278-282):
+            #   findings: dict with possible_causes/overall_confidence/etc.
+            #   confidence: float
+            #   memory_updates: dict with rag_findings/hypotheses/confidence
+            rag_findings = rag_result.get("findings", "")
+            rag_confidence = float(rag_result.get("confidence", 0.0) or 0.0)
+            memory_updates = rag_result.get("memory_updates", {}) or {}
+            no_knowledge = bool(rag_result.get("no_knowledge_retrieved", False))
 
-            # Append RAG findings to STM safely
+            # Derive root_cause from the actual contract structure.
+            # RAGAgent returns findings as a dict with possible_causes.
+            rag_root_cause = ""
+            if isinstance(rag_findings, dict):
+                possible_causes = rag_findings.get("possible_causes", []) or []
+                if possible_causes:
+                    # Take the highest-confidence grounded cause.
+                    sorted_causes = sorted(
+                        possible_causes,
+                        key=lambda c: float(c.get("confidence", 0.0) or 0.0),
+                        reverse=True,
+                    )
+                    top_cause = sorted_causes[0]
+                    rag_root_cause = str(top_cause.get("cause", "")).strip()
+
+            # Record the RAG pass in the findings log (audit trail).
             self._stm.append("findings", {
                 "type": "rag",
                 "depth": depth,
                 "confidence": rag_confidence,
+                "root_cause": rag_root_cause,
                 "data": rag_findings,
             })
 
-            # Apply memory updates (research-only)
-            if "hypotheses" in memory_updates:
-                for h in memory_updates["hypotheses"]:
-                    self._stm.append("hypotheses", h)
-
-            if "confidence" in memory_updates:
-                existing = float(self._stm.get("confidence") or 0.0)
+            # Promote the grounded root cause into STM so finalize_incident()
+            # persists it — and so the KPI placeholder does not overwrite it.
+            if rag_root_cause and not no_knowledge:
+                self._stm.set("root_cause", rag_root_cause)
+                existing_conf = float(self._stm.get("confidence") or 0.0)
                 self._stm.set(
                     "confidence",
-                    round(max(existing, float(memory_updates["confidence"])), 2),
+                    round(max(existing_conf, rag_confidence), 2),
                 )
+                # Persist grounded reasoning + evidence for the dashboard.
+                self._stm.set("llm_response", json.dumps(rag_result, default=str))
 
-            if rag_findings.get("requires_human_review") is True:
+            # Map possible_causes into STM evidence with full grounding metadata.
+            if isinstance(rag_findings, dict):
+                for h in memory_updates.get("hypotheses", []):
+                    self._stm.append("hypotheses", h)
+                for cause in rag_findings.get("possible_causes", []):
+                    self._stm.append("evidence", {
+                        "source": "rag",
+                        "chunk_id": cause.get("chunk_id"),
+                        "cause": cause.get("cause"),
+                        "confidence": cause.get("confidence"),
+                    })
+
+            # Escalation signal from the actual contract.
+            requires_human = rag_findings.get("requires_human_review") if isinstance(rag_findings, dict) else None
+            if requires_human is True:
                 self._stm.set("requires_human", True)
 
         # Always run the KPI placeholder (can be replaced later with actual KPI Agent)
@@ -306,27 +342,28 @@ class Orchestrator:
             try:
                 llm = LLMService(settings=self._settings)
 
-                # Build a structured prompt
-                prompt = f"""
-You are an expert business analyst. Based on the following incident details,
-provide a concise root cause analysis and recommended actions.
-
-Incident:
-- Metric: {self._active_event.metric}
-- Current value: {self._active_event.current_value}
-- Expected value: {self._active_event.expected_value}
-- Severity: {self._active_event.severity}
-- Detection methods: {', '.join(self._active_event.detection_methods)}
-
-Short‑Term Memory findings:
-{self._stm.serialize_for_llm()}
-
-Return a JSON object with:
-- root_cause (string)
-- confidence (float 0-1)
-- recommended_action (string)
-"""
+                # Build a structured prompt that insists on pure JSON
+                prompt = (
+                    f"You are an expert business analyst. Based on the following incident details, "
+                    f"provide a concise root cause analysis and recommended actions.\n\n"
+                    f"Incident:\n"
+                    f"- Metric: {self._active_event.metric}\n"
+                    f"- Current value: {self._active_event.current_value}\n"
+                    f"- Expected value: {self._active_event.expected_value}\n"
+                    f"- Severity: {self._active_event.severity}\n"
+                    f"- Detection methods: {', '.join(self._active_event.detection_methods)}\n\n"
+                    f"Short‑Term Memory findings:\n{self._stm.serialize_for_llm()}\n\n"
+                    f"Return ONLY a valid JSON object, no other text, with these keys:\n"
+                    f'{{"root_cause": "...", "confidence": 0.0, "recommended_action": "..."}}'
+                )
                 raw = llm.query(prompt, temperature=0.2, max_tokens=500)
+
+                # Extract the JSON portion (trim any surrounding text)
+                start = raw.find('{')
+                end = raw.rfind('}') + 1
+                if start != -1 and end > start:
+                    raw = raw[start:end]
+
                 insight = json.loads(raw)
 
                 # Update STM with the LLM output
@@ -412,48 +449,6 @@ Return a JSON object with:
                             incident_id, exc,
                         )
 
-                    # DEBUG: print the condition status
-                    print(f">>> JIRA CONDITION CHECK: URL={'OK' if self._settings.JIRA_URL else 'MISSING'}  TOKEN={'OK' if self._settings.JIRA_API_TOKEN else 'MISSING'}")
-
-                    # Jira ticket creation (if Jira is configured)
-                    if self._settings.JIRA_URL and self._settings.JIRA_API_TOKEN:
-                        priority_map = {
-                            "HIGH": "High",
-                            "CRITICAL": "Highest",
-                            "MEDIUM": "Medium",
-                            "LOW": "Low"
-                        }
-                        jira_priority = priority_map.get(self._active_event.severity.upper(), "Medium")
-
-                        jira_params = {
-                            "summary": f"Incident {incident_id}: {self._active_event.metric} anomaly",
-                            "description": (
-                                f"Automated investigation for incident {incident_id}\n\n"
-                                f"Metric: {self._active_event.metric}\n"
-                                f"Severity: {self._active_event.severity}\n"
-                                f"Current value: {self._active_event.current_value}\n"
-                                f"Expected value: {self._active_event.expected_value}\n"
-                                f"Detection methods: {', '.join(self._active_event.detection_methods)}\n"
-                                f"Root cause: {self._stm.get('root_cause', 'Unknown')}\n\n"
-                                f"LLM Reasoning: {self._stm.get('llm_response', 'Not available')}"
-                            ),
-                            "priority": jira_priority,
-                        }
-                        try:
-                            jira_result = self._action.execute(
-                                action_type="jira",
-                                parameters=jira_params,
-                                incident_id=incident_id,
-                            )
-                            logger.info(
-                                "Jira ticket created | incident_id=%s | result=%s",
-                                incident_id, jira_result,
-                            )
-                        except Exception as exc:
-                            logger.error(
-                                "Jira action failed | incident_id=%s | error=%s",
-                                incident_id, exc,
-                            )
                 else:
                     logger.debug("No action triggered for severity=%s", severity)
 
@@ -487,12 +482,16 @@ Return a JSON object with:
         3. Persist via :meth:`~aeam.memory.long_term.LongTermMemory.record_incident`.
         4. If a ReportAgent is available, generate a human-readable report and
            alert from the current memory state.
-        5. If an ActionAgent is available, send the alert to Slack and the
-           detailed report via email.
+        5. If an ActionAgent is available, send the alert to Slack, create a
+           Jira ticket, and send the detailed report via email.
         6. Log the resulting ``incident_id``.
         7. Clear STM.
         8. Reset ``_active_event`` to ``None``.
         """
+        if self._sm.get_state() == IncidentState.COMPLETE:
+            logger.info("finalize_incident | already COMPLETE; skipping duplicate finalize")
+            return
+
         logger.info("finalize_incident | transitioning to COMPLETE")
 
         self._sm.transition(IncidentState.COMPLETE)
@@ -542,7 +541,7 @@ Return a JSON object with:
                     slack_result = self._action.execute(
                         action_type="slack",
                         parameters={
-                            "channel": "#alerts",
+                            "channel": self._settings.SLACK_CHANNEL,
                             "message": alert["message"],
                             "severity": alert["severity"],
                         },
@@ -551,6 +550,49 @@ Return a JSON object with:
                     logger.debug(
                         "finalize_incident | slack alert sent | result=%s",
                         slack_result,
+                    )
+
+                    priority_map = {
+                        "HIGH": "High",
+                        "CRITICAL": "Highest",
+                        "MEDIUM": "Medium",
+                        "LOW": "Low",
+                    }
+                    event_severity = str(event_data.get("severity") or "").upper()
+                    evidence = self._stm.get("evidence", []) or []
+                    evidence_lines = "\n".join(
+                        f"- [{item.get('source', 'evidence')}] "
+                        f"{item.get('cause') or item.get('result') or item} "
+                        f"(chunk_id={item.get('chunk_id', 'n/a')}, "
+                        f"confidence={item.get('confidence', 'n/a')})"
+                        for item in evidence
+                    ) or "No retrieved evidence recorded."
+                    jira_result = self._action.execute(
+                        action_type="jira",
+                        parameters={
+                            "summary": (
+                                f"Incident {incident_id}: "
+                                f"{event_data.get('metric', 'unknown')} anomaly"
+                            ),
+                            "description": (
+                                f"Automated investigation for incident {incident_id}\n\n"
+                                f"Metric: {event_data.get('metric')}\n"
+                                f"Severity: {event_data.get('severity')}\n"
+                                f"Current value: {event_data.get('current_value')}\n"
+                                f"Expected value: {event_data.get('expected_value')}\n"
+                                "Detection methods: "
+                                f"{', '.join(event_data.get('detection_methods', []))}\n"
+                                f"Root cause: {self._stm.get('root_cause', 'Unknown')}\n\n"
+                                f"Retrieved evidence:\n{evidence_lines}\n\n"
+                                f"LLM Reasoning: {self._stm.get('llm_response', 'Not available')}"
+                            ),
+                            "priority": priority_map.get(event_severity, "Medium"),
+                        },
+                        incident_id=incident_id,
+                    )
+                    logger.debug(
+                        "finalize_incident | jira ticket dispatched | result=%s",
+                        jira_result,
                     )
 
                     # Send email with detailed report.
@@ -619,7 +661,7 @@ Return a JSON object with:
 
         # On the first pass, propose a generic hypothesis.
         if depth == 1:
-            self._stm.append("hypotheses", f"Anomaly in {self._active_event.metric}")
+            self._stm.append("hypotheses", f"Anomaly in {self._active_event.metric} ({self._active_event.current_value} vs expected {self._active_event.expected_value})")
 
         # Simulate progressively increasing confidence with each pass.
         current_confidence: float = float(self._stm.get("confidence") or 0.0)

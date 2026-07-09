@@ -31,14 +31,9 @@ router = APIRouter(prefix="/api/v1/incidents", tags=["incidents"])
 # SQL — read-only, no writes.
 _SELECT_ALL_INCIDENTS: str = """
     SELECT
-        incident_id,
-        event_type,
-        severity,
-        status,
-        root_cause,
-        confidence
+        *
     FROM incidents
-    ORDER BY created_at DESC
+    ORDER BY timestamp DESC
 """
 
 
@@ -66,7 +61,6 @@ def list_incidents(request: Request) -> list[dict[str, Any]]:
         - ``incident_id``  — unique incident identifier.
         - ``event_type``   — anomaly event type (e.g. ``"KPI_ANOMALY"``).
         - ``severity``     — severity level (e.g. ``"HIGH"``).
-        - ``status``       — current lifecycle status.
         - ``root_cause``   — identified root cause string, or ``null``.
         - ``confidence``   — investigation confidence score (0–1).
 
@@ -82,7 +76,6 @@ def list_incidents(request: Request) -> list[dict[str, Any]]:
                 "incident_id": "a1b2c3d4-...",
                 "event_type":  "KPI_ANOMALY",
                 "severity":    "HIGH",
-                "status":      "COMPLETE",
                 "root_cause":  "Runaway thread in payment service",
                 "confidence":  0.91
             }

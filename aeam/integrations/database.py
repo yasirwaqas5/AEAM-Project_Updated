@@ -16,6 +16,7 @@ It satisfies the ``DatabaseClient`` protocol defined in
 import json
 import logging
 import uuid
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import create_engine, text
@@ -269,9 +270,12 @@ class DatabaseClient:
             row[returning_column] = str(uuid.uuid4())
 
         # Serialise any dict/list values to JSON strings for SQLite compatibility.
+        # Also convert datetime objects to ISO format strings for TEXT columns.
         for key, value in row.items():
             if isinstance(value, (dict, list)):
                 row[key] = json.dumps(value)
+            elif isinstance(value, datetime):
+                row[key] = value.isoformat()
 
         columns = ", ".join(row.keys())
         placeholders = ", ".join(f":{col}" for col in row.keys())
@@ -501,7 +505,8 @@ class DatabaseClient:
             confidence REAL,
             action_taken BOOLEAN,
             requires_human BOOLEAN,
-            findings TEXT
+            findings TEXT,
+            llm_response TEXT
         );
         """
 

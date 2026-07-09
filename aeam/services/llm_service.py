@@ -1,6 +1,6 @@
 import logging
+# groq import moved inside generate method to avoid mandatory dependency
 import asyncio
-import groq
 from aeam.config.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,7 @@ class LLMService:
                 provider = self.settings.LLM_PROVIDER.lower()
                 logger.info(f"Generating LLM response (attempt {attempt + 1})")
                 if provider == "groq":
+                    import groq
                     client = groq.Groq(api_key=self.settings.LLM_API_KEY)
                     chat = client.chat.completions.create(
                         messages=[{"role": "user", "content": prompt}],

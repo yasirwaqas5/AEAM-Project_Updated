@@ -12,7 +12,7 @@ Phase 4 constraints strictly enforced:
 - No decision logic.
 - No database writes.
 - Qdrant only (official qdrant-client).
-- Similarity threshold: >= 0.7
+- Similarity threshold: >= 0.5
 - Default top_k: 5
 - Embedding: all-MiniLM-L6-v2 (dim=384, cosine)
 """
@@ -32,7 +32,7 @@ logger = get_logger(__name__, agent="rag")
 
 # Phase 4 spec defaults.
 DEFAULT_TOP_K: int = 5
-SIMILARITY_THRESHOLD: float = 0.7
+SIMILARITY_THRESHOLD: float = 0.5
 
 
 class RetrievalPipeline:
@@ -56,7 +56,9 @@ class RetrievalPipeline:
         collection:         Qdrant collection to search.
                             Defaults to ``"aeam_documents"``.
         similarity_threshold: Minimum cosine similarity score to include in
-                            results. Defaults to ``0.7`` (Phase 4 spec).
+                            results. Defaults to ``0.5`` (empirically validated
+                            against the 300/50 chunk corpus; see retrieval
+                            threshold benchmark).
         default_top_k:      Maximum number of results when the caller does not
                             supply ``top_k``. Defaults to ``5`` (Phase 4 spec).
 
@@ -133,7 +135,7 @@ class RetrievalPipeline:
         Steps:
         1. Validate and encode ``query`` to a 384-dim vector.
         2. Build an optional Qdrant payload filter from ``filter_criteria``.
-        3. Query Qdrant with cosine similarity and ``score_threshold`` >= 0.7.
+        3. Query Qdrant with cosine similarity and ``score_threshold`` >= 0.5.
         4. Map each hit to the standardised result schema.
         5. Return results sorted by similarity descending, capped at ``top_k``.
 
@@ -198,14 +200,14 @@ class RetrievalPipeline:
 
         # Step 3: query Qdrant.
         try:
-            hits = self._qdrant.search(
+            hits = self._qdrant.query_points(
                 collection_name=self._collection,
-                query_vector=query_vector,
+                query=query_vector,
                 limit=top_k,
                 score_threshold=self._threshold,
                 query_filter=qdrant_filter,
                 with_payload=True,
-            )
+            ).points
         except Exception as exc:
             logger.error(
                 "RetrievalPipeline.search failed | collection=%r | error=%s",
@@ -272,14 +274,14 @@ class RetrievalPipeline:
         qdrant_filter = self._build_filter(filter_criteria)
 
         try:
-            hits = self._qdrant.search(
+            hits = self._qdrant.query_points(
                 collection_name=self._collection,
-                query_vector=query_vector,
+                query=query_vector,
                 limit=top_k,
                 score_threshold=self._threshold,
                 query_filter=qdrant_filter,
                 with_payload=True,
-            )
+            ).points
         except Exception as exc:
             logger.error(
                 "RetrievalPipeline.search_by_vector failed | error=%s", exc

@@ -25,6 +25,8 @@ from typing import Any
 
 import requests
 
+from aeam.agents.action.errors import ActionValidationError
+
 logger = get_logger(__name__, agent="action")
 
 # Enforced HTTP timeout (Phase 6 spec).
@@ -32,6 +34,19 @@ _HTTP_TIMEOUT: int = 10
 
 # Slack Web API endpoint.
 _SLACK_POST_MESSAGE_URL: str = "https://slack.com/api/chat.postMessage"
+
+# Slack Block Kit hard limits (exceeding these yields an `invalid_blocks` error).
+_HEADER_TEXT_MAX: int = 150      # header plain_text limit
+_SECTION_TEXT_MAX: int = 3000    # section text limit
+_MAX_BLOCKS: int = 50            # per-message / per-attachment block limit
+
+# Slack payload-level error codes that are permanent (retrying cannot help).
+_PERMANENT_SLACK_ERRORS: frozenset[str] = frozenset({
+    "invalid_blocks",
+    "invalid_blocks_format",
+    "invalid_arguments",
+    "messages_tab_disabled",
+})
 
 # Severity → hex colour for the Block Kit attachment sidebar.
 _SEVERITY_COLOURS: dict[str, str] = {
@@ -214,9 +229,25 @@ class SlackActions:
             incident_id=incident_id,
         )
 
+        # Step 3b: validate the payload BEFORE sending. A structural problem is
+        # reported as a non-retryable ActionValidationError rather than being
+        # discovered as an opaque `invalid_blocks` response after the network
+        # round-trip (and never silently dropped).
+        validation_errors = self._validate_payload(payload)
+        if validation_errors:
+            logger.error(
+                "SlackActions.send_alert | payload validation FAILED | channel=%s | "
+                "errors=%s",
+                channel, validation_errors,
+            )
+            raise ActionValidationError(
+                reason="invalid_blocks",
+                details=validation_errors,
+            )
+
         logger.info(
             "SlackActions.send_alert | POST chat.postMessage | channel=%s | "
-            "severity=%s | title=%r",
+            "severity=%s | title=%r | validation=passed",
             channel, severity, title,
         )
 
@@ -249,6 +280,14 @@ class SlackActions:
                 "error=%s",
                 channel, error_code,
             )
+            # Permanent payload errors (e.g. invalid_blocks) must not be retried;
+            # surface them as a structured, non-retryable failure. Transient
+            # errors keep the original RuntimeError so ActionAgent can retry.
+            if error_code in _PERMANENT_SLACK_ERRORS:
+                raise ActionValidationError(
+                    reason=error_code,
+                    details={"channel": channel, "slack_error": error_code},
+                )
             raise RuntimeError(
                 f"Slack API returned ok=false: {error_code!r}. "
                 f"Channel: {channel!r}."
@@ -322,12 +361,18 @@ class SlackActions:
                 "text": f"*Incident:* {incident_id}",
             })
 
+        # Enforce Slack Block Kit length limits so a long title/message can
+        # never trigger `invalid_blocks`. Header is truncated to 150 chars and
+        # the section body to 3000 chars (with an ellipsis marker when cut).
+        safe_title = title if len(title) <= _HEADER_TEXT_MAX else title[:_HEADER_TEXT_MAX - 1] + "…"
+        safe_message = message if len(message) <= _SECTION_TEXT_MAX else message[:_SECTION_TEXT_MAX - 1] + "…"
+
         blocks: list[dict[str, Any]] = [
             {
                 "type": "header",
                 "text": {
                     "type":  "plain_text",
-                    "text":  title,
+                    "text":  safe_title,
                     "emoji": True,
                 },
             },
@@ -335,7 +380,7 @@ class SlackActions:
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": message,
+                    "text": safe_message,
                 },
             },
             {"type": "divider"},
@@ -345,16 +390,130 @@ class SlackActions:
             },
         ]
 
+        # Plain-text fallback used for notifications / accessibility, and as the
+        # attachment fallback. Kept short and free of block markup.
+        fallback_text = f"[{severity}] {safe_title}: {safe_message}"
+
+        # Render the blocks INSIDE a coloured attachment so the severity colour
+        # sidebar actually wraps the message content. Previously the blocks were
+        # placed at the top level next to a content-less colour-only attachment,
+        # so the colour bar rendered detached from the message.
         return {
-            "channel":     channel,
-            "blocks":      blocks,
+            "channel": channel,
+            "text":    fallback_text,
             "attachments": [
                 {
                     "color":    colour,
-                    "fallback": f"[{severity}] {title}: {message}",
+                    "fallback": fallback_text,
+                    "blocks":   blocks,
                 }
             ],
         }
+
+    # ------------------------------------------------------------------
+    # Payload validation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_payload(payload: dict[str, Any]) -> list[str]:
+        """
+        Validate a ``chat.postMessage`` payload against Slack's structural rules.
+
+        Checks the constraints that Slack rejects with ``invalid_blocks`` /
+        ``invalid_arguments``:
+
+        - ``channel`` is present and non-empty.
+        - The payload carries renderable content (``text``, ``blocks``, or
+          ``attachments``).
+        - Every Block Kit block (top-level and inside attachments) is
+          structurally valid: known type, ``header`` ``plain_text`` ≤ 150 chars
+          and non-empty, ``section`` text ≤ 3000 chars and non-empty,
+          ``context`` has a non-empty ``elements`` list.
+        - No block group exceeds the 50-block limit.
+
+        Args:
+            payload: The fully built ``chat.postMessage`` payload.
+
+        Returns:
+            A list of human-readable error strings. Empty list means the
+            payload is valid.
+        """
+        errors: list[str] = []
+
+        channel = payload.get("channel")
+        if not isinstance(channel, str) or not channel.strip():
+            errors.append("channel must be a non-empty string.")
+
+        has_content = bool(
+            payload.get("text") or payload.get("blocks") or payload.get("attachments")
+        )
+        if not has_content:
+            errors.append("payload must include text, blocks, or attachments.")
+
+        # Validate top-level blocks (if any) and blocks inside each attachment.
+        errors.extend(SlackActions._validate_blocks(payload.get("blocks"), "blocks"))
+        for i, attachment in enumerate(payload.get("attachments", []) or []):
+            if not isinstance(attachment, dict):
+                errors.append(f"attachments[{i}] must be an object.")
+                continue
+            errors.extend(
+                SlackActions._validate_blocks(
+                    attachment.get("blocks"), f"attachments[{i}].blocks"
+                )
+            )
+
+        return errors
+
+    @staticmethod
+    def _validate_blocks(blocks: Any, path: str) -> list[str]:
+        """Validate a Block Kit ``blocks`` array. Returns a list of errors."""
+        errors: list[str] = []
+        if blocks is None:
+            return errors
+        if not isinstance(blocks, list):
+            return [f"{path} must be a list."]
+        if len(blocks) > _MAX_BLOCKS:
+            errors.append(f"{path} exceeds the {_MAX_BLOCKS}-block limit ({len(blocks)}).")
+
+        for i, block in enumerate(blocks):
+            here = f"{path}[{i}]"
+            if not isinstance(block, dict):
+                errors.append(f"{here} must be an object.")
+                continue
+            btype = block.get("type")
+            if not btype:
+                errors.append(f"{here} is missing 'type'.")
+                continue
+
+            if btype == "header":
+                text_obj = block.get("text", {})
+                text = text_obj.get("text", "") if isinstance(text_obj, dict) else ""
+                if text_obj.get("type") != "plain_text":
+                    errors.append(f"{here} header text must be plain_text.")
+                if not text.strip():
+                    errors.append(f"{here} header text must be non-empty.")
+                elif len(text) > _HEADER_TEXT_MAX:
+                    errors.append(
+                        f"{here} header text exceeds {_HEADER_TEXT_MAX} chars ({len(text)})."
+                    )
+            elif btype == "section":
+                text_obj = block.get("text", {})
+                text = text_obj.get("text", "") if isinstance(text_obj, dict) else ""
+                if not text.strip():
+                    errors.append(f"{here} section text must be non-empty.")
+                elif len(text) > _SECTION_TEXT_MAX:
+                    errors.append(
+                        f"{here} section text exceeds {_SECTION_TEXT_MAX} chars ({len(text)})."
+                    )
+            elif btype == "context":
+                elements = block.get("elements")
+                if not isinstance(elements, list) or not elements:
+                    errors.append(f"{here} context must have a non-empty elements list.")
+            elif btype == "divider":
+                pass  # no fields to validate
+            # Unknown block types are left to Slack; we only guard the ones we emit.
+
+        return errors
 
     def __repr__(self) -> str:
         return "SlackActions()"

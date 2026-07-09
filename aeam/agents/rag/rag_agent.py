@@ -49,6 +49,86 @@ _JSON_FENCE_RE: re.Pattern[str] = re.compile(
     r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE
 )
 
+# Natural-language descriptions for each internal event-type enum code.
+# Used by _formulate_query() to produce semantically rich SRE investigation
+# queries that align with the vocabulary used in the knowledge base.
+# Unknown event types fall back to a cleaned version of the enum string.
+_EVENT_TYPE_NL: dict[str, str] = {
+    "DB_LATENCY":         "database latency slow query performance lock contention replication lag",
+    "SALES_DROP":         "sales drop revenue decline checkout failure payment gateway anomaly",
+    "SALES_SPIKE":        "sales spike unexpected revenue surge anomaly",
+    "KPI_ANOMALY":        "KPI anomaly metric deviation performance regression threshold breach",
+    "CPU_HIGH":           "CPU saturation high utilization runaway process resource exhaustion",
+    "MEMORY_HIGH":        "memory exhaustion high usage OOM kill application crash",
+    "DISK_IO":            "disk IO saturation high await latency read write",
+    "NETWORK_ERROR":      "network failure latency packet loss connectivity",
+    "ERROR_RATE":         "error rate spike service failure",
+    "LATENCY_HIGH":       "high latency response time degradation API slowdown backend",
+    "CACHE_MISS":         "cache failure miss rate elevated Redis eviction",
+    "QUEUE_BACKLOG":      "queue backlog consumer lag processing delay",
+    "DEPLOYMENT_FAILURE": "deployment failure rollback health check crash",
+    "AUTH_FAILURE":       "authentication failure login error token rejection",
+}
+
+_METADATA_QUERY_LABELS: dict[str, str] = {
+    "service": "service",
+    "service_name": "service",
+    "application": "application",
+    "app": "application",
+    "component": "component",
+    "host": "host",
+    "hostname": "host",
+    "instance": "instance",
+    "pod": "pod",
+    "namespace": "namespace",
+    "cluster": "cluster",
+    "region": "region",
+    "zone": "zone",
+    "environment": "environment",
+    "team": "team",
+    "database": "database",
+    "db": "database",
+    "queue": "queue",
+    "topic": "topic",
+    "endpoint": "endpoint",
+    "path": "path",
+}
+
+_METADATA_QUERY_ORDER: tuple[str, ...] = (
+    "service",
+    "service_name",
+    "application",
+    "app",
+    "component",
+    "host",
+    "hostname",
+    "instance",
+    "pod",
+    "namespace",
+    "cluster",
+    "region",
+    "zone",
+    "environment",
+    "team",
+    "database",
+    "db",
+    "queue",
+    "topic",
+    "endpoint",
+    "path",
+)
+
+_METADATA_QUERY_IGNORED: frozenset[str] = frozenset({
+    "event_id",
+    "request_id",
+    "trace_id",
+    "span_id",
+    "timestamp",
+})
+
+_QUERY_TOKEN_RE: re.Pattern[str] = re.compile(r"[_\-/]+")
+_QUERY_CAMEL_RE: re.Pattern[str] = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
 
 class RAGAgent:
     """
@@ -288,35 +368,93 @@ class RAGAgent:
     @staticmethod
     def _formulate_query(event: Event) -> str:
         """
-        Build a natural-language search query from event fields.
+        Build a natural-language SRE investigation query from event fields.
 
-        Uses ``event.event_type``, ``event.metric``, ``event.severity``, and
-        selected keys from ``event.metadata`` (region, metric, host).
-        The Event object is not modified.
+        Converts the internal event-type enum code to a domain-appropriate
+        description using ``_EVENT_TYPE_NL``, then appends the metric name
+        (underscores replaced with spaces) and any service/host context
+        present in ``event.metadata``.
+
+        This produces queries whose vocabulary is semantically aligned with
+        the SRE runbook content indexed in the vector store, significantly
+        improving cosine similarity scores compared to the previous
+        pipe-delimited key=value format.
+
+        Unknown event types fall back to a cleaned version of the enum
+        string (underscores → spaces, lower-cased) so the method never
+        returns an empty query.
 
         Args:
             event: The event under investigation.
 
         Returns:
-            A descriptive query string for the retrieval pipeline.
+            A concise natural-language query string for the retrieval pipeline.
         """
-        parts: list[str] = [
-            f"event type: {event.event_type}",
-            f"metric: {event.metric}",
-            f"severity: {event.severity}",
-        ]
+        event_desc: str = _EVENT_TYPE_NL.get(
+            event.event_type,
+            event.event_type.replace("_", " ").lower(),
+        )
 
-        meta = event.metadata or {}
-        for field in ("region", "metric", "host", "service"):
-            if field in meta:
-                parts.append(f"{field}: {meta[field]}")
+        metric_nl: str = RAGAgent._normalise_query_fragment(event.metric)
+        parts: list[str] = [event_desc]
 
-        if event.current_value is not None:
-            parts.append(f"current value: {event.current_value}")
-        if event.expected_value is not None:
-            parts.append(f"expected value: {event.expected_value}")
+        if metric_nl:
+            parts.append(metric_nl)
 
-        return " | ".join(parts)
+        parts.extend(RAGAgent._metadata_query_fragments(event.metadata or {}))
+
+        return " ".join(parts)
+
+    @staticmethod
+    def _normalise_query_fragment(value: Any) -> str:
+        """Convert internal identifiers into compact natural-language text."""
+        text = str(value).strip()
+        if not text:
+            return ""
+
+        text = _QUERY_CAMEL_RE.sub(" ", text)
+        text = _QUERY_TOKEN_RE.sub(" ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    @staticmethod
+    def _metadata_query_fragments(metadata: dict[str, Any]) -> list[str]:
+        """Extract runbook-aligned context fragments from event metadata."""
+        fragments: list[str] = []
+        used_keys: set[str] = set()
+
+        for key in _METADATA_QUERY_ORDER:
+            if key not in metadata:
+                continue
+
+            value = metadata.get(key)
+            if value in (None, ""):
+                continue
+
+            label = _METADATA_QUERY_LABELS.get(key, key)
+            value_nl = RAGAgent._normalise_query_fragment(value)
+            if not value_nl:
+                continue
+
+            fragments.append(f"{label} {value_nl}")
+            used_keys.add(key)
+
+        for key in sorted(metadata):
+            if key in used_keys or key in _METADATA_QUERY_IGNORED:
+                continue
+
+            value = metadata.get(key)
+            if value in (None, ""):
+                continue
+
+            key_nl = RAGAgent._normalise_query_fragment(key)
+            value_nl = RAGAgent._normalise_query_fragment(value)
+            if not key_nl or not value_nl:
+                continue
+
+            fragments.append(f"{key_nl} {value_nl}")
+
+        return fragments
 
     @staticmethod
     def _assemble_prompt(

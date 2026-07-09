@@ -1,134 +1,63 @@
-const STATUS_STYLES = {
-  SUCCESS: { color: "#16a34a", background: "#f0fdf4", border: "#bbf7d0" },
-  RUNNING: { color: "#2563eb", background: "#eff6ff", border: "#bfdbfe" },
-  FAILED:  { color: "#dc2626", background: "#fef2f2", border: "#fecaca" },
-  PENDING: { color: "#d97706", background: "#fffbeb", border: "#fde68a" },
-};
+import { Card, Badge, Field, Icon, stateColor, fmtTime, fmtRelative, fmtMs } from "./ui";
 
-function getStatusStyle(status) {
-  return STATUS_STYLES[(status ?? "").toUpperCase()] ?? {
-    color: "#6b7280", background: "#f9fafb", border: "#e5e7eb",
-  };
-}
-
-function formatTimestamp(ts) {
-  if (!ts) return "—";
-  try {
-    return new Date(ts).toLocaleString("en-IN", {
-      dateStyle: "medium",
-      timeStyle: "short",
-    });
-  } catch {
-    return ts;
-  }
-}
-
-function formatMs(ms) {
-  if (ms == null) return "—";
-  if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(2)}s`;
-}
-
-const styles = {
-  card: {
-    background: "#ffffff",
-    border: "1px solid #e5e7eb",
-    borderRadius: "10px",
-    padding: "1.25rem 1.5rem",
-    boxShadow: "0 1px 3px rgba(0,0,0,0.06)",
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.75rem",
-  },
-  topRow: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-  },
-  agentName: {
-    fontSize: "0.95rem",
-    fontWeight: 600,
-    color: "#111827",
-  },
-  statusBadge: (st) => ({
-    fontSize: "0.7rem",
-    fontWeight: 700,
-    letterSpacing: "0.08em",
-    textTransform: "uppercase",
-    padding: "0.2rem 0.6rem",
-    borderRadius: "4px",
-    color: st.color,
-    background: st.background,
-    border: `1px solid ${st.border}`,
-  }),
-  incidentId: {
-    fontSize: "0.72rem",
-    color: "#9ca3af",
-    fontFamily: "monospace",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    whiteSpace: "nowrap",
-  },
-  bottomRow: {
-    display: "flex",
-    justifyContent: "space-between",
-    alignItems: "center",
-    paddingTop: "0.5rem",
-    borderTop: "1px solid #f3f4f6",
-  },
-  metaItem: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "0.2rem",
-  },
-  metaLabel: {
-    fontSize: "0.65rem",
-    textTransform: "uppercase",
-    letterSpacing: "0.1em",
-    color: "#9ca3af",
-  },
-  metaValue: {
-    fontSize: "0.82rem",
-    fontWeight: 500,
-    color: "#374151",
-  },
-};
+/* ──────────────────────────────────────────────────────────────────────────
+ * A single agent-execution log entry, rendered as an enterprise card:
+ * status badge, failure reason, execution time, retry count, validation result.
+ * Consumes the /api/v1/logs/agents response shape (contract unchanged).
+ * ────────────────────────────────────────────────────────────────────────── */
 
 export default function AgentLogCard({ log }) {
   const {
-    agent,
-    incident_id,
-    status,
-    execution_time_ms,
-    timestamp,
+    agent, incident_id, status,
+    execution_time_ms, retry_count, failure_reason, validation_result, timestamp,
   } = log;
 
-  const stStyle = getStatusStyle(status);
+  const statusColor = stateColor(status);
+  const isFailed = (status ?? "").toUpperCase() === "FAILED";
+  const valColor = stateColor(validation_result);
 
   return (
-    <div style={styles.card}>
-      {/* Top: agent name + status badge */}
-      <div style={styles.topRow}>
-        <span style={styles.agentName}>{agent ?? "—"}</span>
-        <span style={styles.statusBadge(stStyle)}>{status ?? "—"}</span>
+    <Card className="aeam-card-hover" style={{ borderLeft: `3px solid ${statusColor}`, padding: "1.2rem 1.4rem", display: "flex", flexDirection: "column", gap: "0.9rem" }}>
+      {/* Top: agent + status badge */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.75rem" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.55rem", minWidth: 0 }}>
+          <Icon name="zap" size={14} color="var(--muted)" />
+          <span style={{ fontSize: "0.92rem", fontWeight: 600, color: "var(--text)", textTransform: "capitalize" }}>{agent ?? "—"}</span>
+        </div>
+        <Badge label={status || "—"} color={statusColor} dot />
       </div>
 
-      {/* Incident ID */}
-      <div style={styles.incidentId}>
+      {/* Incident id */}
+      <div style={{ fontFamily: "var(--font-mono)", fontSize: "0.7rem", color: "var(--muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
         Incident: {incident_id ?? "—"}
       </div>
 
-      {/* Bottom: execution time + timestamp */}
-      <div style={styles.bottomRow}>
-        <div style={styles.metaItem}>
-          <span style={styles.metaLabel}>Exec Time</span>
-          <span style={styles.metaValue}>{formatMs(execution_time_ms)}</span>
+      {/* Failure reason — replaces a bare "FAILED" */}
+      {(isFailed || failure_reason) && (
+        <div style={{
+          fontSize: "0.78rem", color: "#ff8f88", lineHeight: 1.45, wordBreak: "break-word",
+          background: "rgba(255,95,87,0.08)", border: "1px solid rgba(255,95,87,0.25)",
+          borderRadius: 8, padding: "0.55rem 0.75rem",
+          display: "flex", gap: "0.5rem", alignItems: "flex-start",
+        }}>
+          <Icon name="alert" size={14} color="#ff5f57" style={{ marginTop: 1 }} />
+          <span><strong style={{ color: "#ff5f57" }}>Reason:</strong> {failure_reason ?? "Unknown failure"}</span>
         </div>
-        <div style={{ ...styles.metaItem, alignItems: "flex-end" }}>
-          <span style={styles.metaLabel}>Timestamp</span>
-          <span style={styles.metaValue}>{formatTimestamp(timestamp)}</span>
+      )}
+
+      {/* Meta grid */}
+      <div className="aeam-grid-auto" style={{ gap: "1rem", paddingTop: "0.6rem", borderTop: "1px solid var(--border)" }}>
+        <Field label="Execution Time" value={fmtMs(execution_time_ms)} mono />
+        <Field label="Retry Count" value={retry_count ?? "—"} mono
+          color={retry_count > 0 ? "#ffb800" : "var(--text)"} />
+        <div style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
+          <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>Validation</span>
+          {validation_result
+            ? <Badge label={validation_result} color={valColor} />
+            : <span style={{ fontSize: "0.85rem", color: "var(--text)" }}>—</span>}
         </div>
+        <Field label="Timestamp" value={fmtTime(timestamp)} title={`${fmtTime(timestamp)} (${fmtRelative(timestamp)})`} />
       </div>
-    </div>
+    </Card>
   );
 }

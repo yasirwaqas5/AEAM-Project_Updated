@@ -29,10 +29,20 @@ from typing import Any
 
 import requests
 
+from aeam.agents.action.errors import ActionConfigurationError
+
 logger = get_logger(__name__, agent="action")
 
 # Enforced HTTP timeout (Phase 6 spec).
 _HTTP_TIMEOUT: int = 10
+
+# Required Google Cloud / Gmail credentials, in the order they are reported
+# when missing.
+_REQUIRED_CREDENTIALS: tuple[str, ...] = (
+    "gmail_private_key",
+    "gmail_client_email",
+    "gmail_sender_address",
+)
 
 # Gmail API send endpoint (user "me" = the authenticated service account).
 _GMAIL_SEND_URL: str = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
@@ -169,10 +179,31 @@ class EmailActions:
                 "cc":      ["management@example.com"],
             })
         """
-        # Step 1: retrieve secrets.
-        client_email: str = self._secrets.get("gmail_client_email")
-        private_key: str = self._secrets.get("gmail_private_key")
-        sender: str = self._secrets.get("gmail_sender_address")
+        # Step 0: verify credentials are configured BEFORE doing any work.
+        # Missing credentials are a configuration error, not a transient
+        # failure — surface a structured, non-retryable error so the caller
+        # never silently fails and never wastes retry attempts on it.
+        resolved: dict[str, Any] = {
+            key: self._secrets.get(key) for key in _REQUIRED_CREDENTIALS
+        }
+        missing: list[str] = [
+            key for key in _REQUIRED_CREDENTIALS
+            if not (isinstance(resolved[key], str) and resolved[key].strip())
+        ]
+        if missing:
+            logger.error(
+                "EmailActions.send_email | missing Google Cloud credentials | missing=%s",
+                missing,
+            )
+            raise ActionConfigurationError(
+                reason="Missing Google Cloud credentials",
+                details={"missing": missing},
+            )
+
+        # Step 1: retrieve secrets (validated present above).
+        client_email: str = resolved["gmail_client_email"]
+        private_key: str = resolved["gmail_private_key"]
+        sender: str = resolved["gmail_sender_address"]
 
         # Step 2: obtain OAuth2 token.
         access_token = self._get_access_token(

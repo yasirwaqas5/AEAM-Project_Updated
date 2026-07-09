@@ -18,9 +18,8 @@ def test_embedding_dimension():
 
 def test_embedding_empty_string():
     service = EmbeddingService()
-    result = service.encode_text("")
-    assert isinstance(result, list)
-    assert result == []
+    with pytest.raises(ValueError, match="requires a non-empty"):
+        service.encode_text("")
 
 
 def test_embedding_batch():

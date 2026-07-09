@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 _INTERNAL_PREFIX: str = "/internal"
 
 # Routes that never require authentication (e.g. health check).
-_PUBLIC_PATHS: frozenset[str] = frozenset({"/health", "/docs", "/openapi.json", "/redoc", "/favicon.ico"})
+_PUBLIC_PATHS: frozenset[str] = frozenset({"/", "/health", "/docs", "/openapi.json", "/redoc", "/favicon.ico"})
 
 # ---------------------------------------------------------------------------
 # Endpoint → (resource, action) mapping for RBAC.
@@ -74,7 +74,8 @@ class SecurityMiddleware(BaseHTTPMiddleware):
     security checks.
 
     Per-request steps:
-    1. Bypass if path starts with ``/internal`` or is in ``_PUBLIC_PATHS``.
+    1. Bypass if path starts with ``/internal`` or is in ``_PUBLIC_PATHS``,
+       or if the environment is ``"development"``.
     2. Extract ``Authorization: Bearer <token>`` header.
     3. Verify the JWT via :class:`~aeam.security.jwt_auth.JWTAuth`.
     4. Extract ``user_id`` and ``roles`` from the payload.
@@ -91,6 +92,8 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         rbac:          RBAC policy enforcer.
         rate_limiter:  Redis-backed rate limiter.
         audit_logger:  Append-only audit recorder.
+        environment:   Deployment environment ("development", "staging", "production").
+                       In development, all security checks are bypassed.
 
     Example::
 
@@ -100,6 +103,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             rbac=RBAC(),
             rate_limiter=RateLimiter(redis_client=redis),
             audit_logger=AuditLogger(),
+            environment="development",
         )
     """
 
@@ -110,6 +114,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         rbac: RBAC,
         rate_limiter: RateLimiter,
         audit_logger: AuditLogger,
+        environment: str = "production",
     ) -> None:
         """
         Initialise SecurityMiddleware with injected security dependencies.
@@ -120,6 +125,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             rbac:         RBAC enforcer instance.
             rate_limiter: Rate limiter instance.
             audit_logger: Audit logger instance.
+            environment:  Deployment environment (default: "production").
 
         Raises:
             ValueError: If any required dependency is None.
@@ -139,6 +145,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         self._rbac: RBAC = rbac
         self._rate_limiter: RateLimiter = rate_limiter
         self._audit: AuditLogger = audit_logger
+        self._environment: str = environment
 
     # ------------------------------------------------------------------
     # Middleware dispatch
@@ -156,13 +163,22 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             :class:`fastapi.responses.JSONResponse` with an error status on
             security failure, or the downstream :class:`starlette.responses.Response`
             on success.
+        logger.debug("SecurityMiddleware | ENTER DISPATCH | %s %s", method, path)
         """
         path: str = request.url.path
         method: str = request.method
 
+        # Step 0: bypass ALL authentication in development, or if forced.
+        if self._environment == "development":  # temporarily bypass all auth
+            logger.debug("SecurityMiddleware | BYPASS (all auth disabled) | %s %s", method, path)
+            return await call_next(request)
+
         # Step 1: bypass internal routes and public paths.
         if self._is_bypassed(path):
-            logger.debug("SecurityMiddleware | BYPASS | %s %s", method, path)
+            logger.debug(
+                "SecurityMiddleware | BYPASS | %s %s | env=%s",
+                method, path, self._environment,
+            )
             return await call_next(request)
 
         user_id: str = "anonymous"
@@ -297,8 +313,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         """
         return path.startswith(_INTERNAL_PREFIX) or path in _PUBLIC_PATHS
 
-    @staticmethod
-    def _extract_bearer_token(request: Request) -> str | None:
+    def _extract_bearer_token(self, request: Request) -> str | None:
         """
         Extract the Bearer token from the ``Authorization`` header.
 
@@ -418,5 +433,6 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         return (
             f"SecurityMiddleware("
             f"rate_limit={_RATE_LIMIT_REQUESTS}req/"
-            f"{_RATE_LIMIT_WINDOW_SECONDS}s)"
+            f"{_RATE_LIMIT_WINDOW_SECONDS}s, "
+            f"env={self._environment})"
         )

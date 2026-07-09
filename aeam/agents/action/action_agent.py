@@ -32,6 +32,10 @@ from typing import Any
 from aeam.core.idempotency import IdempotencyManager
 from aeam.integrations.database import DatabaseClient
 from aeam.integrations.redis_client import RedisClient
+from aeam.agents.action.errors import (
+    ActionValidationError,
+    NonRetryableActionError,
+)
 
 # Correct imports based on your folder structure
 from aeam.agents.action.jira_actions import JiraActions
@@ -354,18 +358,45 @@ class ActionAgent:
         final_status: str
         last_exc: Exception | None = None
         success: bool = False
+        attempts_made: int = 0
+        failure_reason: str | None = None
+        # Validation outcome for this execution: PASSED (ran/validated cleanly),
+        # FAILED (payload validation error), SKIPPED (configuration error), or
+        # N/A (transient runtime failure — validation not the cause).
+        validation_result: str = "N/A"
+
+        start_time: float = time.monotonic()
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
+            attempts_made = attempt
             try:
                 handler = self._registry[action_type]
                 handler_result = handler.execute(parameters)
                 final_status = STATUS_SUCCESS
                 success = True
+                validation_result = "PASSED"
 
                 logger.info(
                     "execute | SUCCESS | action_type=%s | incident_id=%s | "
                     "attempt=%d/%d | action_id=%s",
                     action_type, incident_id, attempt, _MAX_ATTEMPTS, action_id,
+                )
+                break
+
+            except NonRetryableActionError as exc:
+                # Configuration / validation errors cannot succeed on retry —
+                # fail fast with a structured reason and do not retry.
+                last_exc = exc
+                final_status = STATUS_FAILED
+                handler_result = exc.to_dict()
+                failure_reason = exc.reason
+                validation_result = (
+                    "FAILED" if isinstance(exc, ActionValidationError) else "SKIPPED"
+                )
+                logger.error(
+                    "execute | NON_RETRYABLE (%s) | action_type=%s | incident_id=%s | "
+                    "reason=%s | action_id=%s",
+                    type(exc).__name__, action_type, incident_id, exc.reason, action_id,
                 )
                 break
 
@@ -387,8 +418,9 @@ class ActionAgent:
                     logger.debug("execute | retrying in %.2fs", sleep_time)
                     time.sleep(sleep_time)
         else:
-            # All attempts exhausted.
+            # All attempts exhausted (transient failures only).
             final_status = STATUS_FAILED
+            failure_reason = str(last_exc)
             handler_result = {
                 "error":   str(last_exc),
                 "detail":  f"Action failed after {_MAX_ATTEMPTS} attempts.",
@@ -405,6 +437,23 @@ class ActionAgent:
         else:
             cb.record_failure()
 
+        # Assemble execution metadata for logs, API, and dashboard.
+        # retry_count = attempts beyond the first (0 when no retries occurred).
+        execution_meta: dict[str, Any] = {
+            "execution_duration_ms": int((time.monotonic() - start_time) * 1000),
+            "retry_count":           max(0, attempts_made - 1),
+            "failure_reason":        failure_reason,
+            "validation_result":     validation_result,
+        }
+
+        logger.info(
+            "execute | RESULT | action_type=%s | incident_id=%s | status=%s | "
+            "duration_ms=%d | retry_count=%d | validation=%s | reason=%s | action_id=%s",
+            action_type, incident_id, final_status,
+            execution_meta["execution_duration_ms"], execution_meta["retry_count"],
+            validation_result, failure_reason, action_id,
+        )
+
         # Step 9: store result in Redis (idempotency record).
         self._idempotency.store(
             key=idempotency_key,
@@ -414,23 +463,26 @@ class ActionAgent:
                 "action_type": action_type,
                 "incident_id": incident_id,
                 **handler_result,
+                **execution_meta,
             },
         )
 
-        # Step 10: persist audit record to action_logs table.
+        # Step 10: persist audit record to action_logs table. Execution metadata
+        # is embedded in the JSON `result` column (no schema change required).
         self._log_to_database(
             action_id=action_id,
             action_type=action_type,
             incident_id=incident_id,
             parameters=parameters,
             status=final_status,
-            result=handler_result,
+            result={**handler_result, **execution_meta},
         )
 
         return {
             "status":    final_status,
             "action_id": action_id,
             "result":    handler_result,
+            **execution_meta,
         }
 
     @property

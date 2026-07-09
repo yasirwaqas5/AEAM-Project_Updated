@@ -86,6 +86,11 @@ class Settings(BaseSettings):
         description="Feature flag to enable or disable LLM-powered components.",
     )
 
+    ENABLE_MONITOR_AGENT: bool = Field(
+        default=False,
+        description="Feature flag to enable or disable the MonitorAgent.",
+    )
+
     LLM_PROVIDER: str = Field(
         default="gemini",
         description="Which LLM backend to use: 'gemini', 'openai', etc.",

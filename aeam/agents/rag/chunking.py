@@ -69,7 +69,7 @@ class TextChunker:
 
     def __init__(
         self,
-        chunk_size: int = 512,
+        chunk_size: int = 256,
         overlap: int = 50,
         strategy: str = "sentence",
     ) -> None:
@@ -340,10 +340,22 @@ class TextChunker:
 
     def _compute_overlap_tail(self, text: str) -> str:
         """
-        Extract the trailing ``overlap`` characters from ``text``.
+        Extract a trailing overlap window from ``text``, snapped to a whole-word
+        boundary, for prepending to the next chunk.
 
-        Trims to the nearest word boundary to avoid splitting mid-word.
-        Returns an empty string if ``overlap`` is zero.
+        Takes the last ``overlap`` characters, then — if that window begins in
+        the middle of a word — extends the start *backward* to the beginning of
+        that word. This preserves whole semantic phrases at the overlap seam
+        (e.g. keeps ``"inefficient queries"`` intact rather than orphaning it to
+        ``"queries"``).
+
+        The previous implementation trimmed *forward* to the first space, which
+        discarded the head of the straddled word and could strip a modifier from
+        the noun it qualifies. As a result the returned tail may now be slightly
+        longer than ``overlap`` characters (by at most one partial word).
+
+        Behaviour is deterministic and depends only on ``text`` and ``overlap``.
+        Returns an empty string if ``overlap`` is zero or ``text`` is empty.
 
         Args:
             text: The chunk text to extract a tail from.
@@ -354,12 +366,18 @@ class TextChunker:
         if self._overlap == 0 or not text:
             return ""
 
-        tail = text[-self._overlap:]
+        if len(text) <= self._overlap:
+            # Whole text fits within the overlap budget; use it as-is.
+            start = 0
+        else:
+            start = len(text) - self._overlap
+            # If the window boundary fell inside a word, extend backward to the
+            # start of that word so its leading characters are not orphaned.
+            if not text[start - 1].isspace() and not text[start].isspace():
+                prev_space = text.rfind(" ", 0, start)
+                start = prev_space + 1 if prev_space != -1 else 0
 
-        # Trim to the nearest word boundary to avoid mid-word splits.
-        space_idx = tail.find(" ")
-        if space_idx > 0:
-            tail = tail[space_idx + 1:]
+        tail = text[start:].strip()
 
         return tail + " " if tail else ""
 

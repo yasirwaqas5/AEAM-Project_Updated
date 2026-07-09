@@ -22,8 +22,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, HTTPException, Request
 
 logger = logging.getLogger(__name__)
 
@@ -146,56 +145,74 @@ _LOG_STORE: list[dict[str, Any]] = _generate_mock_logs()
 # Endpoint
 # ---------------------------------------------------------------------------
 
-@router.get(
-    "/agents",
-    summary="List agent execution logs",
-    response_description="List of agent execution log entries.",
-)
-def list_agent_logs(request: Request) -> JSONResponse:
-    """
-    Return agent execution log entries from the in-memory log store.
-
-    No persistent log storage exists yet. This endpoint returns
-    deterministic mock data seeded at module load time. The response
-    shape matches the intended production schema so consumers can
-    integrate against it immediately.
-
-    When real log persistence is implemented, replace ``_LOG_STORE``
-    with a query against the ``action_logs`` table via
-    ``request.app.state.container.db``.
-
-    Args:
-        request: Incoming FastAPI request. Available for future use
-                 when ``container.db`` is used for real log retrieval.
-
-    Returns:
-        ``200`` — JSON array of log entry objects::
-
-            [
-                {
-                    "agent":             "rag",
-                    "incident_id":       "inc-mock-0002",
-                    "status":            "SUCCESS",
-                    "execution_time_ms": 1340,
-                    "timestamp":         "2024-01-15T14:32:00.000000+00:00"
-                },
-                ...
-            ]
-
-        ``500`` — If an unexpected error occurs reading the log store.
-
-    Note:
-        This endpoint is public — no authentication is required.
-        No agents are triggered. No data is written.
-    """
+@router.get("/agents", response_model=list[dict])
+def list_agent_logs(request: Request):
+    container = request.app.state.container
     try:
-        logs = list(_LOG_STORE)
-        logger.info("list_agent_logs | returned %d entries", len(logs))
-        return JSONResponse(status_code=200, content=logs)
-
-    except Exception as exc:  # noqa: BLE001
-        logger.error("list_agent_logs | unexpected error: %s", exc)
-        return JSONResponse(
+        db = container.db
+        # Select the JSON `result` column so we can surface the execution
+        # metadata (duration, retry count, failure reason, validation result)
+        # that ActionAgent embeds there.
+        query = """
+        SELECT action_type as agent, incident_id, status,
+               result, executed_at as timestamp
+        FROM action_logs
+        ORDER BY executed_at DESC
+        LIMIT 50
+        """
+        rows = _fetch_all(db, query)
+        logs = []
+        for row in rows:
+            meta = _parse_result(row.get("result"))
+            logs.append({
+                "agent": row["agent"] or "action",
+                "incident_id": row["incident_id"],
+                "status": row["status"],
+                # Existing key preserved; now populated from the real duration.
+                "execution_time_ms": meta.get("execution_duration_ms", 0),
+                # New, additive fields (null on legacy rows that predate them).
+                "retry_count": meta.get("retry_count"),
+                "failure_reason": meta.get("failure_reason"),
+                "validation_result": meta.get("validation_result"),
+                "timestamp": (
+                    row["timestamp"].isoformat()
+                    if hasattr(row["timestamp"], "isoformat")
+                    else row["timestamp"]
+                ),
+            })
+        return logs
+    except Exception as e:
+        logger.error("Failed to fetch agent logs: %s", e)
+        raise HTTPException(
             status_code=500,
-            content={"detail": "Failed to retrieve agent logs."},
-        )
+            detail="Failed to retrieve agent logs from the database.",
+        ) from e
+
+
+def _parse_result(result: Any) -> dict[str, Any]:
+    """
+    Normalise the ``action_logs.result`` column into a dict.
+
+    The column may come back as a dict (Postgres JSONB), a JSON string
+    (SQLite / text storage), or ``None``. Any parse failure degrades to an
+    empty dict so a malformed legacy row never breaks the endpoint.
+    """
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str) and result.strip():
+        import json
+        try:
+            parsed = json.loads(result)
+            return parsed if isinstance(parsed, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+    return {}
+
+
+def _fetch_all(db: Any, query: str) -> list[dict[str, Any]]:
+    from sqlalchemy import text
+
+    with db._engine.connect() as conn:
+        result = conn.execute(text(query))
+        rows = result.mappings().all()
+        return [dict(row) for row in rows]

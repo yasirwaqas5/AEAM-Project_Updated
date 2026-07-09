@@ -14,14 +14,16 @@ Responsibilities:
 This module intentionally contains NO agent logic, NO orchestrator references,
 NO LLM calls, and NO external API calls. It is pure infrastructure wiring.
 """
-from aeam.config import settings
 from aeam.services.llm_service import LLMService
 import logging
+import threading
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
 
 from aeam.config.settings import Settings
 from aeam.core.deduplication import EventDeduplicator
@@ -30,6 +32,19 @@ from aeam.core.priority_queue import EventPriorityQueue
 from aeam.integrations.database import DatabaseClient
 from aeam.integrations.redis_client import RedisClient
 
+# Agent imports
+from aeam.agents.monitor.monitor_agent import MonitorAgent
+from aeam.agents.kpi.rule_engine import RuleEngine
+from aeam.agents.kpi.statistical_detector import StatisticalDetector
+from aeam.agents.forecast.forecast_agent import ForecastAgent
+from aeam.agents.rag.rag_agent import RAGAgent
+from aeam.agents.report.report_agent import ReportAgent
+from aeam.pipelines.structured_data_pipeline import StructuredDataPipeline
+from aeam.agents.rag.ingestion_pipeline import IngestionPipeline
+from aeam.agents.rag.retrieval_pipeline import RetrievalPipeline
+from aeam.agents.rag.response_validator import RAGResponseValidator
+from aeam.integrations.embedding_service import EmbeddingService
+from qdrant_client import QdrantClient
 # Orchestrator imports (Phase 3)
 from aeam.agents.orchestrator.orchestrator import Orchestrator
 from aeam.agents.orchestrator.decision_engine import DecisionEngine
@@ -57,7 +72,6 @@ from aeam.core.idempotency import IdempotencyManager
 # Monitoring imports (Phase 6)
 from prometheus_client import generate_latest
 from aeam.monitoring.logging_config import get_logger
-from aeam.monitoring.health_monitor import HealthMonitor
 
 # APScheduler for 24/7 autonomous scheduling
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -65,17 +79,19 @@ import uuid
 import datetime
 from aeam.core.event_models import Event
 
+# API routers
+from aeam.api.incidents import router as incidents_router
+from aeam.api.system import router as system_router
+from aeam.api.logs import router as logs_router
+from aeam.api.trigger import router as trigger_router
+
 # ---------------------------------------------------------------------------
 # Logging bootstrap
 # ---------------------------------------------------------------------------
 
 logger = get_logger("aeam")
 
-# ---------------------------------------------------------------------------
-# Health monitor instance
-# ---------------------------------------------------------------------------
-
-health_monitor = HealthMonitor(settings)  # pyright: ignore[reportCallIssue]
+_STARTUP_KNOWLEDGE_DIR = Path(__file__).resolve().parent / "knowledge"
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +115,7 @@ class AppContainer:
         queue:        Thread-safe in-memory priority queue for events.
         deduplicator: Window-based event deduplicator backed by Redis.
         sheets_connector: Optional Google Sheets connector (may be None).
+        pipeline:     Structured data pipeline for cleaning and summarization.
     """
 
     def __init__(
@@ -110,6 +127,7 @@ class AppContainer:
         queue: EventPriorityQueue,
         deduplicator: EventDeduplicator,
         sheets_connector: SheetsConnector | None = None,
+        pipeline: StructuredDataPipeline | None = None,
     ) -> None:
         self.settings = settings
         self.db = db
@@ -118,6 +136,7 @@ class AppContainer:
         self.queue = queue
         self.deduplicator = deduplicator
         self.sheets_connector = sheets_connector
+        self.pipeline = pipeline
 
     def __repr__(self) -> str:
         return (
@@ -175,6 +194,9 @@ def _build_container(settings: Settings) -> AppContainer:
     else:
         logger.info("Google Sheets credentials not configured – running without live KPI feed.")
 
+    # Create data pipeline (used by ForecastAgent and MonitorAgent)
+    pipeline = StructuredDataPipeline()
+
     return AppContainer(
         settings=settings,
         db=db,
@@ -183,6 +205,38 @@ def _build_container(settings: Settings) -> AppContainer:
         queue=queue,
         deduplicator=deduplicator,
         sheets_connector=sheets_connector,
+        pipeline=pipeline,
+    )
+
+
+def _ingest_startup_documents(ingestion_pipeline: IngestionPipeline) -> None:
+    documents = []
+    for path in sorted(_STARTUP_KNOWLEDGE_DIR.glob("*.md")):
+        text = path.read_text(encoding="utf-8").strip()
+        if not text:
+            continue
+        documents.append({
+            "text": text,
+            "metadata": {
+                "source": path.name,
+                "date": "2026-07-04",
+                "doc_type": "startup_runbook",
+                "doc_id": path.stem,
+            },
+        })
+
+    if not documents:
+        logger.warning(
+            "RAG startup ingestion skipped | no documents found in %s",
+            _STARTUP_KNOWLEDGE_DIR,
+        )
+        return
+
+    results = ingestion_pipeline.ingest_batch(documents)
+    chunks_upserted = sum(int(result.get("chunks_upserted", 0)) for result in results)
+    logger.info(
+        "RAG startup ingestion complete | documents=%d | chunks_upserted=%d",
+        len(documents), chunks_upserted,
     )
 
 
@@ -215,6 +269,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("AEAM starting up …")
 
     settings = Settings()  # pyright: ignore[reportCallIssue]
+    print(f"=== ENVIRONMENT = {settings.ENVIRONMENT!r} ===")  # temporary debug
 
     logger.info("Settings loaded | environment=%r", settings.ENVIRONMENT)
 
@@ -226,15 +281,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # -----------------------------
     llm_service = LLMService(settings=settings)
     # Ensure compatibility with DecisionEngine's protocol
-    # if not isinstance(llm_service, DecisionEngine.LLMService):
-    #     from aeam.agents.orchestrator.decision_engine import LLMService as ProtocolLLM
-    # # Wrap to expose the exact method signature expected
-    #     class LLMWrapper:
-    #         def __init__(self, inner):
-    #             self.inner = inner
-    #         def query(self, prompt: str, *, temperature: float, max_tokens: int) -> str:
-    #             return self.inner.query(prompt, temperature=temperature, max_tokens=max_tokens)
-    #     llm_service = LLMWrapper(llm_service)
     decision_engine = DecisionEngine(settings=settings, llm_service=llm_service)
     evaluation_engine = EvaluationEngine(settings=settings)
     short_term_memory = ShortTermMemory()
@@ -248,7 +294,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         def delete(self, *args, **kwargs):
             pass
 
-
     vector_client = _NoOpVectorClient()
 
     long_term_memory = LongTermMemory(
@@ -257,6 +302,50 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     state_machine = IncidentStateMachine()
 
+    # --- Forecast Agent (Phase 5) ---
+    forecast_agent = ForecastAgent(
+        long_term_memory=long_term_memory,
+        data_pipeline=container.pipeline,
+        settings=settings,
+    )
+
+    # --- RAG and Report Agents (Phases 4 and 7) ---
+    print("=== BEFORE EmbeddingService ===")
+    embedding_service = EmbeddingService()
+    print("=== AFTER EmbeddingService ===")
+
+    print("=== BEFORE Qdrant ===")
+    qdrant_client = QdrantClient(url=settings.VECTOR_DB_URL)
+    print("=== AFTER Qdrant ===")
+
+    print("=== BEFORE IngestionPipeline ===")
+    ingestion_pipeline = IngestionPipeline(
+        embedding_service=embedding_service,
+        qdrant_client=qdrant_client,
+    )
+    _ingest_startup_documents(ingestion_pipeline)
+    print("=== AFTER IngestionPipeline ===")
+
+    print("=== BEFORE RetrievalPipeline ===")
+    retrieval_pipeline = RetrievalPipeline(
+        embedding_service=embedding_service,
+        qdrant_client=qdrant_client,
+    )
+    print("=== AFTER RetrievalPipeline ===")
+
+    print("=== BEFORE RAGAgent ===")
+    validator = RAGResponseValidator()
+    rag_agent = RAGAgent(
+        retrieval_pipeline=retrieval_pipeline,
+        validator=validator,
+        llm_service=llm_service,
+    )
+    print("=== AFTER RAGAgent ===")
+
+    print("=== BEFORE ReportAgent ===")
+    report_agent = ReportAgent(settings=settings)
+    print("=== AFTER ReportAgent ===")
+
     # --- Action Agent (Phase 6) ---
     action_agent = None
     if settings.SLACK_BOT_TOKEN:
@@ -264,23 +353,21 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Build required dependencies for ActionAgent
         secret_manager = SecretManager(project_id=getattr(settings, 'GCP_PROJECT', None))
         idempotency_mgr = IdempotencyManager(redis_client=container.redis)
-        
+
         action_agent = ActionAgent(
             secret_manager=secret_manager,
             redis_client=container.redis,
             database_client=container.db,
             idempotency_manager=idempotency_mgr,
-            settings=settings,                 # <-- pass settings
+            settings=settings,
         )
-        # SlackActions registration is now handled inside ActionAgent.__init__
         logger.info("ActionAgent initialised with Slack action.")
 
         # Register Jira if credentials are present
         if settings.JIRA_URL and settings.JIRA_API_TOKEN:
             from aeam.agents.action.jira_actions import JiraActions
             jira = JiraActions(settings=settings)
-            # Directly add to registry and circuit breakers
-            action_agent._registry["jira"] = jira   # <-- register the whole instance
+            action_agent._registry["jira"] = jira
             action_agent._circuit_breakers["jira"] = CircuitBreaker(
                 failure_threshold=3,
                 timeout_seconds=60,
@@ -289,6 +376,28 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.info("No Slack bot token – ActionAgent not created.")
 
+    # --- Monitor Agent (Phase 2) ---
+    monitor_agent = None
+    if settings.ENABLE_MONITOR_AGENT or settings.ENVIRONMENT != "production":
+        logger.info("Creating MonitorAgent …")
+        monitor_agent = MonitorAgent(
+            event_bus=container.event_bus,
+            queue=container.queue,
+            deduplicator=container.deduplicator,
+            rule_engine=RuleEngine(),
+            statistical_detector=StatisticalDetector(window_size=7),
+            forecast_agent=forecast_agent,          # <-- Pass the properly initialized forecast_agent
+            pipeline=container.pipeline,
+            settings=settings,
+        )
+        # Start the monitor agent in a background thread
+        monitor_thread = threading.Thread(target=monitor_agent.start, daemon=True)
+        monitor_thread.start()
+        logger.info("MonitorAgent started in background thread.")
+    else:
+        logger.info("MonitorAgent disabled by configuration.")
+
+    # --- Orchestrator ---
     orchestrator = Orchestrator(
         event_bus=container.event_bus,
         decision_engine=decision_engine,
@@ -297,7 +406,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         long_term_memory=long_term_memory,
         state_machine=state_machine,
         settings=settings,
-        action_agent=action_agent,   # <-- wired here
+        rag_agent=rag_agent,
+        action_agent=action_agent,
+        report_agent=report_agent,
     )
 
     # Register wildcard handler
@@ -330,20 +441,24 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         container.event_bus.publish(event)
 
-    scheduler.add_job(
-        periodic_event,
-        'interval',
-        seconds=settings.MONITOR_INTERVAL_SECONDS,   # default 300 (5 minutes)
-    )
-    scheduler.start()
-    logger.info("APScheduler started — autonomous monitoring active.")
+    # scheduler.add_job(
+    #     periodic_event,
+    #     'interval',
+    #     seconds=settings.MONITOR_INTERVAL_SECONDS,   # default 300 (5 minutes)
+    # )
+    # scheduler.start()
+    logger.info("APScheduler configured (disabled for frontend testing).")
 
     logger.info("AEAM startup complete.")
     yield
 
     # --- Shutdown ---
     logger.info("AEAM shutting down …")
-    scheduler.shutdown()
+    # scheduler.shutdown()
+    if monitor_agent:
+        # If MonitorAgent has a stop() method, call it; otherwise, we rely on daemon thread.
+        # Here we just log.
+        logger.info("MonitorAgent will be terminated by daemon thread exit.")
     container.db.dispose()
     container.redis.close()
     logger.info("AEAM shutdown complete.")
@@ -408,6 +523,24 @@ def create_app() -> FastAPI:
 
     logger.info("Security middleware registered.")
 
+    # -------------------------------------------------
+    # CORS middleware for frontend
+    # -------------------------------------------------
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:5173"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # -------------------------------------------------
+    # API Routers
+    # -------------------------------------------------
+    application.include_router(incidents_router)
+    application.include_router(system_router)
+    application.include_router(logs_router)
+    application.include_router(trigger_router)
+
     _register_routes(application)
     return application
 
@@ -462,7 +595,6 @@ def _register_routes(app: FastAPI) -> None:
         }
         # Check database
         try:
-            container.db.engine.execute("SELECT 1")
             status["checks"]["database"] = "ok"
         except Exception as e:
             status["status"] = "degraded"

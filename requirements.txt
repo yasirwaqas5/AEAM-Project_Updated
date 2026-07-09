@@ -47,3 +47,5 @@ cryptography
 # --- Observability ---
 structlog
 prometheus-client
+# --- Scheduling ---
+apscheduler

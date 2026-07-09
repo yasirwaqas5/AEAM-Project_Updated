@@ -158,7 +158,7 @@ def trigger_event(body: TriggerRequest, request: Request) -> JSONResponse:
         event_type=body.event_type,
         metric=body.metric,
         current_value=body.value,
-        expected_value=None,
+        expected_value=body.value * 2,
         detection_methods=["manual_trigger"],
         severity=body.severity,
         timestamp=datetime.now(tz=timezone.utc),
