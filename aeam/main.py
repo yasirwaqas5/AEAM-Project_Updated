@@ -42,6 +42,11 @@ from aeam.agents.report.report_agent import ReportAgent
 from aeam.pipelines.structured_data_pipeline import StructuredDataPipeline
 from aeam.agents.rag.ingestion_pipeline import IngestionPipeline
 from aeam.agents.rag.retrieval_pipeline import RetrievalPipeline
+from aeam.agents.rag.hybrid_retrieval import BM25Index, HybridRetrievalPipeline
+from aeam.agents.rag.query_expansion import QueryExpansionAgent
+from aeam.agents.rag.multi_query_retrieval import MultiQueryRetrievalPipeline
+from aeam.agents.rag.reranker import CrossEncoderReranker, RerankingRetrievalPipeline
+from aeam.agents.rag.evidence_diversity import EvidenceDiversityFilter, EvidenceDiversityPipeline
 from aeam.agents.rag.response_validator import RAGResponseValidator
 from aeam.integrations.embedding_service import EmbeddingService
 from qdrant_client import QdrantClient
@@ -333,10 +338,116 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     print("=== AFTER RetrievalPipeline ===")
 
+    # --- Phase 7.1: Hybrid (dense + BM25 + RRF) retrieval ---
+    # Wrap the unchanged dense pipeline. BM25 corpus is built by scrolling the
+    # same Qdrant collection. Any build failure falls back to dense-only so RAG
+    # never breaks at startup.
+    rag_retrieval = retrieval_pipeline
+    if settings.RAG_HYBRID_ENABLED:
+        try:
+            bm25_index = BM25Index.from_qdrant(
+                qdrant_client=qdrant_client,
+                collection=retrieval_pipeline.collection,
+            )
+            rag_retrieval = HybridRetrievalPipeline(
+                dense_pipeline=retrieval_pipeline,
+                bm25_index=bm25_index,
+            )
+            logger.info(
+                "RAG hybrid retrieval ENABLED | bm25_docs=%d | collection=%s",
+                bm25_index.size, retrieval_pipeline.collection,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "RAG hybrid retrieval init failed (%s) — falling back to dense-only.",
+                exc,
+            )
+            rag_retrieval = retrieval_pipeline
+    else:
+        logger.info("RAG hybrid retrieval DISABLED by configuration — dense-only.")
+
+    # --- Phase 7.3: Multi-Query Retrieval ---
+    # Wrap the active retrieval (hybrid or dense) so each query is expanded
+    # into diverse variants, retrieved separately, and fused. Reuses the
+    # already-constructed llm_service. Falls back to the unwrapped pipeline on
+    # any construction error (mirrors the hybrid/rerank fallback pattern).
+    if settings.RAG_MULTI_QUERY_ENABLED:
+        try:
+            query_expander = QueryExpansionAgent(
+                llm_service=llm_service,
+                query_count=settings.RAG_MULTI_QUERY_COUNT,
+            )
+            rag_retrieval = MultiQueryRetrievalPipeline(
+                inner_pipeline=rag_retrieval,
+                query_expansion_agent=query_expander,
+            )
+            logger.info(
+                "RAG multi-query retrieval ENABLED | query_count=%d",
+                settings.RAG_MULTI_QUERY_COUNT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "RAG multi-query init failed (%s) — falling back to prior retrieval stage.",
+                exc,
+            )
+    else:
+        logger.info("RAG multi-query retrieval DISABLED by configuration.")
+
+    # --- Phase 7.2: Cross-encoder reranking ---
+    # Wrap the active retrieval (hybrid or dense) in a retrieve-then-rerank
+    # stage. If the cross-encoder model cannot initialize, keep the hybrid
+    # pipeline so startup never breaks (requirement #13).
+    if settings.RAG_RERANK_ENABLED:
+        try:
+            reranker = CrossEncoderReranker(model_name=settings.RAG_RERANK_MODEL)
+            rag_retrieval = RerankingRetrievalPipeline(
+                inner_pipeline=rag_retrieval,
+                reranker=reranker,
+                rerank_top_n=settings.RAG_RERANK_TOP_N,
+            )
+            logger.info(
+                "RAG cross-encoder reranking ENABLED | model=%s | top_n=%d",
+                settings.RAG_RERANK_MODEL, settings.RAG_RERANK_TOP_N,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "RAG reranker init failed (%s) — falling back to hybrid retrieval.",
+                exc,
+            )
+    else:
+        logger.info("RAG cross-encoder reranking DISABLED by configuration.")
+
+    # --- Phase 7.4: Evidence diversity filter ---
+    # Wrap the reranked output so the final Top-K spreads across documents
+    # instead of clustering on near-duplicate/neighbouring chunks. Falls back
+    # to the reranked pipeline on any construction error.
+    if settings.RAG_DIVERSITY_ENABLED:
+        try:
+            diversity_filter = EvidenceDiversityFilter(
+                similarity_threshold=settings.RAG_SIMILARITY_THRESHOLD,
+                max_chunks_per_document=settings.RAG_MAX_CHUNKS_PER_DOCUMENT,
+            )
+            rag_retrieval = EvidenceDiversityPipeline(
+                inner_pipeline=rag_retrieval,
+                diversity_filter=diversity_filter,
+            )
+            logger.info(
+                "RAG evidence diversity ENABLED | similarity_threshold=%.2f | "
+                "max_chunks_per_document=%d",
+                settings.RAG_SIMILARITY_THRESHOLD, settings.RAG_MAX_CHUNKS_PER_DOCUMENT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "RAG diversity filter init failed (%s) — falling back to reranked retrieval.",
+                exc,
+            )
+    else:
+        logger.info("RAG evidence diversity DISABLED by configuration.")
+
     print("=== BEFORE RAGAgent ===")
     validator = RAGResponseValidator()
     rag_agent = RAGAgent(
-        retrieval_pipeline=retrieval_pipeline,
+        retrieval_pipeline=rag_retrieval,
         validator=validator,
         llm_service=llm_service,
     )

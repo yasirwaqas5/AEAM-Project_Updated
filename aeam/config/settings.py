@@ -91,6 +91,88 @@ class Settings(BaseSettings):
         description="Feature flag to enable or disable the MonitorAgent.",
     )
 
+    RAG_HYBRID_ENABLED: bool = Field(
+        default=True,
+        description=(
+            "Phase 7.1: when True, RAG retrieval fuses dense (Qdrant) and BM25 "
+            "lexical results via Reciprocal Rank Fusion. When False, falls back "
+            "to the original dense-only RetrievalPipeline unchanged."
+        ),
+    )
+
+    RAG_RERANK_ENABLED: bool = Field(
+        default=True,
+        description=(
+            "Phase 7.2: when True, a cross-encoder reranks the fused candidate "
+            "list before it reaches the LLM. If the reranker model cannot "
+            "initialize, retrieval falls back to hybrid automatically."
+        ),
+    )
+
+    RAG_RERANK_TOP_N: int = Field(
+        default=20,
+        ge=1,
+        description=(
+            "Phase 7.2: number of fused candidates fetched and re-scored by the "
+            "cross-encoder before returning the caller's top_k."
+        ),
+    )
+
+    RAG_RERANK_MODEL: str = Field(
+        default="cross-encoder/ms-marco-MiniLM-L-6-v2",
+        description="Phase 7.2: SentenceTransformers cross-encoder model id for reranking.",
+    )
+
+    RAG_MULTI_QUERY_ENABLED: bool = Field(
+        default=True,
+        description=(
+            "Phase 7.3: when True, the original query is expanded into several "
+            "diverse variants (LLM-generated) before hybrid retrieval, and the "
+            "per-variant results are merged via Reciprocal Rank Fusion. If "
+            "query expansion fails, retrieval falls back to the original query only."
+        ),
+    )
+
+    RAG_MULTI_QUERY_COUNT: int = Field(
+        default=4,
+        ge=1,
+        description=(
+            "Phase 7.3: total number of queries used for retrieval, INCLUDING "
+            "the original — up to (count - 1) additional variants are "
+            "LLM-generated. 1 disables expansion (original query only)."
+        ),
+    )
+
+    RAG_DIVERSITY_ENABLED: bool = Field(
+        default=True,
+        description=(
+            "Phase 7.4: when True, an evidence diversity filter runs after "
+            "cross-encoder reranking — removing near-duplicate chunks and "
+            "capping how many chunks may come from the same source document."
+        ),
+    )
+
+    RAG_MAX_CHUNKS_PER_DOCUMENT: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "Phase 7.4: maximum chunks kept from the same source document "
+            "(metadata['source']) in the final evidence set. A preference, "
+            "not a hard cap — backfilled if too few documents are available."
+        ),
+    )
+
+    RAG_SIMILARITY_THRESHOLD: float = Field(
+        default=0.8,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Phase 7.4: Jaccard token-overlap threshold at/above which two "
+            "chunks are treated as near-duplicates and the lower-ranked one "
+            "is dropped."
+        ),
+    )
+
     LLM_PROVIDER: str = Field(
         default="gemini",
         description="Which LLM backend to use: 'gemini', 'openai', etc.",
