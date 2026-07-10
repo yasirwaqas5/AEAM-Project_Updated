@@ -47,6 +47,7 @@ from aeam.agents.rag.query_expansion import QueryExpansionAgent
 from aeam.agents.rag.multi_query_retrieval import MultiQueryRetrievalPipeline
 from aeam.agents.rag.reranker import CrossEncoderReranker, RerankingRetrievalPipeline
 from aeam.agents.rag.evidence_diversity import EvidenceDiversityFilter, EvidenceDiversityPipeline
+from aeam.agents.rag.retrieval_debug import RetrievalDebugTracer
 from aeam.agents.rag.response_validator import RAGResponseValidator
 from aeam.integrations.embedding_service import EmbeddingService
 from qdrant_client import QdrantClient
@@ -89,6 +90,7 @@ from aeam.api.incidents import router as incidents_router
 from aeam.api.system import router as system_router
 from aeam.api.logs import router as logs_router
 from aeam.api.trigger import router as trigger_router
+from aeam.api.retrieval_debug import router as retrieval_debug_router
 
 # ---------------------------------------------------------------------------
 # Logging bootstrap
@@ -343,6 +345,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # same Qdrant collection. Any build failure falls back to dense-only so RAG
     # never breaks at startup.
     rag_retrieval = retrieval_pipeline
+    bm25_index = None
     if settings.RAG_HYBRID_ENABLED:
         try:
             bm25_index = BM25Index.from_qdrant(
@@ -363,14 +366,22 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 exc,
             )
             rag_retrieval = retrieval_pipeline
+            bm25_index = None
     else:
         logger.info("RAG hybrid retrieval DISABLED by configuration — dense-only.")
+
+    # Snapshot the pipeline reference at this exact point — either the real
+    # HybridRetrievalPipeline or plain dense retrieval — for the retrieval
+    # debug tracer (Phase 7.4 explainability). Not used by production RAG
+    # flow; RAGAgent only ever sees the fully-composed `rag_retrieval` below.
+    hybrid_stage = rag_retrieval
 
     # --- Phase 7.3: Multi-Query Retrieval ---
     # Wrap the active retrieval (hybrid or dense) so each query is expanded
     # into diverse variants, retrieved separately, and fused. Reuses the
     # already-constructed llm_service. Falls back to the unwrapped pipeline on
     # any construction error (mirrors the hybrid/rerank fallback pattern).
+    query_expander = None
     if settings.RAG_MULTI_QUERY_ENABLED:
         try:
             query_expander = QueryExpansionAgent(
@@ -390,6 +401,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "RAG multi-query init failed (%s) — falling back to prior retrieval stage.",
                 exc,
             )
+            query_expander = None
     else:
         logger.info("RAG multi-query retrieval DISABLED by configuration.")
 
@@ -397,6 +409,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Wrap the active retrieval (hybrid or dense) in a retrieve-then-rerank
     # stage. If the cross-encoder model cannot initialize, keep the hybrid
     # pipeline so startup never breaks (requirement #13).
+    reranker = None
     if settings.RAG_RERANK_ENABLED:
         try:
             reranker = CrossEncoderReranker(model_name=settings.RAG_RERANK_MODEL)
@@ -414,6 +427,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "RAG reranker init failed (%s) — falling back to hybrid retrieval.",
                 exc,
             )
+            reranker = None
     else:
         logger.info("RAG cross-encoder reranking DISABLED by configuration.")
 
@@ -421,6 +435,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Wrap the reranked output so the final Top-K spreads across documents
     # instead of clustering on near-duplicate/neighbouring chunks. Falls back
     # to the reranked pipeline on any construction error.
+    diversity_filter = None
     if settings.RAG_DIVERSITY_ENABLED:
         try:
             diversity_filter = EvidenceDiversityFilter(
@@ -441,8 +456,24 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "RAG diversity filter init failed (%s) — falling back to reranked retrieval.",
                 exc,
             )
+            diversity_filter = None
     else:
         logger.info("RAG evidence diversity DISABLED by configuration.")
+
+    # --- Retrieval explainability: developer-only debug tracer ---
+    # Built from the same real, shared component references collected above.
+    # Does not alter retrieval behaviour — read-only introspection, exposed
+    # via GET /api/v1/debug/retrieval (disabled outside development/staging).
+    container.rag_debug_tracer = RetrievalDebugTracer(
+        dense=retrieval_pipeline,
+        bm25_index=bm25_index,
+        hybrid_stage=hybrid_stage,
+        query_expander=query_expander,
+        reranker=reranker,
+        diversity_filter=diversity_filter,
+        rerank_top_n=settings.RAG_RERANK_TOP_N,
+    )
+    logger.info("Retrieval debug tracer initialised.")
 
     print("=== BEFORE RAGAgent ===")
     validator = RAGResponseValidator()
@@ -653,6 +684,7 @@ def create_app() -> FastAPI:
     application.include_router(system_router)
     application.include_router(logs_router)
     application.include_router(trigger_router)
+    application.include_router(retrieval_debug_router)
 
     _register_routes(application)
     return application
