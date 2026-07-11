@@ -11,6 +11,10 @@ export default defineConfig({
       // must be proxied explicitly — otherwise fetch('/metrics') hits the
       // Vite SPA fallback and returns index.html instead of the metrics text.
       '/metrics': 'http://localhost:8080',
+      // Health endpoint is also root-level; the Enterprise Shell StatusBar
+      // reads it for real backend/DB/Redis dependency status. Frontend-only
+      // change — no backend API is modified.
+      '/health': 'http://localhost:8080',
     },
   },
 });
