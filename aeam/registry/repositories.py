@@ -195,6 +195,27 @@ class IngestionJobRepository(BaseRepository):
         ]
         return rows[0] if rows else None
 
+    def find_active_by_content_hash(self, content_hash: str) -> IngestionJob | None:
+        """
+        Return a non-terminal job already tracking this content hash, if any.
+
+        Used by the ingress API to avoid creating a duplicate job when the
+        same file bytes are uploaded again while an earlier job for them is
+        still in flight — the blob itself is already deduplicated by
+        BlobStore; this extends the same "never duplicate" intent to jobs.
+        """
+        terminal = tuple(JobStatus.TERMINAL)
+        placeholders = ", ".join(f":t{i}" for i in range(len(terminal)))
+        params: dict[str, Any] = {"h": content_hash}
+        params.update({f"t{i}": v for i, v in enumerate(terminal)})
+        rows = self._db.fetch_all(
+            f"SELECT * FROM ingestion_jobs WHERE content_hash = :h "
+            f"AND status NOT IN ({placeholders}) "
+            f"ORDER BY created_at DESC LIMIT 1",
+            params,
+        )
+        return self.model_cls.from_row(rows[0]) if rows else None
+
     def update_progress(
         self,
         job_id: str,

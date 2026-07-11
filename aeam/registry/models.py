@@ -72,7 +72,13 @@ class JobStatus:
     INDEXING = "indexing"
     DONE = "done"
     FAILED = "failed"
-    ALL = {QUEUED, VALIDATING, EXTRACTING, INDEXING, DONE, FAILED}
+    # Phase B1.2: distinct terminal state for an operator-cancelled job — never
+    # was an error, so must not be conflated with FAILED. Purely additive: no
+    # existing value renamed or removed, no schema change (status is TEXT).
+    CANCELLED = "cancelled"
+    ALL = {QUEUED, VALIDATING, EXTRACTING, INDEXING, DONE, FAILED, CANCELLED}
+    #: Statuses from which a job can no longer transition.
+    TERMINAL = {DONE, FAILED, CANCELLED}
 
 
 class ParentType:

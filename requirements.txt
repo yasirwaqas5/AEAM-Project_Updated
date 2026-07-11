@@ -49,3 +49,6 @@ structlog
 prometheus-client
 # --- Scheduling ---
 apscheduler
+
+# --- Enterprise Ingress (Phase B1.2) — required by FastAPI for UploadFile/multipart uploads ---
+python-multipart

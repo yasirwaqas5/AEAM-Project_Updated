@@ -32,6 +32,8 @@ from aeam.core.priority_queue import EventPriorityQueue
 from aeam.integrations.database import DatabaseClient
 from aeam.integrations.redis_client import RedisClient
 from aeam.storage.blob_store import BlobStore, LocalDiskBlobStore
+from aeam.registry.repositories import IngestionJobRepository
+from aeam.ingestion.worker import IngestionWorker
 
 # Agent imports
 from aeam.agents.monitor.monitor_agent import MonitorAgent
@@ -92,6 +94,7 @@ from aeam.api.system import router as system_router
 from aeam.api.logs import router as logs_router
 from aeam.api.trigger import router as trigger_router
 from aeam.api.retrieval_debug import router as retrieval_debug_router
+from aeam.api.ingest import router as ingest_router
 
 # ---------------------------------------------------------------------------
 # Logging bootstrap
@@ -553,6 +556,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.info("MonitorAgent disabled by configuration.")
 
+    # --- Ingestion Worker (Phase B1.2) ---
+    # Drains the ingestion_jobs queue created by POST /api/v1/ingest/upload.
+    # Runs a PlaceholderJobProcessor only — no parsing/chunking/embedding/
+    # indexing happens yet; this proves Queued->Validating->Done/Failed.
+    ingestion_job_repo = IngestionJobRepository(container.db)
+    ingestion_worker = IngestionWorker(
+        job_repo=ingestion_job_repo,
+        poll_interval=settings.INGEST_WORKER_POLL_SECONDS,
+    )
+    ingestion_worker_thread = threading.Thread(target=ingestion_worker.start, daemon=True)
+    ingestion_worker_thread.start()
+    container.ingestion_worker = ingestion_worker
+    logger.info("IngestionWorker started in background thread.")
+
     # --- Orchestrator ---
     orchestrator = Orchestrator(
         event_bus=container.event_bus,
@@ -615,6 +632,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # If MonitorAgent has a stop() method, call it; otherwise, we rely on daemon thread.
         # Here we just log.
         logger.info("MonitorAgent will be terminated by daemon thread exit.")
+    if getattr(container, "ingestion_worker", None) is not None:
+        container.ingestion_worker.stop()
+        logger.info("IngestionWorker stop signalled.")
     container.db.dispose()
     container.redis.close()
     logger.info("AEAM shutdown complete.")
@@ -697,6 +717,7 @@ def create_app() -> FastAPI:
     application.include_router(logs_router)
     application.include_router(trigger_router)
     application.include_router(retrieval_debug_router)
+    application.include_router(ingest_router)
 
     _register_routes(application)
     return application

@@ -154,6 +154,15 @@ class Settings(BaseSettings):
         ),
     )
 
+    INGEST_WORKER_POLL_SECONDS: float = Field(
+        default=2.0,
+        gt=0,
+        description=(
+            "Phase B1.2: seconds between IngestionWorker polls of the "
+            "ingestion_jobs queue when idle."
+        ),
+    )
+
     RAG_DIVERSITY_ENABLED: bool = Field(
         default=True,
         description=(
