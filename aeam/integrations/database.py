@@ -24,6 +24,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import QueuePool
 
+from aeam.integrations.enterprise_schema import create_enterprise_tables
+
 logger = logging.getLogger(__name__)
 
 
@@ -188,6 +190,39 @@ class DatabaseClient:
                 return dict(row) if row is not None else None
         except SQLAlchemyError as exc:
             logger.error("fetch_one() failed | query=%r | error=%s", query, exc)
+            raise
+
+    def fetch_all(
+        self,
+        query: str,
+        params: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Execute a SELECT query and return all rows as a list of dicts.
+
+        Additive companion to :meth:`fetch_one` (Phase B1.1) — the registry
+        repositories need list queries without reaching into the private
+        engine. Existing callers are unaffected.
+
+        Args:
+            query:  A parameterised SQL SELECT string using named-parameter syntax.
+            params: Mapping of parameter names to values, or ``None``.
+
+        Returns:
+            List of row dicts (empty list if no rows matched).
+
+        Raises:
+            ValueError:      If ``query`` is empty or whitespace-only.
+            SQLAlchemyError: On any database-level failure.
+        """
+        self._validate_query(query)
+
+        try:
+            with self._engine.connect() as conn:
+                result = conn.execute(text(query), params or {})
+                return [dict(row) for row in result.mappings().all()]
+        except SQLAlchemyError as exc:
+            logger.error("fetch_all() failed | query=%r | error=%s", query, exc)
             raise
 
     def insert(
@@ -550,6 +585,11 @@ class DatabaseClient:
             logger.error("Table creation failed: %s", exc)
             # Re-raise because without tables the client is unusable.
             raise
+
+        # Enterprise Data Layer (Phase B1.1) — additive registry tables.
+        # Purely additive: creates only new tables/indexes, never touches the
+        # existing incidents/decisions/metrics/action_logs schema above.
+        create_enterprise_tables(self._engine)
 
     def dispose(self) -> None:
         """

@@ -143,6 +143,17 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Enterprise Data Layer (Phase B1.1) ---
+
+    BLOB_STORAGE_DIR: str = Field(
+        default="data/blobs",
+        description=(
+            "Phase B1.1: root directory for the content-addressable BlobStore "
+            "that holds original ingested files. Local-disk backend; swappable "
+            "for S3/Azure later without changing callers."
+        ),
+    )
+
     RAG_DIVERSITY_ENABLED: bool = Field(
         default=True,
         description=(

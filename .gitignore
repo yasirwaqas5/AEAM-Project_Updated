@@ -3,6 +3,10 @@
 __pycache__/
 *.pyc
 
+# Enterprise Data Layer — content-addressable blob storage (Phase B1.1)
+data/blobs/
+data/
+
 # Frontend build output / dependencies
 frontend/node_modules/
 frontend/dist/

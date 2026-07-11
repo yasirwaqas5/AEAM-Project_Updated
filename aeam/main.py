@@ -31,6 +31,7 @@ from aeam.core.event_bus import EventBus
 from aeam.core.priority_queue import EventPriorityQueue
 from aeam.integrations.database import DatabaseClient
 from aeam.integrations.redis_client import RedisClient
+from aeam.storage.blob_store import BlobStore, LocalDiskBlobStore
 
 # Agent imports
 from aeam.agents.monitor.monitor_agent import MonitorAgent
@@ -135,6 +136,7 @@ class AppContainer:
         deduplicator: EventDeduplicator,
         sheets_connector: SheetsConnector | None = None,
         pipeline: StructuredDataPipeline | None = None,
+        blob_store: BlobStore | None = None,
     ) -> None:
         self.settings = settings
         self.db = db
@@ -144,6 +146,9 @@ class AppContainer:
         self.deduplicator = deduplicator
         self.sheets_connector = sheets_connector
         self.pipeline = pipeline
+        # Enterprise Data Layer (Phase B1.1) — storage foundation for later
+        # ingestion phases. Present but not yet driven by any endpoint.
+        self.blob_store = blob_store
 
     def __repr__(self) -> str:
         return (
@@ -204,6 +209,12 @@ def _build_container(settings: Settings) -> AppContainer:
     # Create data pipeline (used by ForecastAgent and MonitorAgent)
     pipeline = StructuredDataPipeline()
 
+    # Enterprise Data Layer (Phase B1.1) — content-addressable blob store for
+    # original ingested files. Local-disk backend; the registry tables were
+    # created during DatabaseClient construction above.
+    logger.info("Initialising BlobStore …")
+    blob_store = LocalDiskBlobStore(settings.BLOB_STORAGE_DIR)
+
     return AppContainer(
         settings=settings,
         db=db,
@@ -213,6 +224,7 @@ def _build_container(settings: Settings) -> AppContainer:
         deduplicator=deduplicator,
         sheets_connector=sheets_connector,
         pipeline=pipeline,
+        blob_store=blob_store,
     )
 
 
