@@ -30,7 +30,7 @@ export const NAV_GROUPS = [
   {
     label: "Knowledge & Data",
     items: [
-      { to: "/knowledge", label: "Knowledge Center", icon: "database", status: "soon", phase: "A3" },
+      { to: "/knowledge", label: "Knowledge Center", icon: "database", status: "live" },
       { to: "/data",      label: "Data Center",      icon: "database", status: "soon", phase: "B" },
     ],
   },
