@@ -1,18 +1,24 @@
 """
 aeam/ingestion
 
-Enterprise ingestion infrastructure (Phases B1.2 + B1.3).
+Enterprise ingestion infrastructure (Phases B1.2 + B1.3 + B1.4).
 
 Composes the B1.1 Storage Foundation (BlobStore + registry) into an upload
 entry point (B1.2), a background job worker (B1.2), and the real processing
-pipeline (B1.3): per-format text extraction that feeds the existing RAG
-:class:`~aeam.agents.rag.ingestion_pipeline.IngestionPipeline` (chunk → embed →
-index into Qdrant) and finalises the Document/Version registry rows.
+pipelines:
 
-The worker executes a pluggable :data:`JobProcessor`; B1.3 supplies the real
-:class:`~aeam.ingestion.processor.DocumentIngestJobProcessor` (Tier 1+2 formats:
-PDF, DOCX, Markdown, CSV, Excel, JSON, XML, Log/Text). The B1.2
-``PlaceholderJobProcessor`` remains available for infrastructure-only tests.
+- B1.3 documents: per-format text extraction that feeds the existing RAG
+  :class:`~aeam.agents.rag.ingestion_pipeline.IngestionPipeline` (chunk → embed
+  → index into Qdrant) and finalises the Document/Version registry rows.
+- B1.4 datasets: structured (CSV/Excel) files are profiled — schema inference
+  (column types/roles + metric columns) — and registered as Schema + Dataset +
+  Version rows.
+
+The worker executes a pluggable :data:`JobProcessor`. A
+:class:`~aeam.ingestion.routing.RoutingJobProcessor` dispatches each job by
+parent type to the :class:`~aeam.ingestion.processor.DocumentIngestJobProcessor`
+(B1.3) or the :class:`~aeam.ingestion.dataset_processor.DatasetIngestJobProcessor`
+(B1.4). The B1.2 ``PlaceholderJobProcessor`` remains for infrastructure tests.
 """
 
 from aeam.ingestion.validation import (
@@ -37,6 +43,14 @@ from aeam.ingestion.extraction import (
     DEFERRED_CATEGORIES,
 )
 from aeam.ingestion.processor import DocumentIngestJobProcessor, ProcessingError
+from aeam.ingestion.schema_inference import (
+    SchemaInferenceError,
+    infer_schema,
+    infer_dataset_schema,
+    read_primary_table,
+)
+from aeam.ingestion.dataset_processor import DatasetIngestJobProcessor, DatasetProcessingError
+from aeam.ingestion.routing import RoutingJobProcessor
 
 __all__ = [
     "IngestValidationError",
@@ -57,4 +71,12 @@ __all__ = [
     "DEFERRED_CATEGORIES",
     "DocumentIngestJobProcessor",
     "ProcessingError",
+    # B1.4 — schema inference + dataset processor + routing
+    "SchemaInferenceError",
+    "infer_schema",
+    "infer_dataset_schema",
+    "read_primary_table",
+    "DatasetIngestJobProcessor",
+    "DatasetProcessingError",
+    "RoutingJobProcessor",
 ]

@@ -35,6 +35,8 @@ from aeam.storage.blob_store import BlobStore, LocalDiskBlobStore
 from aeam.registry.repositories import IngestionJobRepository
 from aeam.ingestion.worker import IngestionWorker
 from aeam.ingestion.processor import DocumentIngestJobProcessor
+from aeam.ingestion.dataset_processor import DatasetIngestJobProcessor
+from aeam.ingestion.routing import RoutingJobProcessor
 
 # Agent imports
 from aeam.agents.monitor.monitor_agent import MonitorAgent
@@ -557,17 +559,28 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.info("MonitorAgent disabled by configuration.")
 
-    # --- Ingestion Worker (Phase B1.3) ---
-    # Drains the ingestion_jobs queue created by POST /api/v1/ingest/upload and
-    # runs the REAL processor: extract text (Tier 1+2 formats) -> reuse the RAG
-    # IngestionPipeline built above (chunk/embed/index into Qdrant) -> finalise
-    # the Document/Version registry rows. The startup embedding model and Qdrant
-    # client are reused — the processor constructs neither.
+    # --- Ingestion Worker (Phases B1.3 + B1.4) ---
+    # Drains the ingestion_jobs queue created by POST /api/v1/ingest/upload.
+    # A RoutingJobProcessor dispatches each job by parent type:
+    #   document -> DocumentIngestJobProcessor (B1.3): extract text -> reuse the
+    #     RAG IngestionPipeline built above (chunk/embed/index into Qdrant) ->
+    #     finalise Document/Version rows. Startup embedding model + Qdrant reused.
+    #   dataset  -> DatasetIngestJobProcessor (B1.4): read the tabular file ->
+    #     infer schema (columns/types/metrics) -> register Schema + finalise the
+    #     Dataset/Version rows. No Qdrant.
     ingestion_job_repo = IngestionJobRepository(container.db)
-    ingestion_processor = DocumentIngestJobProcessor(
+    document_processor = DocumentIngestJobProcessor(
         blob_store=container.blob_store,
         ingestion_pipeline=ingestion_pipeline,
         db=container.db,
+    )
+    dataset_processor = DatasetIngestJobProcessor(
+        blob_store=container.blob_store,
+        db=container.db,
+    )
+    ingestion_processor = RoutingJobProcessor(
+        document_processor=document_processor,
+        dataset_processor=dataset_processor,
     )
     ingestion_worker = IngestionWorker(
         job_repo=ingestion_job_repo,

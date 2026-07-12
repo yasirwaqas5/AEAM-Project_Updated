@@ -170,6 +170,24 @@ class VersionRepository(BaseRepository):
         )
         return rows[0] if rows else None
 
+    def find_active_by_content_hash(
+        self, parent_type: str, content_hash: str
+    ) -> Version | None:
+        """
+        Return the active version of the given parent type whose original bytes
+        hash to ``content_hash``, if any.
+
+        Enables content-addressed dedup for parents that carry no own
+        ``content_hash`` column (e.g. ``datasets``): the version records the
+        hash of the original file, so an identical re-upload maps back to the
+        same parent. ``versions.content_hash`` is indexed (idx_versions_content_hash).
+        """
+        rows = self._query(
+            "parent_type = :pt AND content_hash = :h AND is_active = :active",
+            {"pt": parent_type, "h": content_hash, "active": True},
+        )
+        return rows[0] if rows else None
+
     def deactivate_all(self, parent_type: str, parent_id: str) -> None:
         self._db.execute(
             "UPDATE versions SET is_active = :inactive "

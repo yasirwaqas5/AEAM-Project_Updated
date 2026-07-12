@@ -32,6 +32,7 @@ from fastapi.responses import JSONResponse
 from aeam.ingestion.validation import IngestValidationError, validate_upload
 from aeam.registry.models import (
     AssetStatus,
+    Dataset,
     Document,
     IngestionJob,
     JobStatus,
@@ -43,11 +44,17 @@ from aeam.registry.models import (
     Version,
 )
 from aeam.registry.repositories import (
+    DatasetRepository,
     DocumentRepository,
     IngestionJobRepository,
     SourceRepository,
     VersionRepository,
 )
+
+# Structured formats become first-class datasets (schema + metric columns);
+# every other supported format is registered as a retrievable document.
+# Categories come from aeam.ingestion.validation.SUPPORTED_EXTENSIONS values.
+_STRUCTURED_CATEGORIES: frozenset[str] = frozenset({"csv", "excel"})
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +134,53 @@ def _get_or_create_document(
     return doc_id, True
 
 
+def _get_or_create_dataset(
+    dataset_repo: DatasetRepository,
+    version_repo: VersionRepository,
+    *,
+    source_id: str,
+    filename: str | None,
+    content_hash: str,
+    blob_uri: str,
+) -> tuple[str, bool]:
+    """
+    Return ``(dataset_id, created)`` for the dataset backing a structured upload.
+
+    Content-addressed dedup at the dataset level: the ``datasets`` table has no
+    ``content_hash`` column (by B1.1 design), so dedup keys off the active
+    Version's ``content_hash`` (indexed) — identical bytes reuse the existing
+    dataset rather than creating a duplicate.
+
+    A brand-new dataset is created ``pending`` with its first active Version
+    (``version=1``) recording the BlobStore URI of the original. The background
+    worker/processor infers its schema and advances it ``processing`` →
+    ``indexed``. ``dataset.name`` is the filename — the processor derives the
+    format (csv/excel) from its extension.
+    """
+    existing = version_repo.find_active_by_content_hash(ParentType.DATASET, content_hash)
+    if existing is not None:
+        return existing.parent_id, False
+
+    dataset_id = dataset_repo.create(
+        Dataset(
+            name=filename or "untitled",
+            source_id=source_id,
+            status=AssetStatus.PENDING,
+        )
+    )
+    version_repo.create(
+        Version(
+            parent_type=ParentType.DATASET,
+            parent_id=dataset_id,
+            version=1,
+            content_hash=content_hash,
+            blob_ref=blob_uri,
+            is_active=True,
+        )
+    )
+    return dataset_id, True
+
+
 def _iso(value: Any) -> str | None:
     """
     Normalise a timestamp field to an ISO-8601 string for JSON responses.
@@ -158,6 +212,22 @@ def _job_to_dict(job: IngestionJob) -> dict[str, Any]:
         "created_at": _iso(job.created_at),
         "updated_at": _iso(job.updated_at),
     }
+
+
+def _asset_id_keys(parent_type: str | None, parent_id: str | None) -> dict[str, Any]:
+    """
+    Response keys identifying the registered asset.
+
+    Always emits canonical ``asset_type``/``asset_id``; additionally emits the
+    typed convenience key (``doc_id`` for documents — retained for B1.3
+    backward compatibility — or ``dataset_id`` for datasets).
+    """
+    keys: dict[str, Any] = {"asset_type": parent_type, "asset_id": parent_id}
+    if parent_type == ParentType.DOCUMENT:
+        keys["doc_id"] = parent_id
+    elif parent_type == ParentType.DATASET:
+        keys["dataset_id"] = parent_id
+    return keys
 
 
 # ---------------------------------------------------------------------------
@@ -220,30 +290,45 @@ async def upload_file(request: Request, file: UploadFile = File(...)) -> JSONRes
         return JSONResponse(status_code=202, content={
             **_job_to_dict(existing),
             "duplicate_of_content": True,
-            "doc_id": existing.parent_id,
+            "asset_created": False,
+            **_asset_id_keys(existing.parent_type, existing.parent_id),
             "blob_uri": blob_ref.uri,
             "filename": file.filename,
             "category": category,
         })
 
     source_id = _get_or_create_upload_source(source_repo)
-    doc_repo = DocumentRepository(container.db)
     version_repo = VersionRepository(container.db)
-    doc_id, doc_created = _get_or_create_document(
-        doc_repo,
-        version_repo,
-        source_id=source_id,
-        filename=file.filename,
-        category=category,
-        content_hash=blob_ref.content_hash,
-        blob_uri=blob_ref.uri,
-    )
+
+    # Structured formats (csv/excel) are registered as first-class datasets
+    # (schema + metric columns); everything else becomes a retrievable document.
+    if category in _STRUCTURED_CATEGORIES:
+        parent_type = ParentType.DATASET
+        parent_id, asset_created = _get_or_create_dataset(
+            DatasetRepository(container.db),
+            version_repo,
+            source_id=source_id,
+            filename=file.filename,
+            content_hash=blob_ref.content_hash,
+            blob_uri=blob_ref.uri,
+        )
+    else:
+        parent_type = ParentType.DOCUMENT
+        parent_id, asset_created = _get_or_create_document(
+            DocumentRepository(container.db),
+            version_repo,
+            source_id=source_id,
+            filename=file.filename,
+            category=category,
+            content_hash=blob_ref.content_hash,
+            blob_uri=blob_ref.uri,
+        )
 
     job = IngestionJob(
         job_type=JobType.INGEST,
         source_id=source_id,
-        parent_type=ParentType.DOCUMENT,
-        parent_id=doc_id,
+        parent_type=parent_type,
+        parent_id=parent_id,
         status=JobStatus.QUEUED,
         progress=0,
         stage=f"queued — {category} upload ({file.filename})",
@@ -253,15 +338,19 @@ async def upload_file(request: Request, file: UploadFile = File(...)) -> JSONRes
     created = job_repo.get(job_id)
 
     logger.info(
-        "upload_file | job_id=%s | doc_id=%s | doc_created=%s | filename=%r | "
+        "upload_file | job_id=%s | %s=%s | created=%s | filename=%r | "
         "category=%s | size=%d | content_hash=%s",
-        job_id, doc_id, doc_created, file.filename, category, len(data), blob_ref.content_hash,
+        job_id, parent_type, parent_id, asset_created, file.filename, category,
+        len(data), blob_ref.content_hash,
     )
 
     return JSONResponse(status_code=202, content={
         **_job_to_dict(created),
         "duplicate_of_content": False,
-        "doc_id": doc_id,
+        # False when identical bytes already had a registered document/dataset
+        # (reused, no duplicate); True when this upload registered a new asset.
+        "asset_created": asset_created,
+        **_asset_id_keys(parent_type, parent_id),
         "blob_uri": blob_ref.uri,
         "filename": file.filename,
         "category": category,
