@@ -30,8 +30,24 @@ from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from aeam.ingestion.validation import IngestValidationError, validate_upload
-from aeam.registry.models import IngestionJob, JobStatus, JobType, Source, SourceKind, SourceStatus
-from aeam.registry.repositories import IngestionJobRepository, SourceRepository
+from aeam.registry.models import (
+    AssetStatus,
+    Document,
+    IngestionJob,
+    JobStatus,
+    JobType,
+    ParentType,
+    Source,
+    SourceKind,
+    SourceStatus,
+    Version,
+)
+from aeam.registry.repositories import (
+    DocumentRepository,
+    IngestionJobRepository,
+    SourceRepository,
+    VersionRepository,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +76,55 @@ def _get_or_create_upload_source(source_repo: SourceRepository) -> str:
     return source_repo.create(
         Source(name=_DEFAULT_UPLOAD_SOURCE_NAME, kind=SourceKind.UPLOAD, status=SourceStatus.ACTIVE)
     )
+
+
+def _get_or_create_document(
+    doc_repo: DocumentRepository,
+    version_repo: VersionRepository,
+    *,
+    source_id: str,
+    filename: str | None,
+    category: str,
+    content_hash: str,
+    blob_uri: str,
+) -> tuple[str, bool]:
+    """
+    Return ``(doc_id, created)`` for the document backing this upload.
+
+    Content-addressed dedup at the document level: identical bytes (same
+    ``content_hash``) always map to the same Document, so re-uploading a file
+    never creates a duplicate document — it reuses the existing one (whatever
+    its status), and the processor decides whether any work is needed.
+
+    A brand-new document is created ``pending`` together with its first active
+    Version (``version=1``), which records the BlobStore URI of the original.
+    The background worker/processor advances it to ``processing`` → ``indexed``.
+    """
+    existing = doc_repo.get_by_content_hash(content_hash)
+    if existing is not None:
+        return existing.doc_id, False
+
+    doc_id = doc_repo.create(
+        Document(
+            title=filename or "untitled",
+            source_id=source_id,
+            origin_path=filename,
+            doc_type=category,
+            content_hash=content_hash,
+            status=AssetStatus.PENDING,
+        )
+    )
+    version_repo.create(
+        Version(
+            parent_type=ParentType.DOCUMENT,
+            parent_id=doc_id,
+            version=1,
+            content_hash=content_hash,
+            blob_ref=blob_uri,
+            is_active=True,
+        )
+    )
+    return doc_id, True
 
 
 def _iso(value: Any) -> str | None:
@@ -155,16 +220,30 @@ async def upload_file(request: Request, file: UploadFile = File(...)) -> JSONRes
         return JSONResponse(status_code=202, content={
             **_job_to_dict(existing),
             "duplicate_of_content": True,
+            "doc_id": existing.parent_id,
             "blob_uri": blob_ref.uri,
             "filename": file.filename,
             "category": category,
         })
 
     source_id = _get_or_create_upload_source(source_repo)
+    doc_repo = DocumentRepository(container.db)
+    version_repo = VersionRepository(container.db)
+    doc_id, doc_created = _get_or_create_document(
+        doc_repo,
+        version_repo,
+        source_id=source_id,
+        filename=file.filename,
+        category=category,
+        content_hash=blob_ref.content_hash,
+        blob_uri=blob_ref.uri,
+    )
 
     job = IngestionJob(
         job_type=JobType.INGEST,
         source_id=source_id,
+        parent_type=ParentType.DOCUMENT,
+        parent_id=doc_id,
         status=JobStatus.QUEUED,
         progress=0,
         stage=f"queued — {category} upload ({file.filename})",
@@ -174,13 +253,15 @@ async def upload_file(request: Request, file: UploadFile = File(...)) -> JSONRes
     created = job_repo.get(job_id)
 
     logger.info(
-        "upload_file | job_id=%s | filename=%r | category=%s | size=%d | content_hash=%s",
-        job_id, file.filename, category, len(data), blob_ref.content_hash,
+        "upload_file | job_id=%s | doc_id=%s | doc_created=%s | filename=%r | "
+        "category=%s | size=%d | content_hash=%s",
+        job_id, doc_id, doc_created, file.filename, category, len(data), blob_ref.content_hash,
     )
 
     return JSONResponse(status_code=202, content={
         **_job_to_dict(created),
         "duplicate_of_content": False,
+        "doc_id": doc_id,
         "blob_uri": blob_ref.uri,
         "filename": file.filename,
         "category": category,

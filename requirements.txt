@@ -52,3 +52,11 @@ apscheduler
 
 # --- Enterprise Ingress (Phase B1.2) — required by FastAPI for UploadFile/multipart uploads ---
 python-multipart
+
+# --- Enterprise Ingestion extraction (Phase B1.3) — per-format text extraction ---
+# Tier 1 formats (markdown/csv/excel/json/xml/log) use stdlib + pandas (already
+# above); these add the Tier 2 document parsers. Images (OCR) and audio/video
+# (transcription) are Tier 3 and deferred to a later phase.
+pypdf            # PDF text-layer extraction
+python-docx      # DOCX paragraph/table text extraction
+openpyxl         # .xlsx reading via pandas.read_excel

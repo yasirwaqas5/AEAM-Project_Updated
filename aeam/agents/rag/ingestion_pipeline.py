@@ -209,6 +209,7 @@ class IngestionPipeline:
                     "collection":    str,   # target collection name
                     "chunks_total":  int,   # number of chunks created
                     "chunks_upserted": int, # number of points written to Qdrant
+                    "chunk_ids":     list,  # Qdrant point IDs written, chunk order
                     "doc_type":      str,
                     "source":        str,
                     "date":          str,
@@ -252,6 +253,7 @@ class IngestionPipeline:
                 "collection": self._collection,
                 "chunks_total": 0,
                 "chunks_upserted": 0,
+                "chunk_ids": [],
                 "doc_type": metadata.get("doc_type"),
                 "source": metadata.get("source"),
                 "date": metadata.get("date"),
@@ -268,9 +270,14 @@ class IngestionPipeline:
 
         # Step 4: build Qdrant points.
         points: list[qmodels.PointStruct] = []
+        #: Qdrant point IDs written for this document, in chunk order. Returned
+        #: to the caller so a version record can store them for clean
+        #: delete/reindex later (``versions.chunk_ids``).
+        point_ids: list[str] = []
 
         for chunk, vector in zip(chunks, vectors):
             point_id = self._chunk_id_to_uuid(chunk["chunk_id"])
+            point_ids.append(point_id)
 
             payload: dict[str, Any] = {
                 # Guaranteed fields from the spec.
@@ -316,6 +323,7 @@ class IngestionPipeline:
             "collection":      self._collection,
             "chunks_total":    len(chunks),
             "chunks_upserted": len(points),
+            "chunk_ids":       point_ids,
             "doc_type":        metadata["doc_type"],
             "source":          metadata["source"],
             "date":            metadata["date"],

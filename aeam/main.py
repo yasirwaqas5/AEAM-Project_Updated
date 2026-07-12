@@ -34,6 +34,7 @@ from aeam.integrations.redis_client import RedisClient
 from aeam.storage.blob_store import BlobStore, LocalDiskBlobStore
 from aeam.registry.repositories import IngestionJobRepository
 from aeam.ingestion.worker import IngestionWorker
+from aeam.ingestion.processor import DocumentIngestJobProcessor
 
 # Agent imports
 from aeam.agents.monitor.monitor_agent import MonitorAgent
@@ -556,13 +557,21 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.info("MonitorAgent disabled by configuration.")
 
-    # --- Ingestion Worker (Phase B1.2) ---
-    # Drains the ingestion_jobs queue created by POST /api/v1/ingest/upload.
-    # Runs a PlaceholderJobProcessor only — no parsing/chunking/embedding/
-    # indexing happens yet; this proves Queued->Validating->Done/Failed.
+    # --- Ingestion Worker (Phase B1.3) ---
+    # Drains the ingestion_jobs queue created by POST /api/v1/ingest/upload and
+    # runs the REAL processor: extract text (Tier 1+2 formats) -> reuse the RAG
+    # IngestionPipeline built above (chunk/embed/index into Qdrant) -> finalise
+    # the Document/Version registry rows. The startup embedding model and Qdrant
+    # client are reused — the processor constructs neither.
     ingestion_job_repo = IngestionJobRepository(container.db)
+    ingestion_processor = DocumentIngestJobProcessor(
+        blob_store=container.blob_store,
+        ingestion_pipeline=ingestion_pipeline,
+        db=container.db,
+    )
     ingestion_worker = IngestionWorker(
         job_repo=ingestion_job_repo,
+        processor=ingestion_processor,
         poll_interval=settings.INGEST_WORKER_POLL_SECONDS,
     )
     ingestion_worker_thread = threading.Thread(target=ingestion_worker.start, daemon=True)
