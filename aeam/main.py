@@ -32,11 +32,20 @@ from aeam.core.priority_queue import EventPriorityQueue
 from aeam.integrations.database import DatabaseClient
 from aeam.integrations.redis_client import RedisClient
 from aeam.storage.blob_store import BlobStore, LocalDiskBlobStore
-from aeam.registry.repositories import IngestionJobRepository
+from aeam.registry.repositories import (
+    IngestionJobRepository,
+    DatasetRepository,
+    SchemaRepository,
+    VersionRepository,
+)
 from aeam.ingestion.worker import IngestionWorker
 from aeam.ingestion.processor import DocumentIngestJobProcessor
 from aeam.ingestion.dataset_processor import DatasetIngestJobProcessor
 from aeam.ingestion.routing import RoutingJobProcessor
+from aeam.intelligence.dataset_intelligence import DatasetIntelligenceService
+from aeam.intelligence.dataset_kpi_source import DatasetKPISource
+from aeam.intelligence.dataset_activation import StaticDatasetActivation, parse_activated_dataset_ids
+from aeam.connectors.composite_kpi_source import CompositeKPISource
 
 # Agent imports
 from aeam.agents.monitor.monitor_agent import MonitorAgent
@@ -98,6 +107,7 @@ from aeam.api.logs import router as logs_router
 from aeam.api.trigger import router as trigger_router
 from aeam.api.retrieval_debug import router as retrieval_debug_router
 from aeam.api.ingest import router as ingest_router
+from aeam.api.knowledge import router as knowledge_router
 
 # ---------------------------------------------------------------------------
 # Logging bootstrap
@@ -536,6 +546,49 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.info("No Slack bot token – ActionAgent not created.")
 
+    # --- Dataset KPI source + activation + composition (Phase B1.5.3) ---
+    # Reuses container.blob_store (B1.1) and container.db (via the existing
+    # DatasetRepository/VersionRepository) — no new infrastructure clients.
+    # DatasetKPISource never modifies MonitorAgent/RuleEngine/ForecastAgent; it
+    # only satisfies the KPIRowSource protocol those already depend on.
+    dataset_repo = DatasetRepository(container.db)
+    version_repo = VersionRepository(container.db)
+    dataset_intelligence = DatasetIntelligenceService(
+        dataset_repo=dataset_repo, schema_repo=SchemaRepository(container.db),
+    )
+    dataset_kpi_source = DatasetKPISource(
+        blob_store=container.blob_store,
+        dataset_repo=dataset_repo,
+        version_repo=version_repo,
+        intelligence=dataset_intelligence,
+    )
+    # Explicit, never-automatic activation: only dataset ids listed in
+    # ACTIVATED_DATASET_IDS become live KPI feeds. Empty by default.
+    dataset_activation = StaticDatasetActivation(
+        parse_activated_dataset_ids(settings.ACTIVATED_DATASET_IDS)
+    )
+    logger.info(
+        "Dataset monitoring activation | activated_count=%d",
+        len(dataset_activation.list_activated_dataset_ids()),
+    )
+    # CompositeKPISource: Sheets keeps its exact current pass-through
+    # behaviour (zero regression); activated datasets are queried once per
+    # activated id, re-evaluated every cycle. MonitorAgent receives this one
+    # object and is unaware either member exists.
+    #
+    # container.sheets_connector may be None (no Google Sheets credentials
+    # configured) — only add it as a member when real, so a Sheets-less
+    # deployment's composite still has zero members and MonitorAgent's own
+    # `if not rows: return` no-op path behaves exactly as it did when
+    # kpi_source was a bare None reference (see MonitorAgent._run_cycle).
+    composite_kpi_source = CompositeKPISource()
+    if container.sheets_connector is not None:
+        composite_kpi_source.add_passthrough(container.sheets_connector)
+    composite_kpi_source.add_multi(dataset_kpi_source, dataset_activation.list_activated_dataset_ids)
+    container.dataset_kpi_source = dataset_kpi_source
+    container.dataset_activation = dataset_activation
+    container.kpi_source = composite_kpi_source
+
     # --- Monitor Agent (Phase 2) ---
     monitor_agent = None
     if settings.ENABLE_MONITOR_AGENT or settings.ENVIRONMENT != "production":
@@ -549,7 +602,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             forecast_agent=forecast_agent,          # <-- Pass the properly initialized forecast_agent
             pipeline=container.pipeline,
             settings=settings,
-            kpi_source=container.sheets_connector,  # Phase 5: live KPI feed (may be None/disabled)
+            kpi_source=composite_kpi_source,  # Phase B1.5.3: Sheets + activated datasets, composed
             long_term_memory=long_term_memory,      # Hardening: persist observations for forecast training
         )
         # Start the monitor agent in a background thread
@@ -740,6 +793,7 @@ def create_app() -> FastAPI:
     application.include_router(trigger_router)
     application.include_router(retrieval_debug_router)
     application.include_router(ingest_router)
+    application.include_router(knowledge_router)
 
     _register_routes(application)
     return application

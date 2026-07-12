@@ -163,6 +163,20 @@ class Settings(BaseSettings):
         ),
     )
 
+    ACTIVATED_DATASET_IDS: str = Field(
+        default="",
+        description=(
+            "Phase B1.5.3: comma-separated list of registered dataset ids "
+            "explicitly approved for autonomous monitoring. Registering a "
+            "dataset (upload -> B1.4 processing) only makes it eligible — it "
+            "becomes a live KPI feed for MonitorAgent only once its id "
+            "appears here. Empty by default: no dataset is auto-monitored. "
+            "This is the interim (config-driven) DatasetActivation source; a "
+            "future admin-UI/DB-backed implementation can replace it without "
+            "changing any consumer."
+        ),
+    )
+
     RAG_DIVERSITY_ENABLED: bool = Field(
         default=True,
         description=(

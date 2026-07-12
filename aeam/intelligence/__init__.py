@@ -1,7 +1,7 @@
 """
 aeam/intelligence
 
-Dataset Intelligence layer (Phases B1.5.1 + B1.5.2).
+Dataset Intelligence layer (Phases B1.5.1 + B1.5.2 + B1.5.3).
 
 B1.5.1 — a pure semantic layer over the B1.4 registry metadata (``Dataset`` +
 ``Schema``): turns structural facts already inferred at ingestion into a
@@ -19,9 +19,12 @@ registered dataset's active-version blob, reusing the B1.5.1 profile to know
 which columns matter. No monitoring, rule evaluation, forecasting, or incident
 creation happens here either — see its module docstring for the boundary.
 
-Not yet built (a later B1.5 sub-phase): wiring ``DatasetKPISource`` into
-``MonitorAgent``/``RuleEngine`` composition (``main.py``), and a
-``CompositeKPISource`` fanning in multiple ``KPIRowSource`` instances.
+B1.5.3 — :mod:`aeam.intelligence.dataset_activation`: the explicit,
+never-automatic policy deciding WHICH registered datasets are actually
+monitored. Composed with ``DatasetKPISource`` via
+:class:`~aeam.connectors.composite_kpi_source.CompositeKPISource`, which is
+what ``MonitorAgent`` actually receives as its ``kpi_source`` — see that
+module for the composition mechanism.
 """
 
 from aeam.intelligence.models import DatasetMonitoringProfile, MonitorableMetric
@@ -36,6 +39,11 @@ from aeam.intelligence.dataset_intelligence import (
     discover_timestamp_column,
 )
 from aeam.intelligence.dataset_kpi_source import DatasetKPISource
+from aeam.intelligence.dataset_activation import (
+    DatasetActivation,
+    StaticDatasetActivation,
+    parse_activated_dataset_ids,
+)
 
 __all__ = [
     "MonitorableMetric",
@@ -49,4 +57,7 @@ __all__ = [
     "discover_forecast_candidates",
     "build_monitorable_metrics",
     "DatasetKPISource",
+    "DatasetActivation",
+    "StaticDatasetActivation",
+    "parse_activated_dataset_ids",
 ]
