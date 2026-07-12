@@ -50,6 +50,7 @@ from aeam.connectors.composite_kpi_source import CompositeKPISource
 # Agent imports
 from aeam.agents.monitor.monitor_agent import MonitorAgent
 from aeam.agents.kpi.rule_engine import RuleEngine
+from aeam.agents.kpi.composite_rule_engine import CompositeRuleEngine
 from aeam.agents.kpi.statistical_detector import StatisticalDetector
 from aeam.agents.forecast.forecast_agent import ForecastAgent
 from aeam.agents.rag.rag_agent import RAGAgent
@@ -589,6 +590,24 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     container.dataset_activation = dataset_activation
     container.kpi_source = composite_kpi_source
 
+    # CompositeRuleEngine (Phase B1.7): wraps the real, unmodified RuleEngine
+    # with a dynamic domain provider so activated dataset metrics actually
+    # enter MonitorAgent's monitored domain set. evaluate() is a pure
+    # passthrough to the base engine (curated domains: byte-identical
+    # behaviour); only loaded_domains is widened, re-evaluated every cycle so
+    # activation changes apply without a restart. Reuses the SAME
+    # dataset_activation instance already driving CompositeKPISource above —
+    # one activation list, in lockstep, for both what is fetched and what is
+    # monitored.
+    composite_rule_engine = CompositeRuleEngine(base=RuleEngine())
+    composite_rule_engine.add_domain_provider(
+        "datasets",
+        lambda: dataset_intelligence.list_monitorable_metric_names(
+            dataset_activation.list_activated_dataset_ids()
+        ),
+    )
+    container.rule_engine = composite_rule_engine
+
     # --- Monitor Agent (Phase 2) ---
     monitor_agent = None
     if settings.ENABLE_MONITOR_AGENT or settings.ENVIRONMENT != "production":
@@ -597,7 +616,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             event_bus=container.event_bus,
             queue=container.queue,
             deduplicator=container.deduplicator,
-            rule_engine=RuleEngine(),
+            rule_engine=composite_rule_engine,  # Phase B1.7: curated + dynamic dataset domains, composed
             statistical_detector=StatisticalDetector(window_size=7),
             forecast_agent=forecast_agent,          # <-- Pass the properly initialized forecast_agent
             pipeline=container.pipeline,

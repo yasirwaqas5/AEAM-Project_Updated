@@ -28,7 +28,9 @@ dataset-source-specific detail — any future connector that populates a
 
 from __future__ import annotations
 
+import logging
 import re
+from typing import Iterable
 
 from aeam.ingestion.schema_inference import (
     ROLE_DIMENSION,
@@ -38,6 +40,8 @@ from aeam.ingestion.schema_inference import (
 from aeam.intelligence.models import DatasetMonitoringProfile, MonitorableMetric
 from aeam.registry.models import Dataset, Schema
 from aeam.registry.repositories import DatasetRepository, SchemaRepository
+
+logger = logging.getLogger(__name__)
 
 # Column-name tokens (whole-token match only, never substring) that indicate a
 # time axis when no column was already typed/role'd as a timestamp. Guards
@@ -273,6 +277,40 @@ class DatasetIntelligenceService:
             forecastable_metrics=forecastable_metrics,
             monitorable_metrics=monitorable_metrics,
         )
+
+    def list_monitorable_metric_names(self, dataset_ids: Iterable[str]) -> list[str]:
+        """
+        Return the union of monitorable metric (measure) column names across
+        the given datasets — the domain-discovery seam Phase B1.7 composes
+        into ``MonitorAgent``'s monitored domain set (via
+        :class:`~aeam.agents.kpi.composite_rule_engine.CompositeRuleEngine`).
+
+        Reuses :meth:`build_profile` unchanged — no new discovery logic. A
+        dataset that is not yet processed or otherwise fails to profile
+        (:class:`DatasetIntelligenceError`) is logged and skipped, never
+        raised, so one bad dataset id never breaks domain discovery for the
+        rest — this is called on the hot monitoring-cycle path.
+
+        Args:
+            dataset_ids: Ids of datasets to include (e.g. the currently
+                        activated set).
+
+        Returns:
+            Sorted, de-duplicated list of metric column names. Empty list if
+            ``dataset_ids`` is empty or every dataset fails to profile.
+        """
+        names: set[str] = set()
+        for dataset_id in dataset_ids:
+            try:
+                profile = self.build_profile(dataset_id)
+            except DatasetIntelligenceError as exc:
+                logger.warning(
+                    "list_monitorable_metric_names | dataset_id=%s skipped | reason=%s | detail=%s",
+                    dataset_id, exc.reason, exc.detail,
+                )
+                continue
+            names.update(profile.measures)
+        return sorted(names)
 
     def __repr__(self) -> str:
         return "DatasetIntelligenceService()"
