@@ -38,7 +38,7 @@ export const NAV_GROUPS = [
     label: "Operate",
     items: [
       { to: "/agents",  label: "Agents",  icon: "layers", status: "live" },
-      { to: "/actions", label: "Actions", icon: "zap",    status: "soon", phase: "A5" },
+      { to: "/actions", label: "Actions", icon: "zap",    status: "live" },
       { to: "/trigger", label: "Trigger", icon: "bolt",   status: "live" },
     ],
   },
