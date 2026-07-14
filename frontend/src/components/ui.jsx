@@ -164,6 +164,35 @@ export function getEvidence(incident) {
   return Array.isArray(causes) ? causes : [];
 }
 
+/**
+ * The `data` dict of the most recent Enterprise Memory recall pass recorded
+ * in findings (type "memory") — kept structurally separate from RAG's
+ * `type: "rag"` findings entries; never merged into the same list.
+ */
+export function getMemoryData(incident) {
+  const findings = getFindings(incident);
+  let latest = null;
+  for (const entry of findings) {
+    if (entry?.type === "memory" && entry.data) latest = entry.data;
+  }
+  return latest;
+}
+
+/**
+ * Similar resolved incidents surfaced by the Enterprise Memory Engine for
+ * this investigation — a DISTINCT evidence source from RAG's knowledge-
+ * document chunks (see getEvidence). Each entry: {incident_id, similarity,
+ * category, severity, triggered_metric, root_cause, resolution_status,
+ * confidence, timestamp, incident_summary}. Empty array (not an error) both
+ * when memory was never consulted and when it found nothing similar —
+ * distinguish the two with getMemoryData(incident) === null vs.
+ * getMemoryData(incident)?.matches?.length === 0.
+ */
+export function getMemoryMatches(incident) {
+  const data = getMemoryData(incident);
+  return Array.isArray(data?.matches) ? data.matches : [];
+}
+
 /** Count of retrieved evidence chunks recorded for the incident. */
 export function getRetrievedCount(incident) {
   const audit = getAuditSummary(incident);

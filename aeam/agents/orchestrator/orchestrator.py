@@ -30,7 +30,7 @@ from aeam.agents.orchestrator.notifications import format_jira_description, form
 from aeam.agents.orchestrator.runbooks import get_runbook, resolve_action_step
 from aeam.agents.orchestrator.state_machine import IncidentState, IncidentStateMachine
 from aeam.agents.rag.cause_quality import best_meaningful_cause
-from aeam.agents.rag.rag_agent import parse_llm_json
+from aeam.agents.rag.rag_agent import RAGAgent, parse_llm_json
 from aeam.config.settings import Settings
 from aeam.core.event_bus import EventBus
 from aeam.core.event_models import Event
@@ -118,6 +118,7 @@ class Orchestrator:
         rag_agent: Any | None = None,
         action_agent: Any | None = None,  # Phase 6
         report_agent: Any | None = None,  # Phase 7
+        memory_engine: Any | None = None,  # Phase C1 — Enterprise Memory Engine
     ) -> None:
         self._bus = event_bus
         self._decision = decision_engine
@@ -129,6 +130,7 @@ class Orchestrator:
         self._rag = rag_agent
         self._action = action_agent  # Phase 6
         self._report = report_agent   # Phase 7
+        self._memory = memory_engine  # Phase C1
 
         # Track the active event for the duration of a handle_event() call.
         self._active_event: Event | None = None
@@ -285,6 +287,41 @@ class Orchestrator:
 
         # ---------- INVESTIGATE path ----------
         agents = decision_result.get("agents", []) or []
+
+        # --- Enterprise Memory recall (Phase C1) ---
+        # Runs once per incident lifecycle (idempotency guarded by
+        # _has_memory_finding(), same pattern RAGAgent uses for its own
+        # adaptive-query exhaustion check) rather than being gated behind
+        # the decision engine's "RAG" agent routing -- memory recall is a
+        # distinct retrieval stage from document RAG, not a sub-step of it.
+        # Reuses RAGAgent._formulate_query() (the SAME query-formulation
+        # helper document RAG itself calls) so memory and document
+        # retrieval search on identical vocabulary -- no duplicate query
+        # logic. A missing/failed memory engine never blocks investigation.
+        if self._memory is not None and not self._has_memory_finding():
+            memory_incident_id = self._stm.get("incident_id", "unknown")
+            try:
+                memory_query = RAGAgent._formulate_query(self._active_event)
+                similar_incidents = self._memory.recall_similar_incidents(
+                    query=memory_query,
+                    exclude_incident_id=memory_incident_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("investigate | memory recall failed: %s", exc)
+                memory_query = None
+                similar_incidents = []
+
+            self._stm.append("findings", {
+                "type": "memory",
+                "data": {
+                    "query": memory_query,
+                    "matches": similar_incidents,
+                },
+            })
+            logger.info(
+                "investigate | memory recall | matches=%d | incident_id=%s",
+                len(similar_incidents), memory_incident_id,
+            )
 
         # --- RAG integration (Phase 4) ---
         if "RAG" in agents and self._rag is not None:
@@ -762,6 +799,32 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001
             logger.error("finalize_incident | LTM persist failed: %s", exc)
 
+        # --- Enterprise Memory (Phase C1): turn this resolved incident into
+        # reusable organizational knowledge for future investigations. Every
+        # incident is remembered regardless of outcome -- a FAILED/ESCALATED
+        # investigation is still genuinely useful memory (what didn't
+        # resolve it), not just successes. Reuses the exact fields already
+        # computed above; nothing here is invented. A memory-write failure
+        # must never block incident finalization (same resilience contract
+        # as the LTM persist above).
+        if self._memory is not None:
+            try:
+                self._memory.remember_incident({
+                    "incident_id": incident_id,
+                    "event_type": event_data.get("event_type"),
+                    "metric": event_data.get("metric"),
+                    "severity": event_data.get("severity"),
+                    "timestamp": event_data.get("timestamp"),
+                    "root_cause": root_cause,
+                    "confidence": confidence,
+                    "investigation_status": investigation_status,
+                    "recommended_actions": runbook["recommended_actions"],
+                    "executed_actions": executed_actions,
+                    "chunk_ids": chunk_ids,
+                })
+            except Exception as exc:  # noqa: BLE001
+                logger.error("finalize_incident | memory persist failed: %s", exc)
+
         logger.info(
             "finalize_incident | status=%s | root_cause=%r | executed=%s | skipped=%s",
             investigation_status, root_cause, executed_actions,
@@ -823,6 +886,21 @@ class Orchestrator:
                 if isinstance(data, dict):
                     latest = data
         return latest
+
+    def _has_memory_finding(self) -> bool:
+        """
+        True if Enterprise Memory recall has already run this incident
+        lifecycle -- guards investigate() against repeating the same memory
+        search on every investigation depth (mirrors RAGAgent's own
+        adaptive-query exhaustion guard for the same reason: investigate()
+        can be called multiple times per incident, and a memory search's
+        result would not change between depths for an unchanged event).
+        """
+        findings = self._stm.get("findings", []) or []
+        return any(
+            isinstance(entry, dict) and entry.get("type") == "memory"
+            for entry in findings
+        )
 
     def _collect_query_attempts(self) -> list[dict[str, Any]]:
         """

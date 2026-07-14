@@ -58,6 +58,7 @@ from aeam.agents.report.report_agent import ReportAgent
 from aeam.pipelines.structured_data_pipeline import StructuredDataPipeline
 from aeam.agents.rag.ingestion_pipeline import IngestionPipeline
 from aeam.agents.rag.retrieval_pipeline import RetrievalPipeline
+from aeam.memory.enterprise_memory import EnterpriseMemoryEngine
 from aeam.agents.rag.hybrid_retrieval import BM25Index, HybridRetrievalPipeline
 from aeam.agents.rag.query_expansion import QueryExpansionAgent
 from aeam.agents.rag.multi_query_retrieval import MultiQueryRetrievalPipeline
@@ -372,6 +373,32 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     print("=== AFTER RetrievalPipeline ===")
 
+    # --- Enterprise Memory Engine (Phase C1) ---
+    # Reuses the SAME EmbeddingService + QdrantClient + IngestionPipeline/
+    # RetrievalPipeline classes as the document RAG pipeline above — pointed
+    # at a second, dedicated collection rather than a second vector store or
+    # embedding model. Composition, not duplication: both pipeline classes
+    # are already collection-parametrized.
+    memory_ingestion_pipeline = IngestionPipeline(
+        embedding_service=embedding_service,
+        qdrant_client=qdrant_client,
+        collection="aeam_incident_memories",
+    )
+    memory_retrieval_pipeline = RetrievalPipeline(
+        embedding_service=embedding_service,
+        qdrant_client=qdrant_client,
+        collection="aeam_incident_memories",
+    )
+    enterprise_memory = EnterpriseMemoryEngine(
+        ingestion_pipeline=memory_ingestion_pipeline,
+        retrieval_pipeline=memory_retrieval_pipeline,
+    )
+    container.enterprise_memory = enterprise_memory
+    logger.info(
+        "Enterprise Memory Engine initialised | collection=%s",
+        enterprise_memory.collection,
+    )
+
     # --- Phase 7.1: Hybrid (dense + BM25 + RRF) retrieval ---
     # Wrap the unchanged dense pipeline. BM25 corpus is built by scrolling the
     # same Qdrant collection. Any build failure falls back to dense-only so RAG
@@ -684,6 +711,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         rag_agent=rag_agent,
         action_agent=action_agent,
         report_agent=report_agent,
+        memory_engine=enterprise_memory,
     )
 
     # Register wildcard handler

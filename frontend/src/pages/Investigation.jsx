@@ -13,6 +13,7 @@ import {
 import { SearchBox } from "./KnowledgeCenter";
 import Timeline from "../components/Timeline";
 import EvidencePanel from "../components/EvidencePanel";
+import MemoryPanel from "../components/MemoryPanel";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * pages/Investigation.jsx  (Investigation Workspace)
@@ -23,8 +24,13 @@ import EvidencePanel from "../components/EvidencePanel";
  *   - Timeline (components/Timeline.jsx — extended additively this phase
  *     with finer detection/reasoning stages, all existing stages untouched)
  *   - EvidencePanel (components/EvidencePanel.jsx — reused verbatim)
+ *   - MemoryPanel (components/MemoryPanel.jsx, Phase C1) — Enterprise
+ *     Memory's similar-resolved-incidents recall, kept as its own panel
+ *     deliberately separate from Evidence: knowledge documents vs. past
+ *     incidents must never be merged into one indistinguishable list.
  *   - ui.jsx's existing incident-shape helpers (getAuditSummary,
- *     getRecommendedActions, getActionOutcome, getValidationStatus, ...)
+ *     getRecommendedActions, getActionOutcome, getValidationStatus,
+ *     getMemoryData/getMemoryMatches, ...)
  *
  * No new backend endpoint. No orchestration logic duplicated — every
  * derived value here is read directly from fields Orchestrator.
@@ -384,6 +390,7 @@ export default function Investigation() {
                   right={
                     <div style={{ display: "flex", flexDirection: "column", gap: "1.2rem" }}>
                       <Panel title="Evidence" icon="database"><EvidencePanel incident={selected} /></Panel>
+                      <Panel title="Enterprise Memory" icon="layers"><MemoryPanel incident={selected} /></Panel>
                       <Panel title="Reasoning" icon="code"><ReasoningPanel incident={selected} /></Panel>
                       <Panel title="Actions" icon="zap"><ActionsPanel incident={selected} /></Panel>
                     </div>
