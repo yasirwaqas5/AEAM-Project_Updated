@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { Link } from "react-router-dom";
 import { PageHeader, Badge, Modal, Field, Skeleton, Button, Icon, fmtTime, fmtRelative } from "../components/ui";
 import { PageContainer, MetricCard, Panel, DataTable, LoadingState, ErrorState, EmptyState } from "../components/library";
 
@@ -12,6 +13,13 @@ import { PageContainer, MetricCard, Panel, DataTable, LoadingState, ErrorState, 
  * an opt-in purge of Qdrant vectors / BlobStore bytes). Every request below
  * hits an existing or newly-exposed endpoint — no client-side business
  * logic beyond formatting/polling.
+ *
+ * `UploadDropzone` is exported and reused verbatim by pages/DataCenter.jsx
+ * (same component mounted on both pages, not duplicated) — completed uploads
+ * surface a "View in Knowledge Center / View in Data Center" link based on
+ * the real `asset_type` the upload API already returns, so a document
+ * uploaded from Data Center or a dataset uploaded from here can jump
+ * straight to wherever it actually lives.
  * ────────────────────────────────────────────────────────────────────────── */
 
 // ─── Data fetching (plain fetch, mirrors pages/Incidents.jsx's convention) ──
@@ -128,22 +136,35 @@ export function SearchBox({ value, onChange, placeholder }) {
 }
 
 // ─── Upload dropzone ─────────────────────────────────────────────────────────
+//
+// The ONE upload surface for the whole app — mounted here in Knowledge Center
+// and reused verbatim (not duplicated) by pages/DataCenter.jsx, since both
+// are equally valid places an operator expects to be able to drop a file.
+// `currentPage` ("knowledge" | "data") only controls whether a completed
+// upload's cross-navigation link is shown — it never changes upload/validate/
+// poll behaviour, which is identical everywhere this mounts.
 
-function UploadDropzone({ onUploadsSettled }) {
+const DESTINATION = {
+  document: { to: "/knowledge", page: "knowledge", label: "View in Knowledge Center" },
+  dataset:  { to: "/data",      page: "data",      label: "View in Data Center" },
+};
+
+export function UploadDropzone({ onUploadsSettled, currentPage = "knowledge" }) {
   const [dragging, setDragging] = useState(false);
-  const [uploads, setUploads] = useState([]); // [{ id, name, progress, status, error }]
+  const [uploads, setUploads] = useState([]); // [{ id, name, progress, status, error, assetType }]
   const inputRef = useRef(null);
   const nextId = useRef(0);
 
   const startUpload = useCallback((file) => {
     const id = ++nextId.current;
-    setUploads((prev) => [...prev, { id, name: file.name, progress: 0, status: "uploading", error: null }]);
+    setUploads((prev) => [...prev, { id, name: file.name, progress: 0, status: "uploading", error: null, assetType: null }]);
 
     uploadFileWithProgress(file, (progress) => {
       setUploads((prev) => prev.map((u) => (u.id === id ? { ...u, progress } : u)));
     })
       .then((body) => {
-        setUploads((prev) => prev.map((u) => (u.id === id ? { ...u, status: "processing", progress: 100 } : u)));
+        setUploads((prev) => prev.map((u) => (u.id === id
+          ? { ...u, status: "processing", progress: 100, assetType: body.asset_type } : u)));
         return pollJob(body.job_id, (job) => {
           setUploads((prev) => prev.map((u) => (u.id === id
             ? { ...u, status: job.status, stage: job.stage } : u)));
@@ -151,8 +172,9 @@ function UploadDropzone({ onUploadsSettled }) {
       })
       .then(() => {
         onUploadsSettled();
-        // Drop the row a moment after success so the user sees "done" briefly.
-        setTimeout(() => setUploads((prev) => prev.filter((u) => u.id !== id)), 2500);
+        // Drop the row after a while so the user has a fair chance to click
+        // the cross-navigation link (if one is showing) before it vanishes.
+        setTimeout(() => setUploads((prev) => prev.filter((u) => u.id !== id)), 6000);
       })
       .catch((e) => {
         setUploads((prev) => prev.map((u) => (u.id === id ? { ...u, status: "failed", error: e.message } : u)));
@@ -193,28 +215,40 @@ function UploadDropzone({ onUploadsSettled }) {
 
       {uploads.length > 0 && (
         <div style={{ marginTop: "0.8rem", display: "flex", flexDirection: "column", gap: "0.5rem" }}>
-          {uploads.map((u) => (
-            <div key={u.id} style={{
-              display: "flex", alignItems: "center", gap: "0.75rem",
-              background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 9,
-              padding: "0.55rem 0.85rem", fontSize: "0.76rem",
-            }}>
-              <Icon name={u.status === "failed" ? "alert" : u.status === "done" ? "check" : "activity"}
-                size={14} color={u.status === "failed" ? "var(--err)" : u.status === "done" ? "var(--ok)" : "var(--info)"} />
-              <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {u.name}
-              </span>
-              {u.status === "uploading" && (
-                <div style={{ width: 120, height: 5, background: "var(--border)", borderRadius: 3, overflow: "hidden" }}>
-                  <div style={{ width: `${u.progress}%`, height: "100%", background: "var(--info)", transition: "width 0.2s" }} />
-                </div>
-              )}
-              <span style={{ color: statusColor(u.status), fontFamily: "var(--font-mono)", minWidth: 70, textAlign: "right" }}>
-                {u.status === "uploading" ? `${u.progress}%` : (u.stage || u.status)}
-              </span>
-              {u.error && <span style={{ color: "var(--err)", maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis" }} title={u.error}>{u.error}</span>}
-            </div>
-          ))}
+          {uploads.map((u) => {
+            const destination = u.status === "done" && DESTINATION[u.assetType];
+            const showLink = destination && destination.page !== currentPage;
+            return (
+              <div key={u.id} style={{
+                display: "flex", alignItems: "center", gap: "0.75rem",
+                background: "var(--surface)", border: "1px solid var(--border)", borderRadius: 9,
+                padding: "0.55rem 0.85rem", fontSize: "0.76rem", flexWrap: "wrap",
+              }}>
+                <Icon name={u.status === "failed" ? "alert" : u.status === "done" ? "check" : "activity"}
+                  size={14} color={u.status === "failed" ? "var(--err)" : u.status === "done" ? "var(--ok)" : "var(--info)"} />
+                <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {u.name}
+                </span>
+                {u.status === "uploading" && (
+                  <div style={{ width: 120, height: 5, background: "var(--border)", borderRadius: 3, overflow: "hidden" }}>
+                    <div style={{ width: `${u.progress}%`, height: "100%", background: "var(--info)", transition: "width 0.2s" }} />
+                  </div>
+                )}
+                <span style={{ color: statusColor(u.status), fontFamily: "var(--font-mono)", minWidth: 70, textAlign: "right" }}>
+                  {u.status === "uploading" ? `${u.progress}%` : (u.stage || u.status)}
+                </span>
+                {u.error && <span style={{ color: "var(--err)", maxWidth: 260, overflow: "hidden", textOverflow: "ellipsis" }} title={u.error}>{u.error}</span>}
+                {showLink && (
+                  <Link to={destination.to} style={{
+                    fontSize: "0.72rem", color: "var(--accent)", fontWeight: 600, whiteSpace: "nowrap",
+                    display: "flex", alignItems: "center", gap: "0.3rem",
+                  }}>
+                    {destination.label} <Icon name="chevron" size={11} style={{ transform: "rotate(-90deg)" }} />
+                  </Link>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -602,7 +636,7 @@ export default function KnowledgeCenter() {
         right={<Button icon="activity" onClick={() => load()} disabled={loading}>{loading ? "Loading…" : "Refresh"}</Button>}
       />
 
-      <UploadDropzone onUploadsSettled={() => load(true)} />
+      <UploadDropzone onUploadsSettled={() => load(true)} currentPage="knowledge" />
 
       <div className="aeam-grid-metrics" style={{ marginBottom: "1.4rem" }}>
         <MetricCard label="Documents" value={loading ? undefined : documents.length} loading={loading} icon="database" sub="registered documents" />

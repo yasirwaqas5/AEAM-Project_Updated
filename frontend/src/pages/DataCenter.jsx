@@ -4,7 +4,7 @@ import { PageContainer, MetricCard, Panel, DataTable, LoadingState, ErrorState, 
 import {
   fetchJSON, fetchDatasets, fetchDatasetDetail, fetchDatasetPreview, fetchVersions,
   reindexDataset, deleteDataset, pollJob, statusColor, StatusBadge, SearchBox,
-  ConfirmDeleteModal, PreviewPanel, VersionHistoryTable,
+  ConfirmDeleteModal, PreviewPanel, VersionHistoryTable, UploadDropzone,
 } from "./KnowledgeCenter";
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -17,7 +17,10 @@ import {
  * activation (activate/deactivate — aeam/api/data_center.py, backed by the
  * new RedisDatasetActivation) and the composed business/monitoring profile
  * (same file, pure composition of the existing DatasetIntelligenceService +
- * activation + RuleEngine — no new business logic).
+ * activation + RuleEngine — no new business logic). Upload also mounts here
+ * (KnowledgeCenter.jsx's UploadDropzone, reused verbatim — same component,
+ * same /api/v1/ingest/upload call, same job polling, not duplicated) so a
+ * CSV/Excel dataset can be registered without a trip to Knowledge Center.
  * ────────────────────────────────────────────────────────────────────────── */
 
 // ─── Data Center-specific fetchers (new endpoints only) ─────────────────────
@@ -351,6 +354,11 @@ export default function DataCenter() {
         <MetricCard label="Metrics" value={loading ? undefined : totalMetrics} loading={loading} icon="branch" sub="total metric columns" />
       </div>
 
+      {/* Same upload surface as Knowledge Center (components/pages/KnowledgeCenter.jsx's
+          UploadDropzone, reused verbatim) — an operator can register a CSV/Excel
+          dataset directly from Data Center instead of being told to go elsewhere. */}
+      <UploadDropzone onUploadsSettled={() => load(true)} currentPage="data" />
+
       {error && (
         <div style={{ marginBottom: "1.4rem" }}>
           <ErrorState message={error} onRetry={() => load()} />
@@ -361,7 +369,7 @@ export default function DataCenter() {
 
       {isEmpty && (
         <EmptyState icon="layers" title="No datasets yet"
-          description="Upload a CSV or Excel file from the Knowledge Center to register a dataset here." />
+          description="Drop a CSV or Excel file above to register a dataset here." />
       )}
 
       {!loading && !error && !isEmpty && (
