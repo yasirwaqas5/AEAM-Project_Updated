@@ -270,6 +270,99 @@ class RedisClient:
             raise
 
     # ------------------------------------------------------------------
+    # Set operations
+    # ------------------------------------------------------------------
+
+    def sadd(self, key: str, member: str) -> int:
+        """
+        Add ``member`` to the set stored at ``key``.
+
+        Args:
+            key:    The Redis set key. Must be non-empty.
+            member: The member to add.
+
+        Returns:
+            ``1`` if ``member`` was newly added, ``0`` if it was already present.
+
+        Raises:
+            ValueError:           If ``key`` is empty or whitespace-only.
+            RedisConnectionError: On connection or timeout failure.
+            RedisError:           On any other Redis command failure.
+
+        Example::
+
+            client.sadd("aeam:activated_datasets", "ds-123")
+        """
+        self._validate_key(key)
+        try:
+            return int(self._client.sadd(key, member))
+        except (RedisConnectionError, RedisTimeoutError) as exc:
+            logger.error("sadd() connection error | key=%r | member=%r | error=%s", key, member, exc)
+            raise
+        except RedisError as exc:
+            logger.error("sadd() failed | key=%r | member=%r | error=%s", key, member, exc)
+            raise
+
+    def srem(self, key: str, member: str) -> int:
+        """
+        Remove ``member`` from the set stored at ``key``.
+
+        Args:
+            key:    The Redis set key. Must be non-empty.
+            member: The member to remove.
+
+        Returns:
+            ``1`` if ``member`` was removed, ``0`` if it was not present.
+
+        Raises:
+            ValueError:           If ``key`` is empty or whitespace-only.
+            RedisConnectionError: On connection or timeout failure.
+            RedisError:           On any other Redis command failure.
+
+        Example::
+
+            client.srem("aeam:activated_datasets", "ds-123")
+        """
+        self._validate_key(key)
+        try:
+            return int(self._client.srem(key, member))
+        except (RedisConnectionError, RedisTimeoutError) as exc:
+            logger.error("srem() connection error | key=%r | member=%r | error=%s", key, member, exc)
+            raise
+        except RedisError as exc:
+            logger.error("srem() failed | key=%r | member=%r | error=%s", key, member, exc)
+            raise
+
+    def smembers(self, key: str) -> set[str]:
+        """
+        Return every member of the set stored at ``key``.
+
+        Args:
+            key: The Redis set key. Must be non-empty.
+
+        Returns:
+            The set's members as strings. Empty set if ``key`` does not exist.
+
+        Raises:
+            ValueError:           If ``key`` is empty or whitespace-only.
+            RedisConnectionError: On connection or timeout failure.
+            RedisError:           On any other Redis command failure.
+
+        Example::
+
+            activated = client.smembers("aeam:activated_datasets")
+        """
+        self._validate_key(key)
+        try:
+            return {str(m) for m in self._client.smembers(key)}
+        except (RedisConnectionError, RedisTimeoutError) as exc:
+            logger.error("smembers() connection error | key=%r | error=%s", key, exc)
+            raise
+        except RedisError as exc:
+            logger.error("smembers() failed | key=%r | error=%s", key, exc)
+            raise
+
+    # ------------------------------------------------------------------
     # Health check
     # ------------------------------------------------------------------
 

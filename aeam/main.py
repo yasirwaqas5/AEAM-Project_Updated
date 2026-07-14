@@ -44,7 +44,7 @@ from aeam.ingestion.dataset_processor import DatasetIngestJobProcessor
 from aeam.ingestion.routing import RoutingJobProcessor
 from aeam.intelligence.dataset_intelligence import DatasetIntelligenceService
 from aeam.intelligence.dataset_kpi_source import DatasetKPISource
-from aeam.intelligence.dataset_activation import StaticDatasetActivation, parse_activated_dataset_ids
+from aeam.intelligence.dataset_activation import RedisDatasetActivation, parse_activated_dataset_ids
 from aeam.connectors.composite_kpi_source import CompositeKPISource
 
 # Agent imports
@@ -109,6 +109,7 @@ from aeam.api.trigger import router as trigger_router
 from aeam.api.retrieval_debug import router as retrieval_debug_router
 from aeam.api.ingest import router as ingest_router
 from aeam.api.knowledge import router as knowledge_router
+from aeam.api.data_center import router as data_center_router
 
 # ---------------------------------------------------------------------------
 # Logging bootstrap
@@ -352,6 +353,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     print("=== BEFORE Qdrant ===")
     qdrant_client = QdrantClient(url=settings.VECTOR_DB_URL)
+    container.qdrant_client = qdrant_client
     print("=== AFTER Qdrant ===")
 
     print("=== BEFORE IngestionPipeline ===")
@@ -359,6 +361,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         embedding_service=embedding_service,
         qdrant_client=qdrant_client,
     )
+    container.ingestion_pipeline = ingestion_pipeline
     _ingest_startup_documents(ingestion_pipeline)
     print("=== AFTER IngestionPipeline ===")
 
@@ -563,10 +566,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         version_repo=version_repo,
         intelligence=dataset_intelligence,
     )
-    # Explicit, never-automatic activation: only dataset ids listed in
-    # ACTIVATED_DATASET_IDS become live KPI feeds. Empty by default.
-    dataset_activation = StaticDatasetActivation(
-        parse_activated_dataset_ids(settings.ACTIVATED_DATASET_IDS)
+    # Explicit, never-automatic activation: only activated dataset ids become
+    # live KPI feeds. RedisDatasetActivation (Enterprise Data Center) is
+    # mutable at runtime via POST /api/v1/data-center/datasets/{id}/activate|
+    # deactivate — StaticDatasetActivation, kept unmodified, cannot support
+    # that. ACTIVATED_DATASET_IDS still seeds the initial state on first boot
+    # (only if the Redis key doesn't already exist), so existing config-based
+    # deployments keep working unchanged.
+    dataset_activation = RedisDatasetActivation(
+        container.redis, seed=parse_activated_dataset_ids(settings.ACTIVATED_DATASET_IDS)
     )
     logger.info(
         "Dataset monitoring activation | activated_count=%d",
@@ -813,6 +821,7 @@ def create_app() -> FastAPI:
     application.include_router(retrieval_debug_router)
     application.include_router(ingest_router)
     application.include_router(knowledge_router)
+    application.include_router(data_center_router)
 
     _register_routes(application)
     return application

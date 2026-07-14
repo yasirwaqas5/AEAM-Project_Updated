@@ -1,6 +1,7 @@
 import {
   Icon, STATE,
   getRetrievedCount, getValidationStatus, getActionOutcome, actionLabel,
+  getAuditSummary, fmtPct, parseMaybeJSON,
 } from "./ui";
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -35,12 +36,55 @@ function outcomeFor(actionTypes, outcome) {
   return { state: "pending", detail: "not part of this incident's runbook" };
 }
 
-function buildStages(incident) {
+/**
+ * Detection sub-stages (Rule Evaluation / Statistical Analysis / Forecast
+ * Analysis) are not persisted as structured objects anywhere — only the
+ * flattened `detection_methods` signal-name list is (see
+ * MonitorAgent._collect_signals / create_event). Rather than persist a new
+ * field on Orchestrator, this parses the EXACT string formats that producer
+ * already emits ("rule:<name>", "statistical:z_score(<n>)" |
+ * "statistical:below_p5" | "statistical:above_p95", "FORECAST") — the same
+ * "derive rich display from a raw persisted field" idiom this file's own
+ * `outcomeFor` and every ui.jsx getter already use.
+ *
+ * `incident.detection_methods` arrives as a raw JSON-encoded STRING, not an
+ * array — aeam/api/incidents.py's `SELECT *` returns the JSON column
+ * verbatim, exactly like `findings` (see ui.jsx's own `getFindings`, which
+ * already runs `parseMaybeJSON` for the same reason). Never assume it is
+ * already an array.
+ */
+function parseDetectionMethods(rawMethods) {
+  const parsed = parseMaybeJSON(rawMethods);
+  const list = Array.isArray(parsed) ? parsed : (Array.isArray(rawMethods) ? rawMethods : []);
+  const ruleEntry = list.find((m) => m.startsWith("rule:"));
+  const statEntries = list.filter((m) => m.startsWith("statistical:"));
+  return {
+    any: list.length > 0,
+    count: list.length,
+    rule: ruleEntry
+      ? { fired: true, detail: ruleEntry.slice("rule:".length) }
+      : { fired: false, detail: null },
+    statistical: {
+      fired: statEntries.length > 0,
+      detail: statEntries.map((s) => s.slice("statistical:".length)).join(", "),
+    },
+    forecast: { fired: list.includes("FORECAST") },
+  };
+}
+
+// Exported (additive — no existing behaviour changed) so pages/Replay.jsx can
+// reuse the SAME stage-derivation logic for its step-through playback, rather
+// than duplicating this component's stage-building rules.
+export function buildStages(incident) {
   const retrieved = getRetrievedCount(incident);
   const validation = getValidationStatus(incident);
   const outcome = getActionOutcome(incident);
   const requiresHuman = !!incident?.requires_human;
   const hasDepth = incident?.investigation_depth != null;
+  const audit = getAuditSummary(incident);
+  const detection = parseDetectionMethods(incident?.detection_methods);
+  const confidenceValue = incident?.confidence ?? audit?.top_confidence ?? null;
+  const recommended = audit?.recommended_actions || [];
 
   const ragState = retrieved > 0 ? "done" : (validation.status === "SKIPPED" ? "pending" : "failed");
 
@@ -58,13 +102,43 @@ function buildStages(incident) {
   return [
     { key: "trigger", icon: "bolt", label: "Trigger", state: "done",
       detail: `${incident?.event_type || "event"} · ${incident?.metric || "—"}` },
+    { key: "detection", icon: "target", label: "Detection", state: detection.any ? "done" : "pending",
+      detail: detection.any
+        ? `${detection.count} signal${detection.count !== 1 ? "s" : ""} fired`
+        : "no anomaly signals recorded" },
+    { key: "rule_evaluation", icon: "shield", label: "Rule Evaluation",
+      state: detection.rule.fired ? "done" : "idle",
+      detail: detection.rule.fired ? `breached: ${detection.rule.detail}` : "no governed rule triggered" },
+    { key: "statistical_analysis", icon: "activity", label: "Statistical Analysis",
+      state: detection.statistical.fired ? "done" : "idle",
+      detail: detection.statistical.fired ? detection.statistical.detail : "within normal statistical range" },
+    { key: "forecast_analysis", icon: "target", label: "Forecast Analysis",
+      state: detection.forecast.fired ? "done" : "idle",
+      detail: detection.forecast.fired ? "deviation from forecast detected" : "no forecast deviation / not applicable" },
     { key: "investigation", icon: "search", label: "Investigation", state: hasDepth ? "done" : "pending",
       detail: `depth ${incident?.investigation_depth ?? "—"}` },
-    { key: "rag", icon: "database", label: "RAG Retrieval", state: ragState,
-      detail: `${retrieved} chunk${retrieved !== 1 ? "s" : ""} retrieved` },
+    { key: "rag", icon: "database", label: "RAG Decision", state: ragState,
+      detail: retrieved > 0 ? "retrieval invoked" : (validation.status === "SKIPPED" ? "RAG not invoked" : "retrieval found nothing") },
+    { key: "retrieved_evidence", icon: "database", label: "Retrieved Evidence",
+      state: retrieved > 0 ? "done" : "idle",
+      detail: retrieved > 0
+        ? `${retrieved} chunk${retrieved !== 1 ? "s" : ""} · top confidence ${audit?.top_confidence != null ? fmtPct(audit.top_confidence) : "—"}`
+        : "no evidence retrieved" },
     { key: "validation", icon: "shield", label: "Validation", state: validationState,
       detail: `${validation.status} — ${validation.reason}` },
-    { key: "action", icon: "zap", label: "Action", state: anyActionExecuted ? "done" : (requiresHuman ? "skipped" : "pending"),
+    { key: "llm_reasoning", icon: "code", label: "LLM Reasoning",
+      state: incident?.root_cause ? "done" : (validation.status === "SKIPPED" ? "pending" : "failed"),
+      detail: incident?.root_cause ? "root cause reasoning produced" : "no reasoning produced" },
+    { key: "confidence", icon: "check", label: "Confidence",
+      state: confidenceValue != null ? "done" : "pending",
+      detail: confidenceValue != null ? `${fmtPct(confidenceValue)} confidence assigned` : "no confidence score assigned" },
+    { key: "recommended_action", icon: "zap", label: "Recommended Action",
+      state: recommended.length > 0 ? "done" : "pending",
+      detail: recommended.length > 0 ? recommended.join("; ") : "no recommendation generated" },
+    { key: "human_review", icon: "shield", label: "Human Review",
+      state: requiresHuman ? "pending" : "idle",
+      detail: requiresHuman ? (audit?.escalation_reason || "escalated for manual review") : "not required — auto-resolved" },
+    { key: "action", icon: "zap", label: "Execution Status", state: anyActionExecuted ? "done" : (requiresHuman ? "skipped" : "pending"),
       detail: anyActionExecuted
         ? `${outcome.executed.length} action${outcome.executed.length !== 1 ? "s" : ""} executed`
         : (requiresHuman ? "escalated to human" : "no action") },

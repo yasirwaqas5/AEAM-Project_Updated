@@ -13,17 +13,17 @@ export const NAV_GROUPS = [
     label: "Overview",
     items: [
       { to: "/",          label: "Dashboard", icon: "activity", status: "live" },
-      { to: "/analytics", label: "Analytics", icon: "target",   status: "soon", phase: "B-series" },
+      { to: "/analytics", label: "Analytics", icon: "target",   status: "live" },
     ],
   },
   {
     label: "Investigate",
     items: [
       { to: "/incidents",     label: "Incidents",          icon: "alert",  status: "live" },
-      { to: "/investigation", label: "Investigation",      icon: "branch", status: "soon", phase: "A4" },
-      { to: "/human-review",  label: "Human Review",       icon: "shield", status: "soon", phase: "A5" },
+      { to: "/investigation", label: "Investigation",      icon: "branch", status: "live" },
+      { to: "/human-review",  label: "Human Review",       icon: "shield", status: "live" },
       { to: "/retrieval",     label: "Retrieval Explorer", icon: "search", status: "soon", phase: "A6" },
-      { to: "/replay",        label: "Replay",             icon: "play",   status: "soon", phase: "C" },
+      { to: "/replay",        label: "Replay",             icon: "play",   status: "live" },
       { to: "/memory",        label: "Memory",             icon: "layers", status: "soon", phase: "C" },
     ],
   },
@@ -31,7 +31,7 @@ export const NAV_GROUPS = [
     label: "Knowledge & Data",
     items: [
       { to: "/knowledge", label: "Knowledge Center", icon: "database", status: "live" },
-      { to: "/data",      label: "Data Center",      icon: "database", status: "soon", phase: "B" },
+      { to: "/data",      label: "Data Center",      icon: "database", status: "live" },
     ],
   },
   {

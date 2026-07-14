@@ -42,6 +42,7 @@ from aeam.intelligence.dataset_kpi_source import DatasetKPISource
 from aeam.intelligence.dataset_activation import (
     DatasetActivation,
     StaticDatasetActivation,
+    RedisDatasetActivation,
     parse_activated_dataset_ids,
 )
 
@@ -59,5 +60,6 @@ __all__ = [
     "DatasetKPISource",
     "DatasetActivation",
     "StaticDatasetActivation",
+    "RedisDatasetActivation",
     "parse_activated_dataset_ids",
 ]

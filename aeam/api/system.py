@@ -24,6 +24,8 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from aeam.agents.kpi.rule_engine import RuleEngine
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/system", tags=["System"])
@@ -119,6 +121,43 @@ def get_status(request: Request) -> JSONResponse:
             status_code=500,
             content={"detail": "Failed to retrieve system status."},
         )
+
+
+@router.get(
+    "/rule-engine",
+    summary="Rule Engine domain snapshot",
+    response_description="The curated metric domains RuleEngine currently loads.",
+)
+def get_rule_engine_status(request: Request) -> JSONResponse:
+    """
+    Return the curated metric domains :class:`~aeam.agents.kpi.rule_engine.RuleEngine`
+    loads from ``detection_rules.yaml``.
+
+    Added for the Agent Observatory (frontend): no existing endpoint exposed
+    "which domains are loaded" anywhere, and it is a required, non-optional
+    field for the Rule Engine panel. Justified as minimal — this constructs a
+    fresh, unmodified :class:`RuleEngine` (a side-effect-free operation
+    already performed internally by ``aeam.api.data_center``'s dataset
+    profile endpoint) and returns only its already-computed
+    ``loaded_domains`` property. No new class, no mutation, no persisted
+    state, no change to ``RuleEngine`` itself.
+
+    Deliberately does NOT reflect ``main.py``'s live ``CompositeRuleEngine``
+    (which also merges in dynamic per-dataset metric names) — this endpoint
+    answers "what governed rules exist," not "what is MonitorAgent currently
+    watching this instant" (see ``/api/v1/data-center/activation`` for the
+    live monitored-dataset list).
+
+    Returns:
+        ``200`` — ``{"loaded_domains": [...], "count": int}``.
+        ``500`` — If ``detection_rules.yaml`` cannot be loaded.
+    """
+    try:
+        domains = RuleEngine().loaded_domains
+        return JSONResponse(status_code=200, content={"loaded_domains": domains, "count": len(domains)})
+    except Exception as exc:  # noqa: BLE001
+        logger.error("get_rule_engine_status | failed to load RuleEngine: %s", exc)
+        return JSONResponse(status_code=500, content={"detail": "Failed to load Rule Engine configuration."})
 
 
 # ---------------------------------------------------------------------------
