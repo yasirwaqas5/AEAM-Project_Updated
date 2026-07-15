@@ -63,6 +63,7 @@ from aeam.memory.enterprise_memory import EnterpriseMemoryEngine
 from aeam.intelligence.policy_extraction import PolicyExtractor
 from aeam.intelligence.policy_registry import PolicyRegistry
 from aeam.intelligence.cross_dataset_analyzer import CrossDatasetAnalyzer
+from aeam.intelligence.adaptive_detection import AdaptiveDetectionEngine
 from aeam.agents.rag.hybrid_retrieval import BM25Index, HybridRetrievalPipeline
 from aeam.agents.rag.query_expansion import QueryExpansionAgent
 from aeam.agents.rag.multi_query_retrieval import MultiQueryRetrievalPipeline
@@ -737,6 +738,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         kpi_source=dataset_kpi_source,
     )
 
+    # --- Adaptive Detection Engine (Phase C5) ---
+    # Reuses the EXACT SAME long_term_memory instance MonitorAgent's
+    # ForecastAgent already depends on for get_metric_history() -- no second
+    # LTM instance, no new table, no new Qdrant collection. StatisticalDetector
+    # is constructed fresh inside AdaptiveDetectionEngine with a longer
+    # window_size=30 (same class as MonitorAgent's own window_size=7
+    # instance -- a second perspective, not a second implementation).
+    adaptive_detection_engine = AdaptiveDetectionEngine(
+        long_term_memory=long_term_memory,
+    )
+
     # --- Orchestrator ---
     orchestrator = Orchestrator(
         event_bus=container.event_bus,
@@ -752,6 +764,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         memory_engine=enterprise_memory,
         policy_registry=policy_registry,
         cross_dataset_analyzer=cross_dataset_analyzer,
+        adaptive_detection_engine=adaptive_detection_engine,
     )
 
     # Register wildcard handler

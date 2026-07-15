@@ -279,6 +279,10 @@ class ReportAgent:
         # additive-post-processing rationale as Phase C3 above.
         detailed_report = f"{detailed_report}\n\n{self._format_cross_dataset_analysis(memory)}"
 
+        # Phase C5: append the "Adaptive Detection" section. Same
+        # additive-post-processing rationale as Phase C3/C4 above.
+        detailed_report = f"{detailed_report}\n\n{self._format_adaptive_detection(memory)}"
+
         return {
             "executive_summary": executive_summary,
             "detailed_report":   detailed_report,
@@ -374,6 +378,67 @@ class ReportAgent:
             lines.append(f"  Missing signals ({len(missing_signals)}): " + "; ".join(
                 f"{m.get('dataset_name')} ({m.get('reason')})" for m in missing_signals
             ))
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_adaptive_detection(memory: ShortTermMemory) -> str:
+        """
+        Build the "Adaptive Detection" report section (Phase C5) from the
+        adaptive finding the Orchestrator already appended to STM
+        (``type == "adaptive"``, see Orchestrator.investigate() /
+        aeam.intelligence.adaptive_detection.AdaptiveDetectionEngine).
+
+        Never fabricates a baseline or seasonality judgement: an incident
+        predating Phase C5, one with too little history for an adaptive
+        baseline, and one with too little dated history for a seasonality
+        judgement are each rendered with their own honest wording -- never
+        conflated with an invented threshold or pattern.
+        """
+        findings = memory.get("findings") or []
+        found_stage = False
+        data: dict[str, Any] = {}
+        for entry in findings:
+            if isinstance(entry, dict) and entry.get("type") == "adaptive":
+                found_stage = True
+                data = entry.get("data") or {}
+
+        lines = ["Adaptive Detection:"]
+        if not found_stage:
+            lines.append("  Adaptive Detection Engine was not consulted for this investigation.")
+            return "\n".join(lines)
+
+        baseline = data.get("adaptive_baseline")
+        baseline_insufficient = data.get("adaptive_baseline_insufficient")
+        if baseline_insufficient:
+            lines.append(f"  Adaptive baseline: insufficient data -- {baseline_insufficient}")
+        elif baseline:
+            lines.append(
+                f"  Adaptive baseline: moving_avg={baseline.get('moving_avg')}, "
+                f"z_score={baseline.get('z_score')}, "
+                f"anomaly={baseline.get('statistical_anomaly')} "
+                f"(history_points={data.get('history_points_used', 0)})"
+            )
+
+        seasonality = data.get("seasonality")
+        seasonality_insufficient = data.get("seasonality_insufficient")
+        if seasonality_insufficient:
+            lines.append(f"  Seasonality: insufficient data -- {seasonality_insufficient}")
+        elif seasonality:
+            if seasonality.get("detected"):
+                lines.append(
+                    f"  Seasonality: detected (strength={seasonality.get('strength')}, "
+                    f"highest={seasonality.get('highest_weekday')}, "
+                    f"lowest={seasonality.get('lowest_weekday')})"
+                )
+            else:
+                lines.append(f"  Seasonality: not detected -- {seasonality.get('reason')}")
+
+        corroborating = data.get("corroborating_signals") or []
+        if data.get("combined_signal"):
+            lines.append(f"  Combined signal: corroborated by {', '.join(corroborating)}.")
+        else:
+            lines.append("  Combined signal: no corroborating evidence across adaptive baseline, statistical, or forecast signals.")
 
         return "\n".join(lines)
 

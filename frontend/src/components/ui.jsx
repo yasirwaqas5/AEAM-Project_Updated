@@ -243,6 +243,28 @@ export function getCrossDatasetData(incident) {
   return latest;
 }
 
+/**
+ * The Adaptive Detection Engine finding (type "adaptive", Phase C5) — a
+ * FIFTH, structurally distinct evidence source: a longer-horizon rolling
+ * baseline plus day-of-week seasonality judgement for the incident's own
+ * metric, combined with the event's already-computed statistical/forecast
+ * signals. Never merged with RAG documents, Enterprise Memory, Enterprise
+ * Policies, or Cross-Dataset Intelligence. Shape: {history_points_used,
+ * adaptive_baseline, adaptive_baseline_insufficient, seasonality,
+ * seasonality_insufficient, existing_statistical, existing_forecast,
+ * combined_signal, corroborating_signals}. Returns null if the Adaptive
+ * Detection Engine was never consulted for this investigation (distinct
+ * from having run and found insufficient history for either sub-analysis).
+ */
+export function getAdaptiveDetectionData(incident) {
+  const findings = getFindings(incident);
+  let latest = null;
+  for (const entry of findings) {
+    if (entry?.type === "adaptive" && entry.data) latest = entry.data;
+  }
+  return latest;
+}
+
 /** Count of retrieved evidence chunks recorded for the incident. */
 export function getRetrievedCount(incident) {
   const audit = getAuditSummary(incident);

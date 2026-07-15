@@ -121,6 +121,7 @@ class Orchestrator:
         memory_engine: Any | None = None,  # Phase C1 — Enterprise Memory Engine
         policy_registry: Any | None = None,  # Phase C3 — Enterprise Policy Registry
         cross_dataset_analyzer: Any | None = None,  # Phase C4 — Cross-Dataset Intelligence
+        adaptive_detection_engine: Any | None = None,  # Phase C5 — Adaptive Detection Engine
     ) -> None:
         self._bus = event_bus
         self._decision = decision_engine
@@ -135,6 +136,7 @@ class Orchestrator:
         self._memory = memory_engine  # Phase C1
         self._policy_registry = policy_registry  # Phase C3
         self._cross_dataset = cross_dataset_analyzer  # Phase C4
+        self._adaptive_detection = adaptive_detection_engine  # Phase C5
 
         # Track the active event for the duration of a handle_event() call.
         self._active_event: Event | None = None
@@ -396,6 +398,51 @@ class Orchestrator:
                 len(cross_dataset_result.get("contradicting", [])),
                 len(cross_dataset_result.get("strong_correlations", [])),
                 cross_incident_id,
+            )
+
+        # --- Adaptive Detection Engine (Phase C5) ---
+        # Same idempotency pattern as Enterprise Memory / Policy Registry /
+        # Cross-Dataset Intelligence above -- runs once per incident
+        # lifecycle. Computes a longer-horizon, seasonality-aware adaptive
+        # baseline via AdaptiveDetectionEngine, which reuses
+        # StatisticalDetector/LongTermMemory unmodified and only READS the
+        # event's own already-computed metadata["statistical"]/["forecast"]
+        # -- it never re-invokes ForecastAgent or MonitorAgent's own
+        # detector, never calls RuleEngine.evaluate(), and never feeds back
+        # into DecisionEngine/ActionAgent. Advisory only.
+        if self._adaptive_detection is not None and not self._has_adaptive_finding():
+            adaptive_incident_id = self._stm.get("incident_id", "unknown")
+            try:
+                adaptive_result = self._adaptive_detection.analyze(
+                    metric=self._active_event.metric,
+                    current_value=self._active_event.current_value,
+                    event_metadata=self._active_event.metadata,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("investigate | adaptive detection failed: %s", exc)
+                adaptive_result = {
+                    "history_points_used": 0,
+                    "adaptive_baseline": None,
+                    "adaptive_baseline_insufficient": f"Adaptive analysis failed: {exc}",
+                    "seasonality": None,
+                    "seasonality_insufficient": f"Adaptive analysis failed: {exc}",
+                    "existing_statistical": None,
+                    "existing_forecast": None,
+                    "combined_signal": False,
+                    "corroborating_signals": [],
+                }
+
+            self._stm.append("findings", {
+                "type": "adaptive",
+                "data": adaptive_result,
+            })
+            logger.info(
+                "investigate | adaptive detection | history_points=%d | combined_signal=%s | "
+                "corroborating=%s | incident_id=%s",
+                adaptive_result.get("history_points_used", 0),
+                adaptive_result.get("combined_signal"),
+                adaptive_result.get("corroborating_signals"),
+                adaptive_incident_id,
             )
 
         # --- RAG integration (Phase 4) ---
@@ -998,6 +1045,19 @@ class Orchestrator:
         findings = self._stm.get("findings", []) or []
         return any(
             isinstance(entry, dict) and entry.get("type") == "cross_dataset"
+            for entry in findings
+        )
+
+    def _has_adaptive_finding(self) -> bool:
+        """
+        True if the Adaptive Detection Engine has already run this incident
+        lifecycle -- same idempotency guard as _has_memory_finding()/
+        _has_policy_finding()/_has_cross_dataset_finding(), for the same
+        reason.
+        """
+        findings = self._stm.get("findings", []) or []
+        return any(
+            isinstance(entry, dict) and entry.get("type") == "adaptive"
             for entry in findings
         )
 
