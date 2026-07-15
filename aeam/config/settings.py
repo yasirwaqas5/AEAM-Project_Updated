@@ -100,6 +100,19 @@ class Settings(BaseSettings):
         ),
     )
 
+    POLICY_EXTRACTION_ENABLED: bool = Field(
+        default=True,
+        description=(
+            "Phase C2: when True, DocumentIngestJobProcessor runs an additional "
+            "LLM extraction pass after a document is chunked/embedded/indexed, "
+            "looking for explicit business rules (conditions/actions/thresholds/"
+            "escalation/approval/department/role/time constraints/priority/"
+            "related metrics) and persisting any found to the 'policies' table. "
+            "Never blocks ingestion on failure. When False, ingestion behaves "
+            "exactly as before this phase — no LLM call, no policies table writes."
+        ),
+    )
+
     RAG_RERANK_ENABLED: bool = Field(
         default=True,
         description=(

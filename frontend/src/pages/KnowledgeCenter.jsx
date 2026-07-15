@@ -44,6 +44,7 @@ const fetchDocumentDetail = (id) => fetchJSON(`/api/v1/knowledge/documents/${id}
 // are identical concerns in both Knowledge Center and Data Center).
 export const fetchDatasetDetail = (id) => fetchJSON(`/api/v1/knowledge/datasets/${id}`);
 const fetchDocumentPreview = (id) => fetchJSON(`/api/v1/knowledge/documents/${id}/preview`);
+const fetchDocumentPolicies = (id) => fetchJSON(`/api/v1/knowledge/documents/${id}/policies`);
 export const fetchDatasetPreview = (id) => fetchJSON(`/api/v1/knowledge/datasets/${id}/preview`);
 export const fetchVersions = (parentType, parentId) =>
   fetchJSON(`/api/v1/knowledge/versions?parent_type=${parentType}&parent_id=${parentId}`);
@@ -356,6 +357,80 @@ export function PreviewPanel({ kind, id }) {
   );
 }
 
+// ─── Policy panel (Phase C2 — Enterprise Policy Intelligence Engine) ────────
+//
+// Renders the structured business policies extracted from THIS document —
+// additional structured knowledge, never a replacement for the document
+// itself. Deliberately its own tab, never merged into Preview: a policy is a
+// distinct kind of artifact (condition/actions/department/etc.), not raw
+// document text.
+
+export function PolicyPanel({ id }) {
+  const [state, setState] = useState({ loading: true, error: null, data: null });
+
+  const load = useCallback(() => {
+    setState({ loading: true, error: null, data: null });
+    fetchDocumentPolicies(id)
+      .then((data) => setState({ loading: false, error: null, data }))
+      .catch((e) => setState({ loading: false, error: e.message, data: null }));
+  }, [id]);
+
+  useEffect(() => { load(); }, [load]);
+
+  if (state.loading) return <Skeleton height={100} />;
+  if (state.error) return <ErrorState message={state.error} onRetry={load} />;
+
+  const policies = state.data?.policies || [];
+  if (policies.length === 0) {
+    return (
+      <EmptyState icon="shield" title="No policies extracted"
+        description="This document contains no recognizable business rule (condition/threshold/escalation/approval requirement) — an honest outcome, not every document is a policy document."
+        tone="muted" />
+    );
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "0.8rem" }}>
+      <div style={{ fontSize: "0.72rem", color: "var(--muted)" }}>
+        {policies.length} polic{policies.length !== 1 ? "ies" : "y"} extracted from this document
+      </div>
+      {policies.map((p) => (
+        <div key={p.policy_id} style={{
+          border: "1px solid var(--border)", borderRadius: 10,
+          background: "rgba(255,255,255,0.015)", padding: "0.85rem 1rem",
+          display: "flex", flexDirection: "column", gap: "0.6rem",
+        }}>
+          {p.business_rule && (
+            <div style={{ fontSize: "0.82rem", color: "var(--text)", fontWeight: 600 }}>{p.business_rule}</div>
+          )}
+          <div style={{ fontSize: "0.76rem", color: "var(--muted)", fontStyle: "italic", lineHeight: 1.45 }}>
+            "{p.raw_text}"
+          </div>
+          <div className="aeam-grid-auto" style={{ gap: "0.7rem" }}>
+            {p.condition && <Field label="Condition" value={p.condition} mono />}
+            {p.threshold && <Field label="Threshold" value={p.threshold} mono />}
+            {p.actions?.length > 0 && <Field label="Actions" value={p.actions.join(", ")} />}
+            {p.escalation_rule && <Field label="Escalation" value={p.escalation_rule} />}
+            {p.approval_required != null && <Field label="Approval Required" value={p.approval_required ? "Yes" : "No"} />}
+            {p.department && <Field label="Department" value={p.department} />}
+            {p.role && <Field label="Role" value={p.role} />}
+            {p.time_constraint && <Field label="Time Constraint" value={p.time_constraint} />}
+            {p.priority && <Field label="Priority" value={<Badge label={p.priority} color={
+              p.priority === "critical" || p.priority === "high" ? "var(--err)" : p.priority === "medium" ? "var(--warn)" : "var(--muted)"
+            } />} />}
+            {p.related_metrics?.length > 0 && <Field label="Related Metrics" value={p.related_metrics.join(", ")} mono />}
+          </div>
+          <div style={{ display: "flex", gap: "1rem", fontSize: "0.66rem", color: "var(--muted)", paddingTop: "0.4rem", borderTop: "1px solid var(--border)" }}>
+            <span>Source: {p.source_document || "—"}</span>
+            {p.source_chunk && <span title={p.source_chunk}>Chunk: {p.source_chunk.slice(0, 12)}…</span>}
+            <span>{fmtTime(p.extracted_at)}</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ─── Detail modal ────────────────────────────────────────────────────────────
 
 function DetailModal({ kind, id, onClose, onChanged }) {
@@ -399,7 +474,11 @@ function DetailModal({ kind, id, onClose, onChanged }) {
         <div style={{ display: "flex", flexDirection: "column", gap: "1.1rem" }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "0.6rem" }}>
             <div style={{ display: "flex", gap: "0.4rem" }}>
-              {[["overview", "Overview"], ["preview", "Preview"], ["versions", "Versions"]].map(([key, label]) => (
+              {[
+                ["overview", "Overview"], ["preview", "Preview"],
+                ...(kind === "document" ? [["policies", "Policies"]] : []),
+                ["versions", "Versions"],
+              ].map(([key, label]) => (
                 <button key={key} onClick={() => setTab(key)} style={{
                   fontSize: "0.7rem", letterSpacing: "0.06em", textTransform: "uppercase",
                   background: tab === key ? "var(--accent-dim)" : "none",
@@ -465,6 +544,8 @@ function DetailModal({ kind, id, onClose, onChanged }) {
           )}
 
           {tab === "preview" && <PreviewPanel kind={kind} id={id} />}
+
+          {tab === "policies" && kind === "document" && <PolicyPanel id={id} />}
 
           {tab === "versions" && <VersionHistoryTable parentType={parentType} parentId={id} />}
         </div>

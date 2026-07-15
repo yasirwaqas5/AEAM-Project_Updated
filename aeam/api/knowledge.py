@@ -56,6 +56,7 @@ from aeam.registry.repositories import (
     DatasetRepository,
     DocumentRepository,
     IngestionJobRepository,
+    PolicyRepository,
     SchemaRepository,
     SourceRepository,
     VersionRepository,
@@ -684,6 +685,54 @@ def preview_document(request: Request, doc_id: str) -> JSONResponse:
         "truncated": len(text) > _PREVIEW_TEXT_CHARS,
         "char_count": len(text),
         "detail": result.detail,
+    })
+
+
+@router.get("/documents/{doc_id}/policies", summary="Structured policies extracted from a document (Phase C2)")
+def get_document_policies(request: Request, doc_id: str) -> JSONResponse:
+    """
+    List the structured business policies the Policy Intelligence Engine
+    extracted from this document (see
+    aeam.intelligence.policy_extraction.PolicyExtractor, invoked from
+    aeam.ingestion.processor.DocumentIngestJobProcessor right after this
+    document was chunked/embedded/indexed).
+
+    Always ``200`` for an existing document — a document with no recognizable
+    policy reports an empty ``policies`` list, matching the same "expected
+    outcome, not a server error" convention as ``/preview``. Policies are
+    read-only here: this phase only extracts and persists them (no
+    RuleEngine integration, no execution).
+    """
+    container = request.app.state.container
+    doc = DocumentRepository(container.db).get(doc_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"No document with id {doc_id!r}.")
+
+    policies = PolicyRepository(container.db).list_by_document(doc_id)
+    return JSONResponse(status_code=200, content={
+        "doc_id": doc_id,
+        "count": len(policies),
+        "policies": [
+            {
+                "policy_id": p.policy_id,
+                "source_document": p.source_document,
+                "source_chunk": p.source_chunk,
+                "raw_text": p.raw_text,
+                "business_rule": p.business_rule,
+                "condition": p.condition,
+                "threshold": p.threshold,
+                "actions": p.actions,
+                "escalation_rule": p.escalation_rule,
+                "approval_required": p.approval_required,
+                "department": p.department,
+                "role": p.role,
+                "time_constraint": p.time_constraint,
+                "priority": p.priority,
+                "related_metrics": p.related_metrics,
+                "extracted_at": _iso(p.extracted_at),
+            }
+            for p in policies
+        ],
     })
 
 

@@ -265,3 +265,37 @@ class IngestionJob(_Asset):
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "IngestionJob":
         return _Asset._base_from_row(cls, row, ())
+
+
+@dataclass
+class Policy(_Asset):
+    """
+    A single structured business rule extracted from a document (Phase C2).
+
+    Additional, not a replacement — the source document/chunk are always
+    retained so a policy is traceable back to exactly what it was derived
+    from. Every field besides ``policy_id``/``doc_id``/``raw_text`` is
+    optional: extraction never fabricates a value for a field the source
+    text didn't actually specify (see aeam/intelligence/policy_extraction.py).
+    """
+    policy_id: str = field(default_factory=_new_id)
+    doc_id: str = ""                         # -> documents.doc_id (unenforced)
+    source_document: str | None = None       # human-readable title/origin_path
+    source_chunk: str | None = None          # chunk_id within the document, if attributable
+    raw_text: str = ""                       # verbatim source sentence(s) this policy is based on
+    business_rule: str | None = None         # short human-readable summary
+    condition: str | None = None
+    threshold: str | None = None
+    actions: list[str] = field(default_factory=list)
+    escalation_rule: str | None = None
+    approval_required: bool | None = None
+    department: str | None = None
+    role: str | None = None
+    time_constraint: str | None = None
+    priority: str | None = None
+    related_metrics: list[str] = field(default_factory=list)
+    extracted_at: str = field(default_factory=_now_iso)
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "Policy":
+        return _Asset._base_from_row(cls, row, ("actions", "related_metrics"))

@@ -26,6 +26,7 @@ from aeam.registry.models import (
     IngestionJob,
     JobStatus,
     ParentType,
+    Policy,
     Schema,
     Source,
     SourceStatus,
@@ -253,3 +254,10 @@ class IngestionJobRepository(BaseRepository):
         if error is not None:
             fields["error"] = error
         self.update(job_id, fields)
+
+
+class PolicyRepository(BaseRepository):
+    table, pk, model_cls = "policies", "policy_id", Policy
+
+    def list_by_document(self, doc_id: str) -> list[Policy]:
+        return self._query("doc_id = :doc_id", {"doc_id": doc_id})

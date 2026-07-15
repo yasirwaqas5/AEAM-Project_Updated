@@ -59,6 +59,7 @@ from aeam.pipelines.structured_data_pipeline import StructuredDataPipeline
 from aeam.agents.rag.ingestion_pipeline import IngestionPipeline
 from aeam.agents.rag.retrieval_pipeline import RetrievalPipeline
 from aeam.memory.enterprise_memory import EnterpriseMemoryEngine
+from aeam.intelligence.policy_extraction import PolicyExtractor
 from aeam.agents.rag.hybrid_retrieval import BM25Index, HybridRetrievalPipeline
 from aeam.agents.rag.query_expansion import QueryExpansionAgent
 from aeam.agents.rag.multi_query_retrieval import MultiQueryRetrievalPipeline
@@ -676,10 +677,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     #     infer schema (columns/types/metrics) -> register Schema + finalise the
     #     Dataset/Version rows. No Qdrant.
     ingestion_job_repo = IngestionJobRepository(container.db)
+    # Phase C2 — Policy Intelligence Engine: reuses the SAME llm_service
+    # already constructed above for DecisionEngine/RAGAgent (no second LLM
+    # client). Runs as an additional step inside the existing document
+    # ingestion job — see DocumentIngestJobProcessor — not a second pipeline.
+    policy_extractor = PolicyExtractor(llm_service=llm_service)
     document_processor = DocumentIngestJobProcessor(
         blob_store=container.blob_store,
         ingestion_pipeline=ingestion_pipeline,
         db=container.db,
+        policy_extractor=policy_extractor,
+        policy_extraction_enabled=settings.POLICY_EXTRACTION_ENABLED,
     )
     dataset_processor = DatasetIngestJobProcessor(
         blob_store=container.blob_store,

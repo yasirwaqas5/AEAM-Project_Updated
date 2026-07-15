@@ -35,10 +35,11 @@ from typing import Any
 
 from aeam.agents.rag.ingestion_pipeline import IngestionPipeline
 from aeam.ingestion.extraction import ExtractionError, extract_text
+from aeam.intelligence.policy_extraction import PolicyExtractor
 from aeam.integrations.database import DatabaseClient
-from aeam.registry.models import AssetStatus, IngestionJob, JobStatus, ParentType, _now_iso
+from aeam.registry.models import AssetStatus, IngestionJob, JobStatus, ParentType, Policy, _now_iso
 from aeam.registry.repositories import DocumentRepository, VersionRepository
-from aeam.registry.repositories import IngestionJobRepository
+from aeam.registry.repositories import IngestionJobRepository, PolicyRepository
 from aeam.storage.blob_store import BlobStore
 
 logger = logging.getLogger(__name__)
@@ -70,9 +71,18 @@ class DocumentIngestJobProcessor:
                              model load, no second Qdrant client).
         db:                  Shared :class:`~aeam.integrations.database.DatabaseClient`,
                              used to build the document/version repositories.
+        policy_extractor:    Optional :class:`~aeam.intelligence.policy_extraction.PolicyExtractor`
+                             (Phase C2). When provided (and
+                             ``policy_extraction_enabled`` is True), an
+                             additional structured-policy extraction pass
+                             runs after indexing succeeds. ``None`` (the
+                             default) reproduces pre-C2 behaviour exactly.
+        policy_extraction_enabled: Mirrors ``Settings.POLICY_EXTRACTION_ENABLED``
+                             — lets the extraction pass be disabled without
+                             removing the wiring.
 
     Raises:
-        ValueError: If any dependency is ``None``.
+        ValueError: If any REQUIRED dependency is ``None``.
     """
 
     def __init__(
@@ -80,6 +90,8 @@ class DocumentIngestJobProcessor:
         blob_store: BlobStore,
         ingestion_pipeline: IngestionPipeline,
         db: DatabaseClient,
+        policy_extractor: PolicyExtractor | None = None,
+        policy_extraction_enabled: bool = True,
     ) -> None:
         if blob_store is None:
             raise ValueError("blob_store must not be None.")
@@ -91,6 +103,9 @@ class DocumentIngestJobProcessor:
         self._pipeline = ingestion_pipeline
         self._doc_repo = DocumentRepository(db)
         self._version_repo = VersionRepository(db)
+        self._policy_repo = PolicyRepository(db)
+        self._policy_extractor = policy_extractor
+        self._policy_extraction_enabled = policy_extraction_enabled
 
     # ------------------------------------------------------------------
     # JobProcessor protocol
@@ -191,6 +206,72 @@ class DocumentIngestJobProcessor:
             "DocumentIngestJobProcessor | job_id=%s | doc_id=%s | category=%s | "
             "chunks=%d | detail=%s",
             job.job_id, doc.doc_id, category, chunk_count, extracted.detail,
+        )
+
+        # --- Policy extraction (Phase C2) --------------------------------
+        # Purely additive: runs after indexing has already succeeded, never
+        # blocks or fails the ingestion job. Reuses the SAME extracted text
+        # and chunk_ids already computed above — no re-parsing, no
+        # re-embedding, no second chunking of the document for retrieval.
+        if self._policy_extraction_enabled and self._policy_extractor is not None:
+            self._extract_and_store_policies(
+                doc=doc, extracted_text=extracted.text, chunk_ids=chunk_ids, metadata=metadata,
+            )
+
+    def _extract_and_store_policies(
+        self, doc: Any, extracted_text: str, chunk_ids: list[str], metadata: dict[str, Any],
+    ) -> None:
+        """
+        Run policy extraction and persist any genuine result. A failure here
+        (LLM error, parse failure, DB error) is logged and swallowed — it must
+        never mark an already-successfully-indexed document as failed.
+        """
+        try:
+            policies = self._policy_extractor.extract(
+                text=extracted_text, chunk_ids=chunk_ids, chunk_metadata=metadata,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "DocumentIngestJobProcessor | policy extraction failed | doc_id=%s | error=%s",
+                doc.doc_id, exc,
+            )
+            return
+
+        if not policies:
+            logger.info(
+                "DocumentIngestJobProcessor | no recognizable policy found | doc_id=%s", doc.doc_id,
+            )
+            return
+
+        source_document = doc.origin_path or doc.title or doc.doc_id
+        for p in policies:
+            try:
+                self._policy_repo.create(Policy(
+                    doc_id=doc.doc_id,
+                    source_document=source_document,
+                    source_chunk=p.get("source_chunk"),
+                    raw_text=p.get("raw_text", ""),
+                    business_rule=p.get("business_rule"),
+                    condition=p.get("condition"),
+                    threshold=p.get("threshold"),
+                    actions=p.get("actions", []),
+                    escalation_rule=p.get("escalation_rule"),
+                    approval_required=p.get("approval_required"),
+                    department=p.get("department"),
+                    role=p.get("role"),
+                    time_constraint=p.get("time_constraint"),
+                    priority=p.get("priority"),
+                    related_metrics=p.get("related_metrics", []),
+                ))
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "DocumentIngestJobProcessor | failed to persist a policy | doc_id=%s | error=%s",
+                    doc.doc_id, exc,
+                )
+
+        logger.info(
+            "DocumentIngestJobProcessor | stored %d polic%s | doc_id=%s",
+            len(policies), "y" if len(policies) == 1 else "ies", doc.doc_id,
         )
 
     def _load_document(self, job: IngestionJob) -> Any:

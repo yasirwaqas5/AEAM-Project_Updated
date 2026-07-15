@@ -38,6 +38,7 @@ ENTERPRISE_TABLES: tuple[str, ...] = (
     "schemas",
     "versions",
     "ingestion_jobs",
+    "policies",
 )
 
 # ---------------------------------------------------------------------------
@@ -136,8 +137,30 @@ CREATE TABLE IF NOT EXISTS ingestion_jobs (
 );
 """
 
+_POLICIES = """
+CREATE TABLE IF NOT EXISTS policies (
+    policy_id         TEXT PRIMARY KEY,
+    doc_id            TEXT,               -- -> documents.doc_id (unenforced)
+    source_document   TEXT,               -- human-readable title/origin_path
+    source_chunk      TEXT,               -- chunk_id within the document, if attributable
+    raw_text          TEXT,               -- verbatim source sentence(s) this policy is based on
+    business_rule     TEXT,               -- short human-readable summary
+    condition         TEXT,
+    threshold         TEXT,
+    actions           JSONB,              -- list of action strings
+    escalation_rule   TEXT,
+    approval_required BOOLEAN,
+    department        TEXT,
+    role              TEXT,
+    time_constraint   TEXT,
+    priority          TEXT,
+    related_metrics   JSONB,              -- list of metric name strings
+    extracted_at      TIMESTAMP
+);
+"""
+
 _DDL: tuple[str, ...] = (
-    _SOURCES, _DOCUMENTS, _DATASETS, _SCHEMAS, _VERSIONS, _INGESTION_JOBS,
+    _SOURCES, _DOCUMENTS, _DATASETS, _SCHEMAS, _VERSIONS, _INGESTION_JOBS, _POLICIES,
 )
 
 # Helpful lookup indexes for the query patterns later phases rely on.
@@ -151,6 +174,7 @@ _INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_versions_content_hash ON versions (content_hash);",
     "CREATE INDEX IF NOT EXISTS idx_jobs_status ON ingestion_jobs (status);",
     "CREATE INDEX IF NOT EXISTS idx_jobs_content_hash ON ingestion_jobs (content_hash);",
+    "CREATE INDEX IF NOT EXISTS idx_policies_doc ON policies (doc_id);",
 )
 
 
