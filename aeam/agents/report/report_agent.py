@@ -275,6 +275,10 @@ class ReportAgent:
         # runbook action plan above.
         detailed_report = f"{detailed_report}\n\n{self._format_matched_policies(memory)}"
 
+        # Phase C4: append the "Cross-Dataset Analysis" section. Same
+        # additive-post-processing rationale as Phase C3 above.
+        detailed_report = f"{detailed_report}\n\n{self._format_cross_dataset_analysis(memory)}"
+
         return {
             "executive_summary": executive_summary,
             "detailed_report":   detailed_report,
@@ -316,6 +320,61 @@ class ReportAgent:
                     f"  - {label} "
                     f"[policy_id={m.get('policy_id')}, matched_by={reason}, source={source}]"
                 )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_cross_dataset_analysis(memory: ShortTermMemory) -> str:
+        """
+        Build the "Cross-Dataset Analysis" report section (Phase C4) from
+        the cross-dataset finding the Orchestrator already appended to STM
+        (``type == "cross_dataset"``, see Orchestrator.investigate() /
+        aeam.intelligence.cross_dataset_analyzer.CrossDatasetAnalyzer).
+
+        Never fabricates a relationship: an incident predating Phase C4, an
+        analysis that ran but had insufficient activated datasets, and a
+        genuinely correlation-free result are each rendered with their own
+        honest wording -- never conflated with an invented correlation.
+        """
+        findings = memory.get("findings") or []
+        found_stage = False
+        data: dict[str, Any] = {}
+        for entry in findings:
+            if isinstance(entry, dict) and entry.get("type") == "cross_dataset":
+                found_stage = True
+                data = entry.get("data") or {}
+
+        lines = ["Cross-Dataset Analysis:"]
+        if not found_stage:
+            lines.append("  Cross-Dataset Intelligence was not consulted for this investigation.")
+            return "\n".join(lines)
+
+        if data.get("insufficient_data"):
+            lines.append(f"  Insufficient data: {data.get('reason', 'not enough activated datasets.')}")
+            return "\n".join(lines)
+
+        supporting = data.get("supporting") or []
+        contradicting = data.get("contradicting") or []
+        strong_correlations = data.get("strong_correlations") or []
+        missing_signals = data.get("missing_signals") or []
+
+        if not (supporting or contradicting or strong_correlations):
+            lines.append(
+                f"  No supporting, contradicting, or strongly-correlated signals found "
+                f"across {data.get('candidates_checked', 0)} other activated dataset(s)."
+            )
+        else:
+            for s in supporting:
+                lines.append(f"  - Supporting: {s.get('dataset_name')} / {s.get('metric')} (z={s.get('z_score')}, relation={s.get('relation')})")
+            for c in contradicting:
+                lines.append(f"  - Contradicting: {c.get('dataset_name')} / {c.get('metric')} stayed normal (relation={c.get('relation')})")
+            for r in strong_correlations:
+                lines.append(f"  - Strong correlation: {r.get('dataset_name')} / {r.get('metric')} (r={r.get('correlation')}, overlapping_dates={r.get('overlapping_dates')})")
+
+        if missing_signals:
+            lines.append(f"  Missing signals ({len(missing_signals)}): " + "; ".join(
+                f"{m.get('dataset_name')} ({m.get('reason')})" for m in missing_signals
+            ))
+
         return "\n".join(lines)
 
     def _generate_alert_inner(self, memory: ShortTermMemory) -> dict[str, Any]:

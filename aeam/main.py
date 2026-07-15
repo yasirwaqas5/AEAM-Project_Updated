@@ -62,6 +62,7 @@ from aeam.agents.rag.retrieval_pipeline import RetrievalPipeline
 from aeam.memory.enterprise_memory import EnterpriseMemoryEngine
 from aeam.intelligence.policy_extraction import PolicyExtractor
 from aeam.intelligence.policy_registry import PolicyRegistry
+from aeam.intelligence.cross_dataset_analyzer import CrossDatasetAnalyzer
 from aeam.agents.rag.hybrid_retrieval import BM25Index, HybridRetrievalPipeline
 from aeam.agents.rag.query_expansion import QueryExpansionAgent
 from aeam.agents.rag.multi_query_retrieval import MultiQueryRetrievalPipeline
@@ -722,6 +723,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         embedding_service=embedding_service,
     )
 
+    # --- Cross-Dataset Intelligence (Phase C4) ---
+    # Reuses the EXACT SAME dataset_activation/dataset_intelligence/
+    # dataset_kpi_source instances MonitorAgent's own CompositeKPISource
+    # already depends on (constructed above) -- no second dataset reader,
+    # no second profiler, no second activation store. StatisticalDetector
+    # is constructed fresh inside CrossDatasetAnalyzer with the SAME
+    # window_size=7 MonitorAgent itself uses (same class, not a second
+    # detector implementation).
+    cross_dataset_analyzer = CrossDatasetAnalyzer(
+        dataset_activation=dataset_activation,
+        intelligence=dataset_intelligence,
+        kpi_source=dataset_kpi_source,
+    )
+
     # --- Orchestrator ---
     orchestrator = Orchestrator(
         event_bus=container.event_bus,
@@ -736,6 +751,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         report_agent=report_agent,
         memory_engine=enterprise_memory,
         policy_registry=policy_registry,
+        cross_dataset_analyzer=cross_dataset_analyzer,
     )
 
     # Register wildcard handler

@@ -15,6 +15,7 @@ import Timeline from "../components/Timeline";
 import EvidencePanel from "../components/EvidencePanel";
 import MemoryPanel from "../components/MemoryPanel";
 import PolicyMatchPanel from "../components/PolicyMatchPanel";
+import CrossDatasetPanel from "../components/CrossDatasetPanel";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * pages/Investigation.jsx  (Investigation Workspace)
@@ -34,9 +35,15 @@ import PolicyMatchPanel from "../components/PolicyMatchPanel";
  *     findings for this investigation. A THIRD, structurally distinct
  *     evidence source (type: "policy") — never merged with RAG or Memory,
  *     and never capable of overriding a deterministic RuleEngine decision.
+ *   - CrossDatasetPanel (components/CrossDatasetPanel.jsx, Phase C4) —
+ *     "Cross-Dataset Analysis", correlated signals from OTHER activated
+ *     datasets (type: "cross_dataset"). A FOURTH, structurally distinct
+ *     evidence source — advisory only, never a second MonitorAgent/
+ *     RuleEngine/ForecastAgent.
  *   - ui.jsx's existing incident-shape helpers (getAuditSummary,
  *     getRecommendedActions, getActionOutcome, getValidationStatus,
- *     getMemoryData/getMemoryMatches, getPolicyMatchData/getPolicyMatches, ...)
+ *     getMemoryData/getMemoryMatches, getPolicyMatchData/getPolicyMatches,
+ *     getCrossDatasetData, ...)
  *
  * No new backend endpoint. No orchestration logic duplicated — every
  * derived value here is read directly from fields Orchestrator.
@@ -398,6 +405,7 @@ export default function Investigation() {
                       <Panel title="Evidence" icon="database"><EvidencePanel incident={selected} /></Panel>
                       <Panel title="Enterprise Memory" icon="layers"><MemoryPanel incident={selected} /></Panel>
                       <Panel title="Matched Enterprise Policies" icon="shield"><PolicyMatchPanel incident={selected} /></Panel>
+                      <Panel title="Cross-Dataset Analysis" icon="branch"><CrossDatasetPanel incident={selected} /></Panel>
                       <Panel title="Reasoning" icon="code"><ReasoningPanel incident={selected} /></Panel>
                       <Panel title="Actions" icon="zap"><ActionsPanel incident={selected} /></Panel>
                     </div>

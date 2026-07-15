@@ -223,6 +223,26 @@ export function getPolicyMatches(incident) {
   return Array.isArray(data?.matches) ? data.matches : [];
 }
 
+/**
+ * The Cross-Dataset Intelligence finding (type "cross_dataset", Phase C4)
+ * — a FOURTH, structurally distinct evidence source: correlated signals
+ * across OTHER activated datasets, never merged with RAG documents,
+ * Enterprise Memory, or Enterprise Policies. Shape:
+ * {insufficient_data, reason, origin_dataset_id, origin_dataset_name,
+ *  candidates_checked, supporting, contradicting, strong_correlations,
+ *  missing_signals}. Returns null if Cross-Dataset Intelligence was never
+ * consulted for this investigation (distinct from having run and found
+ * insufficient_data=true, or having run and found nothing).
+ */
+export function getCrossDatasetData(incident) {
+  const findings = getFindings(incident);
+  let latest = null;
+  for (const entry of findings) {
+    if (entry?.type === "cross_dataset" && entry.data) latest = entry.data;
+  }
+  return latest;
+}
+
 /** Count of retrieved evidence chunks recorded for the incident. */
 export function getRetrievedCount(incident) {
   const audit = getAuditSummary(incident);

@@ -120,6 +120,7 @@ class Orchestrator:
         report_agent: Any | None = None,  # Phase 7
         memory_engine: Any | None = None,  # Phase C1 — Enterprise Memory Engine
         policy_registry: Any | None = None,  # Phase C3 — Enterprise Policy Registry
+        cross_dataset_analyzer: Any | None = None,  # Phase C4 — Cross-Dataset Intelligence
     ) -> None:
         self._bus = event_bus
         self._decision = decision_engine
@@ -133,6 +134,7 @@ class Orchestrator:
         self._report = report_agent   # Phase 7
         self._memory = memory_engine  # Phase C1
         self._policy_registry = policy_registry  # Phase C3
+        self._cross_dataset = cross_dataset_analyzer  # Phase C4
 
         # Track the active event for the duration of a handle_event() call.
         self._active_event: Event | None = None
@@ -358,6 +360,42 @@ class Orchestrator:
             logger.info(
                 "investigate | policy match | matches=%d | incident_id=%s",
                 len(policy_matches), policy_incident_id,
+            )
+
+        # --- Cross-Dataset Intelligence (Phase C4) ---
+        # Same idempotency pattern as Enterprise Memory / Policy Registry
+        # above -- runs once per incident lifecycle. Correlates the
+        # incident's metric against every OTHER currently-activated
+        # dataset via CrossDatasetAnalyzer, which reuses
+        # DatasetIntelligenceService/DatasetKPISource/StatisticalDetector
+        # unmodified -- no second MonitorAgent, no second RuleEngine, no
+        # new detection logic. Advisory only: appended as its own findings
+        # entry, never fed back into RuleEngine/DecisionEngine/ActionAgent.
+        if self._cross_dataset is not None and not self._has_cross_dataset_finding():
+            cross_incident_id = self._stm.get("incident_id", "unknown")
+            try:
+                cross_dataset_result = self._cross_dataset.analyze(metric=self._active_event.metric)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("investigate | cross-dataset analysis failed: %s", exc)
+                cross_dataset_result = {
+                    "insufficient_data": True,
+                    "reason": f"Cross-dataset analysis failed: {exc}",
+                    "origin_dataset_id": None, "origin_dataset_name": None,
+                    "candidates_checked": 0, "supporting": [], "contradicting": [],
+                    "strong_correlations": [], "missing_signals": [],
+                }
+
+            self._stm.append("findings", {
+                "type": "cross_dataset",
+                "data": cross_dataset_result,
+            })
+            logger.info(
+                "investigate | cross-dataset analysis | supporting=%d | contradicting=%d | "
+                "strong_correlations=%d | incident_id=%s",
+                len(cross_dataset_result.get("supporting", [])),
+                len(cross_dataset_result.get("contradicting", [])),
+                len(cross_dataset_result.get("strong_correlations", [])),
+                cross_incident_id,
             )
 
         # --- RAG integration (Phase 4) ---
@@ -948,6 +986,18 @@ class Orchestrator:
         findings = self._stm.get("findings", []) or []
         return any(
             isinstance(entry, dict) and entry.get("type") == "policy"
+            for entry in findings
+        )
+
+    def _has_cross_dataset_finding(self) -> bool:
+        """
+        True if Cross-Dataset Intelligence has already run this incident
+        lifecycle -- same idempotency guard as _has_memory_finding()/
+        _has_policy_finding(), for the same reason.
+        """
+        findings = self._stm.get("findings", []) or []
+        return any(
+            isinstance(entry, dict) and entry.get("type") == "cross_dataset"
             for entry in findings
         )
 
