@@ -14,6 +14,7 @@ import { SearchBox } from "./KnowledgeCenter";
 import Timeline from "../components/Timeline";
 import EvidencePanel from "../components/EvidencePanel";
 import MemoryPanel from "../components/MemoryPanel";
+import PolicyMatchPanel from "../components/PolicyMatchPanel";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * pages/Investigation.jsx  (Investigation Workspace)
@@ -28,9 +29,14 @@ import MemoryPanel from "../components/MemoryPanel";
  *     Memory's similar-resolved-incidents recall, kept as its own panel
  *     deliberately separate from Evidence: knowledge documents vs. past
  *     incidents must never be merged into one indistinguishable list.
+ *   - PolicyMatchPanel (components/PolicyMatchPanel.jsx, Phase C3) —
+ *     "Matched Enterprise Policies", the Policy Registry's advisory
+ *     findings for this investigation. A THIRD, structurally distinct
+ *     evidence source (type: "policy") — never merged with RAG or Memory,
+ *     and never capable of overriding a deterministic RuleEngine decision.
  *   - ui.jsx's existing incident-shape helpers (getAuditSummary,
  *     getRecommendedActions, getActionOutcome, getValidationStatus,
- *     getMemoryData/getMemoryMatches, ...)
+ *     getMemoryData/getMemoryMatches, getPolicyMatchData/getPolicyMatches, ...)
  *
  * No new backend endpoint. No orchestration logic duplicated — every
  * derived value here is read directly from fields Orchestrator.
@@ -391,6 +397,7 @@ export default function Investigation() {
                     <div style={{ display: "flex", flexDirection: "column", gap: "1.2rem" }}>
                       <Panel title="Evidence" icon="database"><EvidencePanel incident={selected} /></Panel>
                       <Panel title="Enterprise Memory" icon="layers"><MemoryPanel incident={selected} /></Panel>
+                      <Panel title="Matched Enterprise Policies" icon="shield"><PolicyMatchPanel incident={selected} /></Panel>
                       <Panel title="Reasoning" icon="code"><ReasoningPanel incident={selected} /></Panel>
                       <Panel title="Actions" icon="zap"><ActionsPanel incident={selected} /></Panel>
                     </div>

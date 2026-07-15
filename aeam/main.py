@@ -37,6 +37,7 @@ from aeam.registry.repositories import (
     DatasetRepository,
     SchemaRepository,
     VersionRepository,
+    PolicyRepository,
 )
 from aeam.ingestion.worker import IngestionWorker
 from aeam.ingestion.processor import DocumentIngestJobProcessor
@@ -60,6 +61,7 @@ from aeam.agents.rag.ingestion_pipeline import IngestionPipeline
 from aeam.agents.rag.retrieval_pipeline import RetrievalPipeline
 from aeam.memory.enterprise_memory import EnterpriseMemoryEngine
 from aeam.intelligence.policy_extraction import PolicyExtractor
+from aeam.intelligence.policy_registry import PolicyRegistry
 from aeam.agents.rag.hybrid_retrieval import BM25Index, HybridRetrievalPipeline
 from aeam.agents.rag.query_expansion import QueryExpansionAgent
 from aeam.agents.rag.multi_query_retrieval import MultiQueryRetrievalPipeline
@@ -707,6 +709,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     container.ingestion_worker = ingestion_worker
     logger.info("IngestionWorker started in background thread.")
 
+    # --- Enterprise Policy Registry (Phase C3) ---
+    # Reuses the existing PolicyRepository (Phase C2 table, no new schema),
+    # a fresh plain RuleEngine() for its curated-domain vocabulary only (the
+    # SAME "cheap, side-effect-free, read-only" pattern
+    # aeam/api/data_center.py's dataset-profile endpoint already uses --
+    # never CompositeRuleEngine, never .evaluate()), and the SAME shared
+    # embedding_service the RAG pipeline/Enterprise Memory already use.
+    policy_registry = PolicyRegistry(
+        policy_repository=PolicyRepository(container.db),
+        rule_engine=RuleEngine(),
+        embedding_service=embedding_service,
+    )
+
     # --- Orchestrator ---
     orchestrator = Orchestrator(
         event_bus=container.event_bus,
@@ -720,6 +735,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         action_agent=action_agent,
         report_agent=report_agent,
         memory_engine=enterprise_memory,
+        policy_registry=policy_registry,
     )
 
     # Register wildcard handler

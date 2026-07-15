@@ -193,6 +193,36 @@ export function getMemoryMatches(incident) {
   return Array.isArray(data?.matches) ? data.matches : [];
 }
 
+/**
+ * The `data` dict of the most recent Enterprise Policy Registry match pass
+ * recorded in findings (type "policy", Phase C3) — a THIRD, structurally
+ * distinct evidence source: never merged with RAG's `type: "rag"` document
+ * chunks or Enterprise Memory's `type: "memory"` past incidents.
+ */
+export function getPolicyMatchData(incident) {
+  const findings = getFindings(incident);
+  let latest = null;
+  for (const entry of findings) {
+    if (entry?.type === "policy" && entry.data) latest = entry.data;
+  }
+  return latest;
+}
+
+/**
+ * Enterprise policies matched to this investigation — advisory evidence
+ * only (see aeam/intelligence/policy_registry.py: policies never override
+ * a deterministic RuleEngine decision). Each entry: {policy_id,
+ * source_document, source_chunk, business_rule, condition, threshold,
+ * actions, escalation_rule, approval_required, department, role,
+ * time_constraint, priority, related_metrics, match_reason, similarity?}.
+ * Empty array both when the registry was never consulted and when it
+ * found nothing — distinguish via getPolicyMatchData(incident) === null.
+ */
+export function getPolicyMatches(incident) {
+  const data = getPolicyMatchData(incident);
+  return Array.isArray(data?.matches) ? data.matches : [];
+}
+
 /** Count of retrieved evidence chunks recorded for the incident. */
 export function getRetrievedCount(incident) {
   const audit = getAuditSummary(incident);

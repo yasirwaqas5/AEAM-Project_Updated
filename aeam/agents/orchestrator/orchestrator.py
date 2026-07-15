@@ -119,6 +119,7 @@ class Orchestrator:
         action_agent: Any | None = None,  # Phase 6
         report_agent: Any | None = None,  # Phase 7
         memory_engine: Any | None = None,  # Phase C1 — Enterprise Memory Engine
+        policy_registry: Any | None = None,  # Phase C3 — Enterprise Policy Registry
     ) -> None:
         self._bus = event_bus
         self._decision = decision_engine
@@ -131,6 +132,7 @@ class Orchestrator:
         self._action = action_agent  # Phase 6
         self._report = report_agent   # Phase 7
         self._memory = memory_engine  # Phase C1
+        self._policy_registry = policy_registry  # Phase C3
 
         # Track the active event for the duration of a handle_event() call.
         self._active_event: Event | None = None
@@ -321,6 +323,41 @@ class Orchestrator:
             logger.info(
                 "investigate | memory recall | matches=%d | incident_id=%s",
                 len(similar_incidents), memory_incident_id,
+            )
+
+        # --- Enterprise Policy Registry match (Phase C3) ---
+        # Same idempotency pattern as Enterprise Memory above -- runs once
+        # per incident lifecycle, independent of decision-engine agent
+        # routing. Reuses RAGAgent._formulate_query() (the SAME query
+        # RAG/Memory already compute) so all three evidence sources search
+        # on identical vocabulary -- no duplicate query logic. Advisory
+        # only: matched policies are appended as their own findings entry
+        # and NEVER passed to RuleEngine.evaluate(), DecisionEngine, or
+        # ActionAgent -- they cannot trigger, suppress, or override a
+        # deterministic rule.
+        if self._policy_registry is not None and not self._has_policy_finding():
+            policy_incident_id = self._stm.get("incident_id", "unknown")
+            try:
+                policy_query = RAGAgent._formulate_query(self._active_event)
+                policy_matches = self._policy_registry.match_for_incident(
+                    metric=self._active_event.metric,
+                    query=policy_query,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("investigate | policy match failed: %s", exc)
+                policy_query = None
+                policy_matches = []
+
+            self._stm.append("findings", {
+                "type": "policy",
+                "data": {
+                    "query": policy_query,
+                    "matches": policy_matches,
+                },
+            })
+            logger.info(
+                "investigate | policy match | matches=%d | incident_id=%s",
+                len(policy_matches), policy_incident_id,
             )
 
         # --- RAG integration (Phase 4) ---
@@ -899,6 +936,18 @@ class Orchestrator:
         findings = self._stm.get("findings", []) or []
         return any(
             isinstance(entry, dict) and entry.get("type") == "memory"
+            for entry in findings
+        )
+
+    def _has_policy_finding(self) -> bool:
+        """
+        True if the Enterprise Policy Registry match has already run this
+        incident lifecycle -- same idempotency guard as
+        _has_memory_finding(), for the same reason.
+        """
+        findings = self._stm.get("findings", []) or []
+        return any(
+            isinstance(entry, dict) and entry.get("type") == "policy"
             for entry in findings
         )
 

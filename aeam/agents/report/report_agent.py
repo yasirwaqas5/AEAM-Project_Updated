@@ -266,11 +266,57 @@ class ReportAgent:
             )
             detailed_report = filled_template
 
+        # Phase C3: append the "Matched Enterprise Policies" section.
+        # Additive post-processing, not a template/prompt change -- the LLM
+        # path above is untouched, so this never risks the LLM narrating
+        # (or hallucinating about) policies it wasn't designed around.
+        # Advisory only: this section is a report of what the Policy
+        # Registry found; it never altered root_cause, confidence, or the
+        # runbook action plan above.
+        detailed_report = f"{detailed_report}\n\n{self._format_matched_policies(memory)}"
+
         return {
             "executive_summary": executive_summary,
             "detailed_report":   detailed_report,
             "confidence":        round(confidence, 4),
         }
+
+    @staticmethod
+    def _format_matched_policies(memory: ShortTermMemory) -> str:
+        """
+        Build the "Matched Enterprise Policies" report section (Phase C3)
+        from the policy-match finding the Orchestrator already appended to
+        STM (``type == "policy"``, see Orchestrator.investigate()).
+
+        Never fabricates a match: an incident predating Phase C3 (no policy
+        finding recorded at all) or one where the Policy Registry
+        genuinely found nothing both render an honest "none" statement,
+        distinguishable from each other by wording, never by a guessed value.
+        """
+        findings = memory.get("findings") or []
+        found_policy_stage = False
+        matches: list[dict[str, Any]] = []
+        for entry in findings:
+            if isinstance(entry, dict) and entry.get("type") == "policy":
+                found_policy_stage = True
+                data = entry.get("data") or {}
+                matches = data.get("matches") or []
+
+        lines = ["Matched Enterprise Policies:"]
+        if not found_policy_stage:
+            lines.append("  Policy Registry was not consulted for this investigation.")
+        elif not matches:
+            lines.append("  No matched enterprise policies for this investigation.")
+        else:
+            for m in matches:
+                label = m.get("business_rule") or m.get("condition") or "(unlabeled policy)"
+                reason = m.get("match_reason", "unknown")
+                source = m.get("source_document") or "unknown source"
+                lines.append(
+                    f"  - {label} "
+                    f"[policy_id={m.get('policy_id')}, matched_by={reason}, source={source}]"
+                )
+        return "\n".join(lines)
 
     def _generate_alert_inner(self, memory: ShortTermMemory) -> dict[str, Any]:
         """
