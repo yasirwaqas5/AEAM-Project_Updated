@@ -122,6 +122,7 @@ class Orchestrator:
         policy_registry: Any | None = None,  # Phase C3 — Enterprise Policy Registry
         cross_dataset_analyzer: Any | None = None,  # Phase C4 — Cross-Dataset Intelligence
         adaptive_detection_engine: Any | None = None,  # Phase C5 — Adaptive Detection Engine
+        execution_planning_engine: Any | None = None,  # Phase C7 — Enterprise Action Planning Engine
     ) -> None:
         self._bus = event_bus
         self._decision = decision_engine
@@ -137,6 +138,7 @@ class Orchestrator:
         self._policy_registry = policy_registry  # Phase C3
         self._cross_dataset = cross_dataset_analyzer  # Phase C4
         self._adaptive_detection = adaptive_detection_engine  # Phase C5
+        self._execution_planner = execution_planning_engine  # Phase C7
 
         # Track the active event for the duration of a handle_event() call.
         self._active_event: Event | None = None
@@ -660,23 +662,26 @@ class Orchestrator:
            :mod:`~aeam.agents.orchestrator.investigation_status`), the
            validation outcome of the latest RAG pass, and the event's safe
            runbook (see :mod:`~aeam.agents.orchestrator.runbooks`).
-        3. Execute the runbook's action plan via ActionAgent. Only actions
+        3. Synthesize the Enterprise Action Planning Engine's execution plan
+           (Phase C7) from every already-computed finding -- appended as its
+           own advisory findings entry, strictly before the action plan runs.
+        4. Execute the runbook's action plan via ActionAgent. Only actions
            that actually return ``SUCCESS`` are recorded as executed; every
            skipped or failed action is recorded with its reason — this
            method never claims an action ran unless ActionAgent confirmed it.
-        4. Send Slack/Jira notifications built from explicit named fields
+        5. Send Slack/Jira notifications built from explicit named fields
            (see :mod:`~aeam.agents.orchestrator.notifications`) — never a
            raw JSON dump of findings or the LLM response.
-        5. Always attempt an email report last (independent of the runbook;
+        6. Always attempt an email report last (independent of the runbook;
            a missing-credentials failure is expected and already reported
            with a structured reason by EmailActions).
-        6. Append one consolidated ``audit_summary`` findings entry — the
+        7. Append one consolidated ``audit_summary`` findings entry — the
            single source of truth the frontend reads for status, evidence,
            and executed actions.
-        7. Persist via :meth:`~aeam.memory.long_term.LongTermMemory.record_incident`
+        8. Persist via :meth:`~aeam.memory.long_term.LongTermMemory.record_incident`
            (schema unchanged — everything new lives inside the existing
            ``findings`` JSON column).
-        8. Clear STM and reset ``_active_event``.
+        9. Clear STM and reset ``_active_event``.
         """
         if self._sm.get_state() == IncidentState.COMPLETE:
             logger.info("finalize_incident | already COMPLETE; skipping duplicate finalize")
@@ -731,6 +736,59 @@ class Orchestrator:
         })
 
         runbook = get_runbook(event_data.get("event_type", ""))
+
+        # --- Enterprise Action Planning Engine (Phase C7) ---
+        # Synthesizes every already-computed finding (memory/policy/
+        # cross_dataset/adaptive/rag) into ONE explainable execution plan.
+        # Runs exactly once (guarded both by finalize_incident()'s own
+        # COMPLETE-state check above and this defensive idempotency guard),
+        # strictly AFTER every evidence-producing stage in investigate() has
+        # already run, and BEFORE the runbook action-execution loop below --
+        # so it is genuinely "the final reasoning stage before Human Review
+        # and ActionAgent" the mission describes. Performs NO retrieval, NO
+        # detection, and calls ActionAgent/RuleEngine/DecisionEngine
+        # nothing -- it only reads self._stm.get("findings") and the
+        # already-resolved runbook, and appends its own advisory findings
+        # entry. ActionAgent.execute() and the action_plan loop below are
+        # completely unchanged by this stage.
+        if self._execution_planner is not None and not self._has_execution_plan_finding():
+            try:
+                execution_plan = self._execution_planner.plan(
+                    event_type=event_data.get("event_type", ""),
+                    metric=event_data.get("metric", ""),
+                    severity=event_data.get("severity", ""),
+                    current_value=event_data.get("current_value"),
+                    expected_value=event_data.get("expected_value"),
+                    findings=self._stm.get("findings", []) or [],
+                    root_cause=root_cause,
+                    confidence=confidence,
+                    requires_human=requires_human,
+                    runbook_recommended_actions=runbook["recommended_actions"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("finalize_incident | execution planning failed: %s", exc)
+                execution_plan = {
+                    "executive_summary": f"Execution planning failed: {exc}",
+                    "recommended_actions": [], "order_rationale": None,
+                    "supporting_evidence": [], "business_risk_assessment": None,
+                    "expected_impact": None, "confidence": 0.0,
+                    "evidence_quality": "insufficient", "evidence_conflicts": [],
+                    "human_approval_required": True, "explanation": f"Execution planning failed: {exc}",
+                    "insufficient_evidence": True,
+                    "sources_consulted": {}, "sources_with_signal": {},
+                }
+
+            self._stm.append("findings", {
+                "type": "execution_plan",
+                "data": execution_plan,
+            })
+            logger.info(
+                "finalize_incident | execution plan | actions=%d | confidence=%s | "
+                "evidence_quality=%s | conflicts=%d | incident_id=%s",
+                len(execution_plan.get("recommended_actions", [])),
+                execution_plan.get("confidence"), execution_plan.get("evidence_quality"),
+                len(execution_plan.get("evidence_conflicts", [])), incident_id,
+            )
 
         # --- Execute the safe runbook action plan. ---
         executed_actions: list[str] = []
@@ -1058,6 +1116,19 @@ class Orchestrator:
         findings = self._stm.get("findings", []) or []
         return any(
             isinstance(entry, dict) and entry.get("type") == "adaptive"
+            for entry in findings
+        )
+
+    def _has_execution_plan_finding(self) -> bool:
+        """
+        True if the Enterprise Action Planning Engine has already run this
+        incident lifecycle -- defensive idempotency guard mirroring
+        _has_adaptive_finding()/etc, even though finalize_incident() itself
+        already guards against running more than once (COMPLETE-state check).
+        """
+        findings = self._stm.get("findings", []) or []
+        return any(
+            isinstance(entry, dict) and entry.get("type") == "execution_plan"
             for entry in findings
         )
 

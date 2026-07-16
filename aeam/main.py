@@ -64,6 +64,7 @@ from aeam.intelligence.policy_extraction import PolicyExtractor
 from aeam.intelligence.policy_registry import PolicyRegistry
 from aeam.intelligence.cross_dataset_analyzer import CrossDatasetAnalyzer
 from aeam.intelligence.adaptive_detection import AdaptiveDetectionEngine
+from aeam.intelligence.execution_planning import ExecutionPlanningEngine
 from aeam.agents.rag.hybrid_retrieval import BM25Index, HybridRetrievalPipeline
 from aeam.agents.rag.query_expansion import QueryExpansionAgent
 from aeam.agents.rag.multi_query_retrieval import MultiQueryRetrievalPipeline
@@ -785,6 +786,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         long_term_memory=long_term_memory,
     )
 
+    # --- Enterprise Action Planning Engine (Phase C7) ---
+    # Zero external dependencies -- pure synthesis over the findings the
+    # Orchestrator has already accumulated by finalize_incident() time. No
+    # new retrieval, no new detector, no LLM call. Always constructed
+    # (mirrors the C1/C3/C4/C5 "always on if wired" precedent -- these
+    # phases have no dedicated settings flag either, since they add no new
+    # infrastructure dependency that could fail to initialize).
+    execution_planning_engine = ExecutionPlanningEngine()
+
     # --- Orchestrator ---
     orchestrator = Orchestrator(
         event_bus=container.event_bus,
@@ -801,6 +811,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         policy_registry=policy_registry,
         cross_dataset_analyzer=cross_dataset_analyzer,
         adaptive_detection_engine=adaptive_detection_engine,
+        execution_planning_engine=execution_planning_engine,
     )
 
     # Register wildcard handler

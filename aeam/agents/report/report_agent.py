@@ -283,6 +283,10 @@ class ReportAgent:
         # additive-post-processing rationale as Phase C3/C4 above.
         detailed_report = f"{detailed_report}\n\n{self._format_adaptive_detection(memory)}"
 
+        # Phase C7: append the "Enterprise Execution Plan" section. Same
+        # additive-post-processing rationale as Phase C3/C4/C5 above.
+        detailed_report = f"{detailed_report}\n\n{self._format_execution_plan(memory)}"
+
         return {
             "executive_summary": executive_summary,
             "detailed_report":   detailed_report,
@@ -439,6 +443,75 @@ class ReportAgent:
             lines.append(f"  Combined signal: corroborated by {', '.join(corroborating)}.")
         else:
             lines.append("  Combined signal: no corroborating evidence across adaptive baseline, statistical, or forecast signals.")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_execution_plan(memory: ShortTermMemory) -> str:
+        """
+        Build the "Enterprise Execution Plan" report section (Phase C7) from
+        the execution-plan finding the Orchestrator already appended to STM
+        (``type == "execution_plan"``, see Orchestrator.finalize_incident() /
+        aeam.intelligence.execution_planning.ExecutionPlanningEngine).
+
+        Never fabricates a recommendation, a confidence value, or a business
+        impact: an incident predating Phase C7 and one where evidence was
+        genuinely insufficient are each rendered with their own honest
+        wording -- never conflated with an invented plan.
+        """
+        findings = memory.get("findings") or []
+        found_stage = False
+        data: dict[str, Any] = {}
+        for entry in findings:
+            if isinstance(entry, dict) and entry.get("type") == "execution_plan":
+                found_stage = True
+                data = entry.get("data") or {}
+
+        lines = ["Enterprise Execution Plan:"]
+        if not found_stage:
+            lines.append("  Enterprise Action Planning Engine was not consulted for this investigation.")
+            return "\n".join(lines)
+
+        lines.append(f"  Summary: {data.get('executive_summary', 'not available')}")
+
+        if data.get("insufficient_evidence"):
+            lines.append("  Insufficient evidence: this plan intentionally does not fabricate recommendations beyond standard runbook guidance.")
+
+        actions = data.get("recommended_actions") or []
+        if not actions:
+            lines.append("  Recommendations: none synthesized.")
+        else:
+            lines.append(f"  Recommendations ({len(actions)}, in order):")
+            for a in actions:
+                lines.append(
+                    f"    {a.get('order')}. [{a.get('classification')}] {a.get('action')} "
+                    f"(source={a.get('source')}) -- {a.get('rationale')}"
+                )
+
+        evidence = data.get("supporting_evidence") or []
+        if evidence:
+            lines.append(f"  Supporting evidence ({len(evidence)}):")
+            for e in evidence:
+                lines.append(f"    - [{e.get('source')}] {e.get('summary')}")
+
+        lines.append(f"  Confidence: {data.get('confidence')}")
+        lines.append(f"  Evidence quality: {data.get('evidence_quality')}")
+
+        conflicts = data.get("evidence_conflicts") or []
+        if conflicts:
+            lines.append(f"  Evidence conflicts ({len(conflicts)}):")
+            for c in conflicts:
+                lines.append(f"    - {c.get('description')}")
+        else:
+            lines.append("  Evidence conflicts: none detected.")
+
+        lines.append(f"  Human approval required: {data.get('human_approval_required')}")
+        if data.get("business_risk_assessment"):
+            lines.append(f"  Business risk: {data.get('business_risk_assessment')}")
+        if data.get("expected_impact"):
+            lines.append(f"  Expected impact: {data.get('expected_impact')}")
+        if data.get("explanation"):
+            lines.append(f"  Explanation: {data.get('explanation')}")
 
         return "\n".join(lines)
 

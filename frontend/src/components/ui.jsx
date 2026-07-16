@@ -265,6 +265,28 @@ export function getAdaptiveDetectionData(incident) {
   return latest;
 }
 
+/**
+ * The Enterprise Action Planning Engine's execution plan (type
+ * "execution_plan", Phase C7) — the FINAL reasoning stage, synthesizing
+ * every prior evidence source (memory/policy/cross_dataset/adaptive/
+ * retrieval) into one explainable plan. Never merged with any individual
+ * evidence panel's data; it only REFERENCES them. Shape: {executive_summary,
+ * recommended_actions, order_rationale, supporting_evidence,
+ * business_risk_assessment, expected_impact, confidence, evidence_quality,
+ * evidence_conflicts, human_approval_required, explanation,
+ * insufficient_evidence, sources_consulted, sources_with_signal}. Returns
+ * null if the planning engine was never consulted for this investigation
+ * (distinct from having run and found insufficient evidence).
+ */
+export function getExecutionPlanData(incident) {
+  const findings = getFindings(incident);
+  let latest = null;
+  for (const entry of findings) {
+    if (entry?.type === "execution_plan" && entry.data) latest = entry.data;
+  }
+  return latest;
+}
+
 /** Count of retrieved evidence chunks recorded for the incident. */
 export function getRetrievedCount(incident) {
   const audit = getAuditSummary(incident);

@@ -17,6 +17,7 @@ import MemoryPanel from "../components/MemoryPanel";
 import PolicyMatchPanel from "../components/PolicyMatchPanel";
 import CrossDatasetPanel from "../components/CrossDatasetPanel";
 import AdaptiveDetectionPanel from "../components/AdaptiveDetectionPanel";
+import ExecutionPlanPanel from "../components/ExecutionPlanPanel";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * pages/Investigation.jsx  (Investigation Workspace)
@@ -47,10 +48,17 @@ import AdaptiveDetectionPanel from "../components/AdaptiveDetectionPanel";
  *     (type: "adaptive"). A FIFTH, structurally distinct evidence source —
  *     advisory only, reuses StatisticalDetector unmodified and never
  *     re-invokes ForecastAgent.
+ *   - ExecutionPlanPanel (components/ExecutionPlanPanel.jsx, Phase C7) —
+ *     "Execution Plan", the Enterprise Action Planning Engine's single
+ *     explainable plan (type: "execution_plan"), synthesized from EVERY
+ *     prior evidence source above. The FINAL reasoning stage before Human
+ *     Review and ActionAgent — advisory only, performs no retrieval/
+ *     detection/LLM call of its own, and never alters ActionAgent's
+ *     runbook-driven execution.
  *   - ui.jsx's existing incident-shape helpers (getAuditSummary,
  *     getRecommendedActions, getActionOutcome, getValidationStatus,
  *     getMemoryData/getMemoryMatches, getPolicyMatchData/getPolicyMatches,
- *     getCrossDatasetData, getAdaptiveDetectionData, ...)
+ *     getCrossDatasetData, getAdaptiveDetectionData, getExecutionPlanData, ...)
  *
  * No new backend endpoint. No orchestration logic duplicated — every
  * derived value here is read directly from fields Orchestrator.
@@ -414,6 +422,7 @@ export default function Investigation() {
                       <Panel title="Matched Enterprise Policies" icon="shield"><PolicyMatchPanel incident={selected} /></Panel>
                       <Panel title="Cross-Dataset Analysis" icon="branch"><CrossDatasetPanel incident={selected} /></Panel>
                       <Panel title="Adaptive Detection" icon="activity"><AdaptiveDetectionPanel incident={selected} /></Panel>
+                      <Panel title="Execution Plan" icon="zap"><ExecutionPlanPanel incident={selected} /></Panel>
                       <Panel title="Reasoning" icon="code"><ReasoningPanel incident={selected} /></Panel>
                       <Panel title="Actions" icon="zap"><ActionsPanel incident={selected} /></Panel>
                     </div>
