@@ -305,6 +305,23 @@ export function getExplainabilityData(incident) {
   return latest;
 }
 
+/**
+ * The Enterprise AI Evaluation & Quality Engine's output (type
+ * "ai_evaluation", Phase D2) — scores the QUALITY of the investigation;
+ * never changes findings, the execution plan, or explainability. Shape:
+ * {overall_score, overall_score_formula, component_scores, strengths,
+ * weaknesses, missing_evidence, improvement_opportunities, quality_summary}.
+ * Returns null if the engine was never consulted for this investigation.
+ */
+export function getAIEvaluationData(incident) {
+  const findings = getFindings(incident);
+  let latest = null;
+  for (const entry of findings) {
+    if (entry?.type === "ai_evaluation" && entry.data) latest = entry.data;
+  }
+  return latest;
+}
+
 /** Count of retrieved evidence chunks recorded for the incident. */
 export function getRetrievedCount(incident) {
   const audit = getAuditSummary(incident);

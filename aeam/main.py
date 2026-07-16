@@ -66,6 +66,7 @@ from aeam.intelligence.cross_dataset_analyzer import CrossDatasetAnalyzer
 from aeam.intelligence.adaptive_detection import AdaptiveDetectionEngine
 from aeam.intelligence.execution_planning import ExecutionPlanningEngine
 from aeam.intelligence.explainability import ExplainabilityEngine
+from aeam.intelligence.ai_evaluation import AIEvaluationEngine
 from aeam.agents.rag.hybrid_retrieval import BM25Index, HybridRetrievalPipeline
 from aeam.agents.rag.query_expansion import QueryExpansionAgent
 from aeam.agents.rag.multi_query_retrieval import MultiQueryRetrievalPipeline
@@ -803,6 +804,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # constructed (same "always on if wired" precedent as C7).
     explainability_engine = ExplainabilityEngine()
 
+    # --- Enterprise AI Evaluation & Quality Engine (Phase D2) ---
+    # Zero external dependencies -- scores investigation quality from
+    # findings, execution_plan, and explainability, never changing any of
+    # them. No new retrieval, no new detector, no LLM call, no second
+    # planner. Always constructed (same "always on if wired" precedent).
+    ai_evaluation_engine = AIEvaluationEngine()
+
     # --- Orchestrator ---
     orchestrator = Orchestrator(
         event_bus=container.event_bus,
@@ -821,6 +829,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         adaptive_detection_engine=adaptive_detection_engine,
         execution_planning_engine=execution_planning_engine,
         explainability_engine=explainability_engine,
+        ai_evaluation_engine=ai_evaluation_engine,
     )
 
     # Register wildcard handler

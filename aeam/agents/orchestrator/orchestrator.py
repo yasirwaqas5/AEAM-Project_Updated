@@ -124,6 +124,7 @@ class Orchestrator:
         adaptive_detection_engine: Any | None = None,  # Phase C5 — Adaptive Detection Engine
         execution_planning_engine: Any | None = None,  # Phase C7 — Enterprise Action Planning Engine
         explainability_engine: Any | None = None,  # Phase D1 — Enterprise Explainability Engine
+        ai_evaluation_engine: Any | None = None,  # Phase D2 — Enterprise AI Evaluation & Quality Engine
     ) -> None:
         self._bus = event_bus
         self._decision = decision_engine
@@ -141,6 +142,7 @@ class Orchestrator:
         self._adaptive_detection = adaptive_detection_engine  # Phase C5
         self._execution_planner = execution_planning_engine  # Phase C7
         self._explainability_engine = explainability_engine  # Phase D1
+        self._ai_evaluator = ai_evaluation_engine  # Phase D2
 
         # Track the active event for the duration of a handle_event() call.
         self._active_event: Event | None = None
@@ -672,23 +674,30 @@ class Orchestrator:
            breakdown, contradictions, missing evidence, and assumptions --
            appended as its own advisory findings entry. Never changes a
            recommendation; only explains it.
-        5. Execute the runbook's action plan via ActionAgent. Only actions
+        5. Score the investigation's own QUALITY via the Enterprise AI
+           Evaluation & Quality Engine (Phase D2) -- evidence coverage,
+           retrieval/memory/policy/cross-dataset/adaptive coverage,
+           conflict severity, diversity, recommendation quality, and
+           completeness -- appended as its own advisory findings entry.
+           Never changes findings, the execution plan, or explainability;
+           only evaluates them.
+        6. Execute the runbook's action plan via ActionAgent. Only actions
            that actually return ``SUCCESS`` are recorded as executed; every
            skipped or failed action is recorded with its reason — this
            method never claims an action ran unless ActionAgent confirmed it.
-        6. Send Slack/Jira notifications built from explicit named fields
+        7. Send Slack/Jira notifications built from explicit named fields
            (see :mod:`~aeam.agents.orchestrator.notifications`) — never a
            raw JSON dump of findings or the LLM response.
-        7. Always attempt an email report last (independent of the runbook;
+        8. Always attempt an email report last (independent of the runbook;
            a missing-credentials failure is expected and already reported
            with a structured reason by EmailActions).
-        8. Append one consolidated ``audit_summary`` findings entry — the
+        9. Append one consolidated ``audit_summary`` findings entry — the
            single source of truth the frontend reads for status, evidence,
            and executed actions.
-        9. Persist via :meth:`~aeam.memory.long_term.LongTermMemory.record_incident`
+        10. Persist via :meth:`~aeam.memory.long_term.LongTermMemory.record_incident`
            (schema unchanged — everything new lives inside the existing
            ``findings`` JSON column).
-        10. Clear STM and reset ``_active_event``.
+        11. Clear STM and reset ``_active_event``.
         """
         if self._sm.get_state() == IncidentState.COMPLETE:
             logger.info("finalize_incident | already COMPLETE; skipping duplicate finalize")
@@ -840,6 +849,53 @@ class Orchestrator:
                 len(explainability_result.get("decision_graph", [])),
                 len(explainability_result.get("contradictions", [])),
                 len(explainability_result.get("missing_evidence", [])), incident_id,
+            )
+
+        # --- Enterprise AI Evaluation & Quality Engine (Phase D2) ---
+        # Scores the QUALITY of this investigation -- never changes
+        # findings, the execution plan, or the explainability object; it
+        # only reads them (execution_plan and explainability read back from
+        # findings, never a possibly-stale local variable). Runs exactly
+        # once (guarded both by finalize_incident()'s own COMPLETE-state
+        # check and this defensive idempotency guard), strictly AFTER
+        # explainability above and BEFORE the runbook action-execution loop.
+        # Performs NO retrieval, NO detection, and calls no other engine.
+        if self._ai_evaluator is not None and not self._has_ai_evaluation_finding():
+            execution_plan_data_for_eval: dict[str, Any] = {}
+            explainability_data_for_eval: dict[str, Any] | None = None
+            for entry in self._stm.get("findings", []) or []:
+                if isinstance(entry, dict) and entry.get("type") == "execution_plan":
+                    execution_plan_data_for_eval = entry.get("data") or {}
+                elif isinstance(entry, dict) and entry.get("type") == "explainability":
+                    explainability_data_for_eval = entry.get("data") or {}
+
+            try:
+                ai_evaluation_result = self._ai_evaluator.assess(
+                    findings=self._stm.get("findings", []) or [],
+                    execution_plan=execution_plan_data_for_eval,
+                    explainability=explainability_data_for_eval,
+                    root_cause=root_cause,
+                    confidence=confidence,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("finalize_incident | AI evaluation failed: %s", exc)
+                ai_evaluation_result = {
+                    "overall_score": None, "overall_score_formula": f"AI evaluation failed: {exc}",
+                    "component_scores": {}, "strengths": [], "weaknesses": [],
+                    "missing_evidence": [], "improvement_opportunities": [],
+                    "quality_summary": f"AI evaluation failed: {exc}",
+                }
+
+            self._stm.append("findings", {
+                "type": "ai_evaluation",
+                "data": ai_evaluation_result,
+            })
+            logger.info(
+                "finalize_incident | AI evaluation | overall_score=%s | strengths=%d | "
+                "weaknesses=%d | incident_id=%s",
+                ai_evaluation_result.get("overall_score"),
+                len(ai_evaluation_result.get("strengths", [])),
+                len(ai_evaluation_result.get("weaknesses", [])), incident_id,
             )
 
         # --- Execute the safe runbook action plan. ---
@@ -1193,6 +1249,18 @@ class Orchestrator:
         findings = self._stm.get("findings", []) or []
         return any(
             isinstance(entry, dict) and entry.get("type") == "explainability"
+            for entry in findings
+        )
+
+    def _has_ai_evaluation_finding(self) -> bool:
+        """
+        True if the Enterprise AI Evaluation & Quality Engine has already run
+        this incident lifecycle -- defensive idempotency guard mirroring
+        _has_explainability_finding(), for the same reason.
+        """
+        findings = self._stm.get("findings", []) or []
+        return any(
+            isinstance(entry, dict) and entry.get("type") == "ai_evaluation"
             for entry in findings
         )
 

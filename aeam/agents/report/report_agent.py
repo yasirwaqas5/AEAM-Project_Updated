@@ -291,6 +291,10 @@ class ReportAgent:
         # additive-post-processing rationale as Phase C3/C4/C5/C7 above.
         detailed_report = f"{detailed_report}\n\n{self._format_explainability(memory)}"
 
+        # Phase D2: append the "Enterprise AI Evaluation" section. Same
+        # additive-post-processing rationale as Phase C3/C4/C5/C7/D1 above.
+        detailed_report = f"{detailed_report}\n\n{self._format_ai_evaluation(memory)}"
+
         return {
             "executive_summary": executive_summary,
             "detailed_report":   detailed_report,
@@ -607,6 +611,78 @@ class ReportAgent:
         lpj = data.get("lower_priority_justification") or {}
         if lpj.get("lower_priority_used"):
             lines.append(f"  Lower-priority evidence used: {lpj.get('reason')}")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_ai_evaluation(memory: ShortTermMemory) -> str:
+        """
+        Build the "Enterprise AI Evaluation" report section (Phase D2) from
+        the AI-evaluation finding the Orchestrator already appended to STM
+        (``type == "ai_evaluation"``, see Orchestrator.finalize_incident() /
+        aeam.intelligence.ai_evaluation.AIEvaluationEngine).
+
+        Never fabricates a score: every component score this section prints
+        is either a real number AIEvaluationEngine derived from
+        already-computed evidence, or explicitly ``None`` ("not computable")
+        when the underlying evidence source was never consulted -- these two
+        states are never conflated.
+        """
+        findings = memory.get("findings") or []
+        found_stage = False
+        data: dict[str, Any] = {}
+        for entry in findings:
+            if isinstance(entry, dict) and entry.get("type") == "ai_evaluation":
+                found_stage = True
+                data = entry.get("data") or {}
+
+        lines = ["Enterprise AI Evaluation:"]
+        if not found_stage:
+            lines.append("  Enterprise AI Evaluation & Quality Engine was not consulted for this investigation.")
+            return "\n".join(lines)
+
+        lines.append(f"  Overall score: {data.get('overall_score')} ({data.get('overall_score_formula', 'formula not available')})")
+        lines.append(f"  Summary: {data.get('quality_summary', 'not available')}")
+
+        components = data.get("component_scores") or {}
+        if components:
+            lines.append(f"  Component scores ({len(components)}):")
+            for key, comp in components.items():
+                score = comp.get("score") if isinstance(comp, dict) else None
+                reason = comp.get("reason") if isinstance(comp, dict) else None
+                lines.append(f"    - {key}: {score if score is not None else 'not computable'} -- {reason}")
+
+        strengths = data.get("strengths") or []
+        if strengths:
+            lines.append(f"  Strengths ({len(strengths)}):")
+            for s in strengths:
+                lines.append(f"    - {s}")
+        else:
+            lines.append("  Strengths: none identified.")
+
+        weaknesses = data.get("weaknesses") or []
+        if weaknesses:
+            lines.append(f"  Weaknesses ({len(weaknesses)}):")
+            for w in weaknesses:
+                lines.append(f"    - {w}")
+        else:
+            lines.append("  Weaknesses: none identified.")
+
+        missing = data.get("missing_evidence") or []
+        if missing:
+            lines.append(f"  Missing evidence ({len(missing)}):")
+            for m in missing:
+                lines.append(f"    - {m.get('source')}: {m.get('reason')}")
+        else:
+            lines.append("  Missing evidence: none.")
+
+        opportunities = data.get("improvement_opportunities") or []
+        if opportunities:
+            lines.append(f"  Improvement opportunities ({len(opportunities)}):")
+            for o in opportunities:
+                lines.append(f"    - {o}")
+        else:
+            lines.append("  Improvement opportunities: none identified.")
 
         return "\n".join(lines)
 

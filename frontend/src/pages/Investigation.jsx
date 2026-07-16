@@ -19,6 +19,7 @@ import CrossDatasetPanel from "../components/CrossDatasetPanel";
 import AdaptiveDetectionPanel from "../components/AdaptiveDetectionPanel";
 import ExecutionPlanPanel from "../components/ExecutionPlanPanel";
 import ExplainabilityPanel from "../components/ExplainabilityPanel";
+import AIEvaluationPanel from "../components/AIEvaluationPanel";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * pages/Investigation.jsx  (Investigation Workspace)
@@ -62,6 +63,12 @@ import ExplainabilityPanel from "../components/ExplainabilityPanel";
  *     (type: "explainability"). A SIXTH, structurally distinct advisory
  *     source that explains the Execution Plan above — it never changes a
  *     recommendation, and performs no retrieval/detection/LLM call.
+ *   - AIEvaluationPanel (components/AIEvaluationPanel.jsx, Phase D2) —
+ *     "AI Evaluation", the Enterprise AI Evaluation & Quality Engine's
+ *     score of this investigation's own thoroughness (type: "ai_evaluation").
+ *     A SEVENTH, structurally distinct advisory source — it never changes
+ *     findings, the Execution Plan, or Explainability; it only evaluates
+ *     them, and performs no retrieval/detection/LLM call.
  *   - ui.jsx's existing incident-shape helpers (getAuditSummary,
  *     getRecommendedActions, getActionOutcome, getValidationStatus,
  *     getMemoryData/getMemoryMatches, getPolicyMatchData/getPolicyMatches,
@@ -431,6 +438,7 @@ export default function Investigation() {
                       <Panel title="Adaptive Detection" icon="activity"><AdaptiveDetectionPanel incident={selected} /></Panel>
                       <Panel title="Execution Plan" icon="zap"><ExecutionPlanPanel incident={selected} /></Panel>
                       <Panel title="Explainability" icon="branch"><ExplainabilityPanel incident={selected} /></Panel>
+                      <Panel title="AI Evaluation" icon="activity"><AIEvaluationPanel incident={selected} /></Panel>
                       <Panel title="Reasoning" icon="code"><ReasoningPanel incident={selected} /></Panel>
                       <Panel title="Actions" icon="zap"><ActionsPanel incident={selected} /></Panel>
                     </div>
