@@ -18,6 +18,7 @@ import PolicyMatchPanel from "../components/PolicyMatchPanel";
 import CrossDatasetPanel from "../components/CrossDatasetPanel";
 import AdaptiveDetectionPanel from "../components/AdaptiveDetectionPanel";
 import ExecutionPlanPanel from "../components/ExecutionPlanPanel";
+import ExplainabilityPanel from "../components/ExplainabilityPanel";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * pages/Investigation.jsx  (Investigation Workspace)
@@ -55,6 +56,12 @@ import ExecutionPlanPanel from "../components/ExecutionPlanPanel";
  *     Review and ActionAgent — advisory only, performs no retrieval/
  *     detection/LLM call of its own, and never alters ActionAgent's
  *     runbook-driven execution.
+ *   - ExplainabilityPanel (components/ExplainabilityPanel.jsx, Phase D1) —
+ *     "Explainability", the Enterprise Explainability Engine's decision
+ *     graph / evidence graph / confidence breakdown / recommendation trace
+ *     (type: "explainability"). A SIXTH, structurally distinct advisory
+ *     source that explains the Execution Plan above — it never changes a
+ *     recommendation, and performs no retrieval/detection/LLM call.
  *   - ui.jsx's existing incident-shape helpers (getAuditSummary,
  *     getRecommendedActions, getActionOutcome, getValidationStatus,
  *     getMemoryData/getMemoryMatches, getPolicyMatchData/getPolicyMatches,
@@ -423,6 +430,7 @@ export default function Investigation() {
                       <Panel title="Cross-Dataset Analysis" icon="branch"><CrossDatasetPanel incident={selected} /></Panel>
                       <Panel title="Adaptive Detection" icon="activity"><AdaptiveDetectionPanel incident={selected} /></Panel>
                       <Panel title="Execution Plan" icon="zap"><ExecutionPlanPanel incident={selected} /></Panel>
+                      <Panel title="Explainability" icon="branch"><ExplainabilityPanel incident={selected} /></Panel>
                       <Panel title="Reasoning" icon="code"><ReasoningPanel incident={selected} /></Panel>
                       <Panel title="Actions" icon="zap"><ActionsPanel incident={selected} /></Panel>
                     </div>

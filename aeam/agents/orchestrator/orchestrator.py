@@ -123,6 +123,7 @@ class Orchestrator:
         cross_dataset_analyzer: Any | None = None,  # Phase C4 — Cross-Dataset Intelligence
         adaptive_detection_engine: Any | None = None,  # Phase C5 — Adaptive Detection Engine
         execution_planning_engine: Any | None = None,  # Phase C7 — Enterprise Action Planning Engine
+        explainability_engine: Any | None = None,  # Phase D1 — Enterprise Explainability Engine
     ) -> None:
         self._bus = event_bus
         self._decision = decision_engine
@@ -139,6 +140,7 @@ class Orchestrator:
         self._cross_dataset = cross_dataset_analyzer  # Phase C4
         self._adaptive_detection = adaptive_detection_engine  # Phase C5
         self._execution_planner = execution_planning_engine  # Phase C7
+        self._explainability_engine = explainability_engine  # Phase D1
 
         # Track the active event for the duration of a handle_event() call.
         self._active_event: Event | None = None
@@ -665,23 +667,28 @@ class Orchestrator:
         3. Synthesize the Enterprise Action Planning Engine's execution plan
            (Phase C7) from every already-computed finding -- appended as its
            own advisory findings entry, strictly before the action plan runs.
-        4. Execute the runbook's action plan via ActionAgent. Only actions
+        4. Explain the Enterprise Action Planning Engine's execution plan
+           (Phase D1) -- decision graph, evidence graph, confidence
+           breakdown, contradictions, missing evidence, and assumptions --
+           appended as its own advisory findings entry. Never changes a
+           recommendation; only explains it.
+        5. Execute the runbook's action plan via ActionAgent. Only actions
            that actually return ``SUCCESS`` are recorded as executed; every
            skipped or failed action is recorded with its reason — this
            method never claims an action ran unless ActionAgent confirmed it.
-        5. Send Slack/Jira notifications built from explicit named fields
+        6. Send Slack/Jira notifications built from explicit named fields
            (see :mod:`~aeam.agents.orchestrator.notifications`) — never a
            raw JSON dump of findings or the LLM response.
-        6. Always attempt an email report last (independent of the runbook;
+        7. Always attempt an email report last (independent of the runbook;
            a missing-credentials failure is expected and already reported
            with a structured reason by EmailActions).
-        7. Append one consolidated ``audit_summary`` findings entry — the
+        8. Append one consolidated ``audit_summary`` findings entry — the
            single source of truth the frontend reads for status, evidence,
            and executed actions.
-        8. Persist via :meth:`~aeam.memory.long_term.LongTermMemory.record_incident`
+        9. Persist via :meth:`~aeam.memory.long_term.LongTermMemory.record_incident`
            (schema unchanged — everything new lives inside the existing
            ``findings`` JSON column).
-        9. Clear STM and reset ``_active_event``.
+        10. Clear STM and reset ``_active_event``.
         """
         if self._sm.get_state() == IncidentState.COMPLETE:
             logger.info("finalize_incident | already COMPLETE; skipping duplicate finalize")
@@ -788,6 +795,51 @@ class Orchestrator:
                 len(execution_plan.get("recommended_actions", [])),
                 execution_plan.get("confidence"), execution_plan.get("evidence_quality"),
                 len(execution_plan.get("evidence_conflicts", [])), incident_id,
+            )
+
+        # --- Enterprise Explainability Engine (Phase D1) ---
+        # Explains WHY the execution plan above reached its recommendations
+        # -- never recomputes them. Runs exactly once (guarded both by
+        # finalize_incident()'s own COMPLETE-state check and this defensive
+        # idempotency guard), strictly AFTER the execution_plan finding above
+        # was appended (it explains THAT finding -- read back from findings,
+        # never a possibly-stale local variable), and BEFORE the runbook
+        # action-execution loop below. Performs NO retrieval, NO detection,
+        # and calls no other engine -- it only reads self._stm.get("findings")
+        # (which now includes the execution_plan entry) and appends its own
+        # advisory findings entry. Never alters recommended_actions/root_cause/
+        # confidence -- purely explanatory.
+        if self._explainability_engine is not None and not self._has_explainability_finding():
+            execution_plan_data: dict[str, Any] = {}
+            for entry in self._stm.get("findings", []) or []:
+                if isinstance(entry, dict) and entry.get("type") == "execution_plan":
+                    execution_plan_data = entry.get("data") or {}
+
+            try:
+                explainability_result = self._explainability_engine.explain(
+                    findings=self._stm.get("findings", []) or [],
+                    execution_plan=execution_plan_data,
+                    raw_confidence=confidence,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("finalize_incident | explainability failed: %s", exc)
+                explainability_result = {
+                    "decision_graph": [], "evidence_graph": {}, "recommendation_trace": [],
+                    "confidence_breakdown": {}, "evidence_contribution": [], "contradictions": [],
+                    "missing_evidence": [], "assumptions": [], "evidence_quality": "insufficient",
+                    "lower_priority_justification": {}, "insufficient_evidence": True,
+                }
+
+            self._stm.append("findings", {
+                "type": "explainability",
+                "data": explainability_result,
+            })
+            logger.info(
+                "finalize_incident | explainability | decision_graph=%d | contradictions=%d | "
+                "missing_evidence=%d | incident_id=%s",
+                len(explainability_result.get("decision_graph", [])),
+                len(explainability_result.get("contradictions", [])),
+                len(explainability_result.get("missing_evidence", [])), incident_id,
             )
 
         # --- Execute the safe runbook action plan. ---
@@ -1129,6 +1181,18 @@ class Orchestrator:
         findings = self._stm.get("findings", []) or []
         return any(
             isinstance(entry, dict) and entry.get("type") == "execution_plan"
+            for entry in findings
+        )
+
+    def _has_explainability_finding(self) -> bool:
+        """
+        True if the Enterprise Explainability Engine has already run this
+        incident lifecycle -- defensive idempotency guard mirroring
+        _has_execution_plan_finding(), for the same reason.
+        """
+        findings = self._stm.get("findings", []) or []
+        return any(
+            isinstance(entry, dict) and entry.get("type") == "explainability"
             for entry in findings
         )
 

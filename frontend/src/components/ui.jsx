@@ -287,6 +287,24 @@ export function getExecutionPlanData(incident) {
   return latest;
 }
 
+/**
+ * The Enterprise Explainability Engine's output (type "explainability",
+ * Phase D1) — explains WHY the execution plan reached its recommendations;
+ * never changes them. Shape: {decision_graph, evidence_graph,
+ * recommendation_trace, confidence_breakdown, evidence_contribution,
+ * contradictions, missing_evidence, assumptions, evidence_quality,
+ * lower_priority_justification, insufficient_evidence}. Returns null if the
+ * engine was never consulted for this investigation.
+ */
+export function getExplainabilityData(incident) {
+  const findings = getFindings(incident);
+  let latest = null;
+  for (const entry of findings) {
+    if (entry?.type === "explainability" && entry.data) latest = entry.data;
+  }
+  return latest;
+}
+
 /** Count of retrieved evidence chunks recorded for the incident. */
 export function getRetrievedCount(incident) {
   const audit = getAuditSummary(incident);

@@ -65,6 +65,7 @@ from aeam.intelligence.policy_registry import PolicyRegistry
 from aeam.intelligence.cross_dataset_analyzer import CrossDatasetAnalyzer
 from aeam.intelligence.adaptive_detection import AdaptiveDetectionEngine
 from aeam.intelligence.execution_planning import ExecutionPlanningEngine
+from aeam.intelligence.explainability import ExplainabilityEngine
 from aeam.agents.rag.hybrid_retrieval import BM25Index, HybridRetrievalPipeline
 from aeam.agents.rag.query_expansion import QueryExpansionAgent
 from aeam.agents.rag.multi_query_retrieval import MultiQueryRetrievalPipeline
@@ -795,6 +796,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # infrastructure dependency that could fail to initialize).
     execution_planning_engine = ExecutionPlanningEngine()
 
+    # --- Enterprise Explainability Engine (Phase D1) ---
+    # Zero external dependencies -- pure synthesis over findings AND the
+    # execution plan ExecutionPlanningEngine already produced. No new
+    # retrieval, no new detector, no LLM call, no second planner. Always
+    # constructed (same "always on if wired" precedent as C7).
+    explainability_engine = ExplainabilityEngine()
+
     # --- Orchestrator ---
     orchestrator = Orchestrator(
         event_bus=container.event_bus,
@@ -812,6 +820,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         cross_dataset_analyzer=cross_dataset_analyzer,
         adaptive_detection_engine=adaptive_detection_engine,
         execution_planning_engine=execution_planning_engine,
+        explainability_engine=explainability_engine,
     )
 
     # Register wildcard handler

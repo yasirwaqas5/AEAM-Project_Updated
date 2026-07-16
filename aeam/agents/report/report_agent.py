@@ -287,6 +287,10 @@ class ReportAgent:
         # additive-post-processing rationale as Phase C3/C4/C5 above.
         detailed_report = f"{detailed_report}\n\n{self._format_execution_plan(memory)}"
 
+        # Phase D1: append the "Enterprise Explainability" section. Same
+        # additive-post-processing rationale as Phase C3/C4/C5/C7 above.
+        detailed_report = f"{detailed_report}\n\n{self._format_explainability(memory)}"
+
         return {
             "executive_summary": executive_summary,
             "detailed_report":   detailed_report,
@@ -512,6 +516,97 @@ class ReportAgent:
             lines.append(f"  Expected impact: {data.get('expected_impact')}")
         if data.get("explanation"):
             lines.append(f"  Explanation: {data.get('explanation')}")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_explainability(memory: ShortTermMemory) -> str:
+        """
+        Build the "Enterprise Explainability" report section (Phase D1) from
+        the explainability finding the Orchestrator already appended to STM
+        (``type == "explainability"``, see Orchestrator.finalize_incident() /
+        aeam.intelligence.explainability.ExplainabilityEngine).
+
+        Never fabricates a confidence delta, an evidence reference, or an
+        assumption: this section only ever restates what
+        ExplainabilityEngine already honestly derived from the
+        execution-plan and findings data -- it never explains a
+        recommendation that does not exist, and never invents traceability
+        for one that has none.
+        """
+        findings = memory.get("findings") or []
+        found_stage = False
+        data: dict[str, Any] = {}
+        for entry in findings:
+            if isinstance(entry, dict) and entry.get("type") == "explainability":
+                found_stage = True
+                data = entry.get("data") or {}
+
+        lines = ["Enterprise Explainability:"]
+        if not found_stage:
+            lines.append("  Enterprise Explainability Engine was not consulted for this investigation.")
+            return "\n".join(lines)
+
+        trace = data.get("recommendation_trace") or []
+        if trace:
+            lines.append(f"  Why these recommendations exist ({len(trace)}):")
+            for t in trace:
+                lines.append(f"    - {t}")
+        else:
+            lines.append("  Why these recommendations exist: no recommendations to explain.")
+
+        cb = data.get("confidence_breakdown") or {}
+        lines.append(
+            f"  Confidence: raw={cb.get('raw_confidence')}, plan={cb.get('plan_confidence')}, "
+            f"adjustment={cb.get('adjustment')} -- {cb.get('adjustment_reason', 'not available')}"
+        )
+        for s in cb.get("per_source") or []:
+            lines.append(
+                f"    - {s.get('source')}: consulted={s.get('consulted')}, signal={s.get('has_signal')}, "
+                f"value={s.get('raw_value')} ({s.get('raw_value_label')})"
+            )
+
+        lines.append("  Evidence attribution:")
+        decision_graph = data.get("decision_graph") or []
+        if not decision_graph:
+            lines.append("    No recommendations to attribute.")
+        else:
+            for node in decision_graph:
+                evidence_ref = node.get("evidence_id") if node.get("evidence_id") is not None else "none"
+                lines.append(
+                    f"    {node.get('order')}. {node.get('recommendation')} -- source={node.get('source')}, "
+                    f"evidence_id={evidence_ref}, report_section={node.get('report_section')}"
+                )
+
+        conflicts = data.get("contradictions") or []
+        if conflicts:
+            lines.append(f"  Contradictions ({len(conflicts)}):")
+            for c in conflicts:
+                lines.append(f"    - {c.get('description')}")
+        else:
+            lines.append("  Contradictions: none detected.")
+
+        missing = data.get("missing_evidence") or []
+        if missing:
+            lines.append(f"  Missing evidence ({len(missing)}):")
+            for m in missing:
+                lines.append(f"    - {m.get('source')}: {m.get('reason')}")
+        else:
+            lines.append("  Missing evidence: none -- every evidence source consulted produced a usable signal.")
+
+        assumptions = data.get("assumptions") or []
+        if assumptions:
+            lines.append(f"  Assumptions ({len(assumptions)}):")
+            for a in assumptions:
+                lines.append(f"    - {a.get('assumption')} (based on: {a.get('based_on')})")
+        else:
+            lines.append("  Assumptions: none identified.")
+
+        lines.append(f"  Evidence quality: {data.get('evidence_quality')}")
+
+        lpj = data.get("lower_priority_justification") or {}
+        if lpj.get("lower_priority_used"):
+            lines.append(f"  Lower-priority evidence used: {lpj.get('reason')}")
 
         return "\n".join(lines)
 
