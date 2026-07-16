@@ -19,6 +19,17 @@ async function fetchMetrics() {
   return parsePrometheusText(await res.text());
 }
 
+// Phase D3 — Enterprise Observability Engine. Reuses the SAME
+// GET /api/v1/observability/ endpoint Analytics.jsx's full breakdown reads;
+// this page only ever shows the single overall_ai_health figure as a quick
+// glance. Never fabricated — the backend itself reports {available: false}
+// when it cannot be computed, and this tile shows that honestly too.
+async function fetchObservability() {
+  const res = await fetch(`/api/v1/observability/`);
+  if (!res.ok) throw new Error(`Status ${res.status}`);
+  return res.json();
+}
+
 function parsePrometheusText(raw) {
   const out = {};
   for (const line of raw.split("\n")) {
@@ -61,6 +72,7 @@ export default function Dashboard() {
   const [loading, setLoading] = useState(true);
   const [lastRefresh, setLastRefresh] = useState(null);
   const [incidents, setIncidents] = useState([]);
+  const [observability, setObservability] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true); setStatusErr(null); setMetricsErr(null);
@@ -71,6 +83,9 @@ export default function Dashboard() {
       const r = await fetch("/api/v1/incidents/");
       if (r.ok) { const d = await r.json(); setIncidents(Array.isArray(d) ? d : []); }
     } catch { /* AI insight simply shows empty */ }
+    try {
+      setObservability(await fetchObservability());
+    } catch { /* AI Health tile simply shows unavailable */ }
     setLoading(false);
     setLastRefresh(new Date().toLocaleTimeString());
   }, []);
@@ -85,6 +100,10 @@ export default function Dashboard() {
   const displayedMetrics = metrics
     ? Object.entries(metrics).filter(([k]) => HIGHLIGHT_KEYS.some((h) => k.startsWith(h))).slice(0, 8)
     : [];
+
+  const aiHealth = observability?.overall_ai_health;
+  const aiHealthPct = aiHealth?.available ? Math.round(aiHealth.score * 100) : null;
+  const aiHealthColor = aiHealthPct == null ? "var(--muted)" : aiHealthPct >= 70 ? "#00ffa3" : aiHealthPct >= 40 ? "#ffb800" : "#ff5f57";
 
   return (
     <>
@@ -116,6 +135,11 @@ export default function Dashboard() {
           </Card>
           <StatTile label="Active Incidents" value={status?.active_incidents} accent="#ffb800" icon="alert" loading={loading} />
           <StatTile label="Agents Active" value={status?.agents_active} accent="#00b4ff" icon="activity" loading={loading} />
+          {/* Phase D3 — Enterprise Observability Engine's overall_ai_health,
+              a heuristic cross-incident score, never a probability. Shows
+              "N/A" (never a fabricated number) when the backend itself
+              reports insufficient completed investigations to compute it. */}
+          <StatTile label="AI Health" value={aiHealthPct != null ? `${aiHealthPct}%` : "N/A"} accent={aiHealthColor} icon="shield" loading={loading} />
         </div>
 
         {/* Latest investigation — structured cards (replaces raw JSON) */}

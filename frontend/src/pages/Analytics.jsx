@@ -21,6 +21,14 @@ import { PageContainer, MetricCard, Panel, EmptyState, LoadingState, ErrorState,
  *     own module docstring still describes)
  *   - GET /api/v1/knowledge/datasets +
  *     GET /api/v1/data-center/activation -> Business Metrics cards
+ *   - GET /api/v1/observability/ (Phase D3, NEW endpoint) -> Enterprise
+ *     Observability panel. Reuses the IDENTICAL incidents-table read
+ *     GET /api/v1/incidents/ already performs (aeam/api/observability.py
+ *     imports incidents.py's own SQL + fetch helper — no second query, no
+ *     new metrics store) and reduces it to cross-incident hit rates/trends
+ *     via aeam/intelligence/observability.py's ObservabilityEngine. Every
+ *     figure is a real computed rate or an honest {available: false,
+ *     reason} — never fabricated.
  *
  * Forecast vs Actual has no persisted per-incident forecast history anywhere
  * in the system (confirmed: no endpoint exposes LongTermMemory time series) —
@@ -56,6 +64,15 @@ async function fetchMetrics() {
   const res = await fetch("/metrics");
   if (!res.ok) throw new Error(`HTTP ${res.status} — /metrics`);
   return parsePrometheusText(await res.text());
+}
+
+// Phase D3 — Enterprise Observability Engine. A NEW, read-only backend
+// endpoint (aeam/api/observability.py) reusing the identical incidents-table
+// read incidents.py already performs — no second data source, no new
+// metrics store. Every field is either a real computed rate/score or an
+// honest {available: false, reason} — never fabricated.
+async function fetchObservability() {
+  return fetchJSON("/api/v1/observability/");
 }
 
 // ─── Lightweight SVG / div charts (no charting library) ─────────────────────
@@ -145,6 +162,15 @@ function statusDistribution(incidents) {
   ];
 }
 
+// Converts an ObservabilityEngine trend's `recent_values` (chronological,
+// oldest-first, each a real 0..1 rate/score already computed by the
+// backend) into TrendBarChart's {label, count} bucket shape — a display
+// reformat only, never a new computation.
+function trendToBuckets(trend) {
+  if (!trend?.available) return [];
+  return (trend.recent_values || []).map((v, i) => ({ label: String(i + 1), count: Math.round(v * 100) }));
+}
+
 function severityDistribution(incidents) {
   const order = ["CRITICAL", "HIGH", "MEDIUM", "LOW"];
   const counts = Object.fromEntries(order.map((k) => [k, 0]));
@@ -153,6 +179,27 @@ function severityDistribution(incidents) {
     if (key in counts) counts[key] += 1;
   }
   return order.map((k) => ({ label: k, count: counts[k], color: SEVERITY[k].color }));
+}
+
+// ─── Phase D3 building blocks ───────────────────────────────────────────────
+
+function ObservabilityRateRow({ label, metric }) {
+  const pct = metric?.available ? Math.round(metric.rate * 100) : null;
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "0.45rem 0", borderBottom: "1px solid var(--border)" }}>
+      <span style={{ fontSize: "0.78rem", color: "var(--muted)" }}>{label}</span>
+      {pct != null ? (
+        <span style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+          <span style={{ fontSize: "0.68rem", color: "var(--muted)", fontFamily: "var(--font-mono)" }}>
+            {metric.hit_count ?? metric.resolved_count}/{metric.consulted_count ?? metric.total_with_status}
+          </span>
+          <Badge label={`${pct}%`} color={pct >= 70 ? "#00ffa3" : pct >= 40 ? "#ffb800" : "#ff5f57"} />
+        </span>
+      ) : (
+        <Badge label="not available" color="var(--muted)" />
+      )}
+    </div>
+  );
 }
 
 // ─── Page ───────────────────────────────────────────────────────────────────
@@ -164,6 +211,7 @@ export default function Analytics() {
   const [agentLogs, setAgentLogs] = useState([]);
   const [datasets, setDatasets] = useState([]);
   const [activation, setActivation] = useState({ activated_dataset_ids: [] });
+  const [observability, setObservability] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -176,14 +224,16 @@ export default function Analytics() {
       fetchJSON("/api/v1/logs/agents"),
       fetchJSON("/api/v1/knowledge/datasets"),
       fetchJSON("/api/v1/data-center/activation"),
+      fetchObservability(),
     ]);
-    const [inc, stat, met, logs, ds, act] = results;
+    const [inc, stat, met, logs, ds, act, obs] = results;
     if (inc.status === "fulfilled") setIncidents(Array.isArray(inc.value) ? inc.value : []);
     if (stat.status === "fulfilled") setStatus(stat.value);
     if (met.status === "fulfilled") setMetrics(met.value);
     if (logs.status === "fulfilled") setAgentLogs(Array.isArray(logs.value) ? logs.value : []);
     if (ds.status === "fulfilled") setDatasets(Array.isArray(ds.value) ? ds.value : []);
     if (act.status === "fulfilled") setActivation(act.value);
+    if (obs.status === "fulfilled") setObservability(obs.value);
     // Only a total failure of the primary (incidents) feed is a page-level error —
     // the other panels each show their own honest per-section empty/error state.
     if (inc.status === "rejected") setError(inc.reason?.message || "Failed to load incidents");
@@ -345,6 +395,86 @@ export default function Analytics() {
             <MetricCard label="Activated for Monitoring" value={activatedCount} icon="activity" accent="#00ffa3" />
             <MetricCard label="Inactive Datasets" value={Math.max(0, datasets.length - activatedCount)} icon="database" accent="var(--muted)" />
           </div>
+        </Panel>
+      </div>
+
+      {/* Phase D3 — Enterprise Observability Engine */}
+      <div style={{ marginBottom: "1.4rem" }}>
+        <Panel title="Enterprise Observability" icon="shield"
+          right={<span style={{ fontSize: "0.62rem", color: "var(--muted)", fontFamily: "var(--font-mono)" }}>GET /api/v1/observability/</span>}>
+          {!observability ? (
+            <EmptyState icon="shield" title="Observability data unavailable" tone="muted" />
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: "1.1rem" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "0.75rem" }}>
+                <div>
+                  <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>
+                    Overall AI Health ({observability.total_investigations} investigation{observability.total_investigations === 1 ? "" : "s"})
+                  </span>
+                  <div style={{ fontSize: "1.6rem", fontWeight: 800, fontFamily: "var(--font-mono)", color: observability.overall_ai_health?.available ? "#00ffa3" : "var(--muted)" }}>
+                    {observability.overall_ai_health?.available ? `${Math.round(observability.overall_ai_health.score * 100)}%` : "N/A"}
+                  </div>
+                </div>
+                <span style={{ fontSize: "0.68rem", color: "var(--muted)", maxWidth: 420 }}>{observability.overall_ai_health_formula}</span>
+              </div>
+
+              <div className="aeam-grid-2" style={{ gap: "1.1rem" }}>
+                <div>
+                  <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>Evidence Source Rates</span>
+                  <div style={{ marginTop: "0.4rem" }}>
+                    <ObservabilityRateRow label="Memory Hit Rate" metric={observability.memory_hit_rate} />
+                    <ObservabilityRateRow label="Policy Hit Rate" metric={observability.policy_hit_rate} />
+                    <ObservabilityRateRow label="Retrieval Success Rate" metric={observability.retrieval_success_rate} />
+                    <ObservabilityRateRow label="Cross-Dataset Usage" metric={observability.cross_dataset_usage_rate} />
+                    <ObservabilityRateRow label="Adaptive Detection Usage" metric={observability.adaptive_detection_usage_rate} />
+                    <ObservabilityRateRow label="Investigation Success Rate" metric={observability.investigation_success_rate} />
+                  </div>
+                </div>
+
+                <div style={{ display: "flex", flexDirection: "column", gap: "0.9rem" }}>
+                  <div>
+                    <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>
+                      Execution Plan Confidence Trend
+                    </span>
+                    {observability.execution_plan_confidence_trend?.available ? (
+                      <>
+                        <div style={{ marginTop: "0.3rem" }}><TrendBarChart buckets={trendToBuckets(observability.execution_plan_confidence_trend)} /></div>
+                        <span style={{ fontSize: "0.68rem", color: "var(--muted)" }}>
+                          avg {Math.round(observability.execution_plan_confidence_trend.average * 100)}% · {observability.execution_plan_confidence_trend.direction}
+                        </span>
+                      </>
+                    ) : <EmptyState icon="target" title="Not available" tone="muted" description={observability.execution_plan_confidence_trend?.reason} />}
+                  </div>
+                  <div>
+                    <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>
+                      AI Evaluation Trend
+                    </span>
+                    {observability.ai_evaluation_trend?.available ? (
+                      <>
+                        <div style={{ marginTop: "0.3rem" }}><TrendBarChart buckets={trendToBuckets(observability.ai_evaluation_trend)} /></div>
+                        <span style={{ fontSize: "0.68rem", color: "var(--muted)" }}>
+                          avg {Math.round(observability.ai_evaluation_trend.average * 100)}% · {observability.ai_evaluation_trend.direction}
+                        </span>
+                      </>
+                    ) : <EmptyState icon="target" title="Not available" tone="muted" description={observability.ai_evaluation_trend?.reason} />}
+                  </div>
+                </div>
+              </div>
+
+              <div style={{
+                display: "flex", alignItems: "flex-start", gap: "0.5rem",
+                padding: "0.55rem 0.8rem", border: "1px dashed var(--border)", borderRadius: 8,
+                color: "var(--muted)", fontSize: "0.7rem",
+              }}>
+                <Icon name="alert" size={12} color="var(--muted)" style={{ marginTop: "0.1rem", flexShrink: 0 }} />
+                <span>
+                  {observability.investigation_duration?.available
+                    ? `Investigation duration: ${observability.investigation_duration.average}s average.`
+                    : `Investigation duration: ${observability.investigation_duration?.reason || "not available"}`}
+                </span>
+              </div>
+            </div>
+          )}
         </Panel>
       </div>
 

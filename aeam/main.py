@@ -122,6 +122,7 @@ from aeam.api.retrieval_debug import router as retrieval_debug_router
 from aeam.api.ingest import router as ingest_router
 from aeam.api.knowledge import router as knowledge_router
 from aeam.api.data_center import router as data_center_router
+from aeam.api.observability import router as observability_router
 
 # ---------------------------------------------------------------------------
 # Logging bootstrap
@@ -968,6 +969,7 @@ def create_app() -> FastAPI:
     application.include_router(ingest_router)
     application.include_router(knowledge_router)
     application.include_router(data_center_router)
+    application.include_router(observability_router)
 
     _register_routes(application)
     return application
