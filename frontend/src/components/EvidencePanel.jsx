@@ -144,6 +144,24 @@ function EvidenceCard({ item }) {
           <span style={{ color: item.cited ? "#00ffa3" : "var(--muted)" }}>{item.reasonSelected}</span>
         </div>
 
+        {item.rankingReasons && item.rankingReasons.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
+              <Icon name="branch" size={11} color="var(--muted)" />
+              <span style={{ fontSize: "0.66rem", textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--muted)" }}>
+                Business Relevance
+              </span>
+              {item.businessRelevanceScore != null && (
+                <Badge label={`score ${fmtPct(item.businessRelevanceScore)}`} color={scoreColor(item.businessRelevanceScore <= 1 ? item.businessRelevanceScore * 100 : item.businessRelevanceScore)} />
+              )}
+              {item.metadataFilterRelaxed && <Badge label="filter relaxed" color="var(--muted)" />}
+            </div>
+            <ul style={{ margin: 0, paddingLeft: "1.1rem", fontSize: "0.7rem", color: "var(--muted)" }}>
+              {item.rankingReasons.map((r, i) => <li key={i}>{r}</li>)}
+            </ul>
+          </div>
+        )}
+
         <Collapsible summary="Expand full chunk">
           <div style={{ display: "flex", flexDirection: "column", gap: "0.55rem", paddingTop: "0.4rem" }}>
             <div style={{ fontSize: "0.78rem", color: "var(--text)", lineHeight: 1.6 }}>{item.preview}</div>

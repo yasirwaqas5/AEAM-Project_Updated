@@ -76,6 +76,16 @@ class TriggerRequest(BaseModel):
         ...,
         description="Severity level: CRITICAL | HIGH | MEDIUM | LOW.",
     )
+    metadata: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Optional additional event metadata (e.g. {'service': 'checkout'}). "
+            "Merged into the constructed Event's metadata alongside the fixed "
+            "'source': 'api_trigger' marker. Enables Phase C6 entity extraction "
+            "/ metadata-aware retrieval filtering for manually-triggered events. "
+            "Omitted or null preserves the exact prior behaviour."
+        ),
+    )
 
     @field_validator("severity")
     @classmethod
@@ -162,7 +172,7 @@ def trigger_event(body: TriggerRequest, request: Request) -> JSONResponse:
         detection_methods=["manual_trigger"],
         severity=body.severity,
         timestamp=datetime.now(tz=timezone.utc),
-        metadata={"source": "api_trigger"},
+        metadata={"source": "api_trigger", **(body.metadata or {})},
     )
 
     try:

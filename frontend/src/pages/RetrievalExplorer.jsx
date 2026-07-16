@@ -4,6 +4,7 @@ import {
   PageHeader, Badge, SeverityBadge, Field, Icon, Button, Collapsible,
   fmtRelative, fmtMs, fmtPct, severityOf,
   getQueryAttempts, getTopEvidence, getRetrievedCount,
+  getExtractedEntities, getMetadataFilterApplied,
 } from "../components/ui";
 import {
   PageContainer, SplitLayout, MetricCard, Panel, EmptyState, LoadingState, ErrorState,
@@ -52,8 +53,11 @@ async function fetchJSON(url, options) {
 }
 
 const fetchIncidents = () => fetchJSON("/api/v1/incidents/");
-const fetchTrace = (query, topK) =>
-  fetchJSON(`/api/v1/debug/retrieval/?query=${encodeURIComponent(query)}&top_k=${topK}`);
+const fetchTrace = (query, topK, metadataJson) => {
+  let url = `/api/v1/debug/retrieval/?query=${encodeURIComponent(query)}&top_k=${topK}`;
+  if (metadataJson && metadataJson.trim()) url += `&metadata=${encodeURIComponent(metadataJson.trim())}`;
+  return fetchJSON(url);
+};
 
 // ─── Small building blocks ─────────────────────────────────────────────────
 
@@ -68,16 +72,26 @@ function TraceChunkRow({ chunk, scoreLabel, scoreValue }) {
   const shortId = chunk.chunk_id ? (chunk.chunk_id.length > 16 ? `${chunk.chunk_id.slice(0, 14)}…` : chunk.chunk_id) : "unknown";
   return (
     <div style={{
-      display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.75rem",
+      display: "flex", flexDirection: "column", gap: "0.3rem",
       padding: "0.5rem 0.7rem", border: "1px solid var(--border)", borderRadius: 8,
       background: "rgba(255,255,255,0.015)",
     }}>
-      <div style={{ display: "flex", alignItems: "center", gap: "0.55rem", minWidth: 0 }}>
-        <Icon name="database" size={12} color="var(--muted)" />
-        <span title={chunk.chunk_id} style={{ fontFamily: "var(--font-mono)", fontSize: "0.7rem", color: "var(--text)" }}>{shortId}</span>
-        {chunk.source && <span style={{ fontSize: "0.68rem", color: "var(--muted)" }}>· {chunk.source}</span>}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.75rem" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.55rem", minWidth: 0 }}>
+          <Icon name="database" size={12} color="var(--muted)" />
+          <span title={chunk.chunk_id} style={{ fontFamily: "var(--font-mono)", fontSize: "0.7rem", color: "var(--text)" }}>{shortId}</span>
+          {chunk.source && <span style={{ fontSize: "0.68rem", color: "var(--muted)" }}>· {chunk.source}</span>}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
+          {chunk.metadata_filter_relaxed && <Badge label="filter relaxed" color="var(--muted)" />}
+          {scoreValue != null && <Badge label={`${scoreLabel} ${typeof scoreValue === "number" ? scoreValue.toFixed(3) : scoreValue}`} color="var(--info, #00b4ff)" />}
+        </div>
       </div>
-      {scoreValue != null && <Badge label={`${scoreLabel} ${typeof scoreValue === "number" ? scoreValue.toFixed(3) : scoreValue}`} color="var(--info, #00b4ff)" />}
+      {Array.isArray(chunk.ranking_reasons) && chunk.ranking_reasons.length > 0 && (
+        <div style={{ fontSize: "0.66rem", color: "var(--muted)", fontStyle: "italic" }}>
+          {chunk.ranking_reasons.join(" · ")}
+        </div>
+      )}
     </div>
   );
 }
@@ -132,6 +146,8 @@ export default function RetrievalExplorer() {
   const [traceLoading, setTraceLoading] = useState(false);
   const [traceError, setTraceError] = useState(null);
   const [topK, setTopK] = useState(5);
+  const [metadataInput, setMetadataInput] = useState("");
+  const [metadataError, setMetadataError] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true); setError(null);
@@ -155,6 +171,8 @@ export default function RetrievalExplorer() {
   const originalQuery = queryAttempts[0]?.query || null;
   const retrievedCount = incident ? getRetrievedCount(incident) : 0;
   const topEvidence = useMemo(() => (incident ? getTopEvidence(incident) : []), [incident]);
+  const extractedEntities = useMemo(() => (incident ? getExtractedEntities(incident) : []), [incident]);
+  const metadataFilterApplied = incident ? getMetadataFilterApplied(incident) : false;
   const sources = useMemo(() => [...new Set(topEvidence.map((e) => e.source).filter(Boolean))], [topEvidence]);
   const avgSimilarity = useMemo(() => {
     const sims = topEvidence.map((e) => e.similarity).filter((s) => typeof s === "number");
@@ -164,16 +182,29 @@ export default function RetrievalExplorer() {
 
   const runTrace = useCallback(async () => {
     if (!originalQuery) return;
+    setMetadataError(null);
+    if (metadataInput.trim()) {
+      try {
+        const parsed = JSON.parse(metadataInput);
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          setMetadataError("Metadata must be a JSON object, e.g. {\"service\": \"checkout\"}.");
+          return;
+        }
+      } catch {
+        setMetadataError("Metadata is not valid JSON.");
+        return;
+      }
+    }
     setTraceLoading(true); setTraceError(null); setTrace(null);
     try {
-      const data = await fetchTrace(originalQuery, topK);
+      const data = await fetchTrace(originalQuery, topK, metadataInput);
       setTrace(data);
     } catch (e) {
       setTraceError(e.message);
     } finally {
       setTraceLoading(false);
     }
-  }, [originalQuery, topK]);
+  }, [originalQuery, topK, metadataInput]);
 
   const stageSurvivalCounts = useMemo(() => {
     if (!trace?.stage_survival) return null;
@@ -240,6 +271,25 @@ export default function RetrievalExplorer() {
                 <MetricCard label="Sources" icon="layers" value={sources.length} />
                 <MetricCard label="Average Similarity" icon="target" value={avgSimilarity != null ? fmtPct(avgSimilarity) : "—"} />
               </div>
+              <div>
+                <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", marginBottom: "0.4rem" }}>
+                  <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>
+                    Extracted Entities
+                  </span>
+                  <Badge label={metadataFilterApplied ? "metadata filter applied" : "no metadata filter"} color={metadataFilterApplied ? "#00ffa3" : "var(--muted)"} />
+                </div>
+                {extractedEntities.length === 0 ? (
+                  <span style={{ fontSize: "0.74rem", color: "var(--muted)", fontStyle: "italic" }}>
+                    No entities recognised in this incident's metadata.
+                  </span>
+                ) : (
+                  <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap" }}>
+                    {extractedEntities.map((e, i) => (
+                      <Badge key={i} label={`${e.label}=${e.value}`} color="#00b4ff" />
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
           </Panel>
 
@@ -281,18 +331,35 @@ export default function RetrievalExplorer() {
               {!originalQuery ? (
                 <Unavailable>No original query recorded for this incident — nothing to trace.</Unavailable>
               ) : (
-                <div style={{ display: "flex", alignItems: "center", gap: "0.7rem", flexWrap: "wrap" }}>
-                  <Button icon="branch" variant="primary" onClick={runTrace} disabled={traceLoading}>
-                    {traceLoading ? "Tracing…" : "Trace Retrieval Pipeline"}
-                  </Button>
-                  <Field label="Top K" value={
-                    <input type="number" min={1} max={50} value={topK}
-                      onChange={(e) => setTopK(Math.max(1, Math.min(50, Number(e.target.value) || 1)))}
-                      style={{
-                        width: 60, background: "var(--surface)", border: "1px solid var(--border)",
-                        borderRadius: 6, color: "var(--text)", padding: "0.2rem 0.4rem", fontFamily: "var(--font-mono)",
-                      }} />
-                  } />
+                <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.7rem", flexWrap: "wrap" }}>
+                    <Button icon="branch" variant="primary" onClick={runTrace} disabled={traceLoading}>
+                      {traceLoading ? "Tracing…" : "Trace Retrieval Pipeline"}
+                    </Button>
+                    <Field label="Top K" value={
+                      <input type="number" min={1} max={50} value={topK}
+                        onChange={(e) => setTopK(Math.max(1, Math.min(50, Number(e.target.value) || 1)))}
+                        style={{
+                          width: 60, background: "var(--surface)", border: "1px solid var(--border)",
+                          borderRadius: 6, color: "var(--text)", padding: "0.2rem 0.4rem", fontFamily: "var(--font-mono)",
+                        }} />
+                    } />
+                  </div>
+                  <div>
+                    <Field label="Incident metadata (JSON, optional — Phase C6 entity extraction / metadata-aware filtering)" value={
+                      <input type="text" value={metadataInput} placeholder='e.g. {"service": "checkout"}'
+                        onChange={(e) => setMetadataInput(e.target.value)}
+                        style={{
+                          width: "100%", maxWidth: 420, background: "var(--surface)", border: "1px solid var(--border)",
+                          borderRadius: 6, color: "var(--text)", padding: "0.3rem 0.5rem", fontFamily: "var(--font-mono)", fontSize: "0.76rem",
+                        }} />
+                    } />
+                    <div style={{ fontSize: "0.68rem", color: "var(--muted)", marginTop: "0.3rem", fontStyle: "italic" }}>
+                      AEAM does not persist a historical incident's original event.metadata, so it cannot be auto-filled here —
+                      supply it manually to exercise entity extraction / metadata-aware filtering for this trace.
+                    </div>
+                    {metadataError && <div style={{ fontSize: "0.72rem", color: "#ff8f88", marginTop: "0.3rem" }}>{metadataError}</div>}
+                  </div>
                 </div>
               )}
 
@@ -306,6 +373,26 @@ export default function RetrievalExplorer() {
                       timingMs={trace.timings_ms?.query_expansion_ms}
                       note={trace.expanded_queries?.length > 1 ? "Expanded into multiple variants (LLM query expansion)." : "No query expansion — single variant."}
                       chunks={null} />
+                    <StageCard title="Entity Extraction" icon="target" count={trace.extracted_entities?.length ?? 0}
+                      timingMs={trace.timings_ms?.entity_extraction_ms}
+                      note={
+                        (trace.extracted_entities?.length ?? 0) > 0
+                          ? `Entities: ${trace.extracted_entities.map((e) => `${e.label}=${e.value}`).join(", ")}`
+                          : "No incident metadata supplied for this trace, or no recognised entities found."
+                      }
+                      chunks={null} />
+                    <StageCard title="Metadata-Aware Filtering" icon="layers" count={trace.metadata_filtered_results?.length ?? 0}
+                      timingMs={trace.timings_ms?.metadata_filter_ms}
+                      note={
+                        !trace.metadata_filter_applied
+                          ? "No filter applied — no entities to filter by."
+                          : (trace.metadata_filtered_results?.length ?? 0) > 0
+                            ? "Filter applied and matched real evidence via dense search alone — shown below is the dense-only filtered view (informational)."
+                            : trace.metadata_filter_relaxed
+                              ? "Filter matched nothing anywhere — automatically relaxed to an unfiltered search (never reported as \"no evidence\" for a tagging mismatch)."
+                              : "Filter matched nothing via dense search alone, but BM25's lexical channel is never filtered (see aeam/agents/rag/hybrid_retrieval.py) and still contributed real results downstream — evidence was not lost, so fusion did not need to relax."
+                      }
+                      chunks={trace.metadata_filtered_results} scoreKey="dense_similarity" scoreLabel="sim" />
                     <StageCard title="Embedding + Dense Search" icon="target" count={trace.dense_results?.length ?? 0}
                       timingMs={trace.timings_ms?.embedding_search_ms}
                       note="Qdrant vector similarity search (embedding happens as part of this stage — the trace does not expose a separate embedding-only step)."
@@ -316,14 +403,23 @@ export default function RetrievalExplorer() {
                       chunks={trace.bm25_results} scoreKey="bm25_score" scoreLabel="bm25" />
                     <StageCard title="Hybrid Merge (RRF)" icon="branch" count={trace.rrf_fused?.length ?? 0}
                       timingMs={trace.timings_ms?.rrf_fusion_ms}
+                      note={trace.metadata_filter_relaxed ? "Metadata filter was relaxed before this fusion pass ran (see Metadata-Aware Filtering above)." : undefined}
                       chunks={trace.rrf_fused} scoreKey="rrf_score" scoreLabel="rrf" />
                     <StageCard title="Reranking" icon="code" count={trace.reranked?.length ?? 0}
                       timingMs={trace.timings_ms?.reranking_ms}
                       note={trace.reranked === trace.rrf_fused ? "Reranker disabled — pass-through from hybrid merge." : undefined}
                       chunks={trace.reranked} scoreKey="rerank_score" scoreLabel="rerank" />
+                    <StageCard title="Business Relevance Ranking" icon="activity" count={trace.business_ranked?.length ?? 0}
+                      timingMs={trace.timings_ms?.business_relevance_ms}
+                      note={
+                        (trace.business_ranked?.[0]?.business_relevance_score == null)
+                          ? "Business relevance scorer disabled — pass-through from evidence diversity."
+                          : "Re-scored/re-ordered by entity overlap, doc_type authority, and recency — never overriding semantic relevance, only adjusting it."
+                      }
+                      chunks={trace.business_ranked} scoreKey="business_relevance_score" scoreLabel="relevance" />
                     <StageCard title="Selected Evidence" icon="check" count={trace.final_chunks?.length ?? 0}
                       timingMs={trace.timings_ms?.diversity_ms}
-                      note="Exactly what RAGAgent receives, after evidence-diversity filtering."
+                      note="Exactly what RAGAgent receives, after evidence-diversity filtering and business-relevance ranking."
                       chunks={trace.final_chunks} scoreKey="similarity" scoreLabel="sim" />
                   </div>
 

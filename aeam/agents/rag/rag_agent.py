@@ -300,6 +300,7 @@ class RAGAgent:
         validator: RAGResponseValidator,
         llm_service: Any,
         top_k: int = 5,
+        entity_extractor: Any | None = None,
     ) -> None:
         """
         Initialise the RAG Agent with injected dependencies.
@@ -310,6 +311,13 @@ class RAGAgent:
             llm_service:        LLM service satisfying the LLMService protocol.
                                 Must expose ``query(prompt: str, *, temperature: float, max_tokens: int) -> str``.
             top_k:              Max retrieved chunks. Must be >= 1.
+            entity_extractor:   Optional :class:`~aeam.agents.rag.advanced_retrieval.IncidentEntityExtractor`
+                                (Phase C6). When provided, structured entities
+                                are extracted from ``event.metadata`` and used
+                                to build a ``filter_criteria`` dict passed to
+                                the retrieval pipeline (metadata-aware
+                                filtering). When ``None`` (default), retrieval
+                                behaves exactly as before this phase.
 
         Raises:
             ValueError: If any required dependency is None or top_k < 1.
@@ -327,6 +335,7 @@ class RAGAgent:
         self._validator = validator
         self._llm = llm_service
         self._top_k = top_k
+        self._entity_extractor = entity_extractor
 
     # ------------------------------------------------------------------
     # Public API
@@ -417,9 +426,19 @@ class RAGAgent:
             "RAGAgent | attempt=%d | strategy=%s | query=%r", attempt, strategy, query,
         )
 
+        # Step 1b (Phase C6): extract structured entities from event.metadata
+        # and build a metadata-aware filter_criteria dict. No-op (empty
+        # entities, unfiltered search) when no extractor is wired or the
+        # event carries no recognised metadata keys.
+        entities: list[dict[str, str]] = []
+        filter_criteria: dict[str, str] | None = None
+        if self._entity_extractor is not None:
+            entities = self._entity_extractor.extract(event.metadata or {})
+            filter_criteria = self._entity_extractor.to_filter_criteria(entities) or None
+
         # Step 2: retrieve chunks.
         try:
-            chunks = self._retrieval.search(query=query, top_k=self._top_k)
+            chunks = self._retrieval.search(query=query, filter_criteria=filter_criteria, top_k=self._top_k)
         except Exception as exc:  # noqa: BLE001
             logger.error("RAGAgent | retrieval failed: %s", exc)
             return self._error_result(
@@ -439,6 +458,7 @@ class RAGAgent:
             logger.info("RAGAgent | no relevant chunks found; skipping LLM.")
             return self._no_context_result(
                 query=query, attempt=attempt, strategy=strategy, threshold=threshold,
+                entities=entities,
             )
 
         # Step 3: assemble prompt.
@@ -494,11 +514,18 @@ class RAGAgent:
         cited_chunk_ids = {c.get("chunk_id") for c in possible_causes if c.get("cause")}
         retrieved_chunks_meta: list[dict[str, Any]] = [
             {
-                "chunk_id":     c.get("chunk_id"),
-                "similarity":   c.get("similarity"),
-                "source":       c.get("metadata", {}).get("source", "unknown"),
-                "text_preview": (c.get("text", "") or "")[:160],
-                "cited":        c.get("chunk_id") in cited_chunk_ids,
+                "chunk_id":                c.get("chunk_id"),
+                "similarity":               c.get("similarity"),
+                "source":                   c.get("metadata", {}).get("source", "unknown"),
+                "text_preview":             (c.get("text", "") or "")[:160],
+                "cited":                    c.get("chunk_id") in cited_chunk_ids,
+                # Phase C6 — Advanced Retrieval Engine. Present (defaulting to
+                # None/False) even when entity_extractor is not wired, so the
+                # findings schema is always the same shape.
+                "business_relevance_score": c.get("business_relevance_score"),
+                "ranking_reasons":          c.get("ranking_reasons"),
+                "retrieval_confidence":     c.get("retrieval_confidence"),
+                "metadata_filter_relaxed":  bool(c.get("metadata_filter_relaxed", False)),
             }
             for c in chunks
         ]
@@ -515,6 +542,8 @@ class RAGAgent:
             "query_strategy":        strategy,
             "threshold":             threshold,
             "retrieved_chunks":      retrieved_chunks_meta,
+            "extracted_entities":    entities,
+            "metadata_filter_applied": bool(filter_criteria),
         }
 
         hypotheses: list[str] = [
@@ -777,6 +806,7 @@ class RAGAgent:
         attempt: int | None = None,
         strategy: str | None = None,
         threshold: float | None = None,
+        entities: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """
         Build a result dict for the case where no chunks were retrieved.
@@ -786,6 +816,10 @@ class RAGAgent:
             attempt:   Which query attempt (1-3) this was.
             strategy:  Query strategy name ("original"/"rewritten"/"broadened").
             threshold: Similarity threshold in effect for this pass.
+            entities:  Entities extracted from event.metadata this pass
+                       (Phase C6), if an entity extractor is wired. Recorded
+                       even on a no-evidence result so operators can see what
+                       was searched for, honestly, never fabricated.
 
         Returns:
             Full return dict with requires_human_review=True and zero confidence.
@@ -802,6 +836,7 @@ class RAGAgent:
             "query_attempt":         attempt,
             "query_strategy":        strategy,
             "threshold":             threshold,
+            "extracted_entities":    entities or [],
         }
         return {
             "findings":       findings,

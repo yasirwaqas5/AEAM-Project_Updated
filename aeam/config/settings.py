@@ -220,6 +220,18 @@ class Settings(BaseSettings):
         ),
     )
 
+    RAG_ADVANCED_RETRIEVAL_ENABLED: bool = Field(
+        default=True,
+        description=(
+            "Phase C6: when True, wraps the fully-composed existing retrieval "
+            "pipeline with entity extraction (from event.metadata), "
+            "metadata-aware filtering (with automatic relaxation if the "
+            "filter matches nothing), and business-relevance ranking with "
+            "explainable ranking_reasons/retrieval_confidence. When False, "
+            "retrieval behaves exactly as it did before this phase."
+        ),
+    )
+
     LLM_PROVIDER: str = Field(
         default="gemini",
         description="Which LLM backend to use: 'gemini', 'openai', etc.",

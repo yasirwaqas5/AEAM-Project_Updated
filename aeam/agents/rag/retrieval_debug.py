@@ -52,6 +52,8 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "chunk_id", "source", "text_preview", "similarity",
     "dense_similarity", "bm25_score", "hybrid_rrf_score", "rrf_score",
     "rerank_score", "originating_query", "query_index", "query_text", "final_rank",
+    "business_relevance_score", "ranking_reasons", "retrieval_confidence",
+    "metadata_filter_relaxed",
 )
 
 
@@ -109,6 +111,10 @@ def summarize_chunk(item: dict[str, Any]) -> dict[str, Any]:
         "query_index": item.get("query_index"),
         "query_text": item.get("query_text"),
         "final_rank": item.get("final_rank"),
+        "business_relevance_score": item.get("business_relevance_score"),
+        "ranking_reasons": item.get("ranking_reasons"),
+        "retrieval_confidence": item.get("retrieval_confidence"),
+        "metadata_filter_relaxed": item.get("metadata_filter_relaxed"),
     }
 
 
@@ -136,6 +142,17 @@ class RetrievalDebugTracer:
         raw_pool_size:   Candidate count for the informational raw
                         dense-only / BM25-only comparison sections (does not
                         affect ``final_chunks``).
+        entity_extractor: The live
+                        :class:`~aeam.agents.rag.advanced_retrieval.IncidentEntityExtractor`
+                        (Phase C6), or ``None`` if advanced retrieval is
+                        disabled. Only produces entities/filter_criteria when
+                        ``trace()`` is called WITH a ``metadata`` dict — a
+                        free-text trace with no metadata behaves exactly as
+                        before this phase.
+        relevance_scorer: The live
+                        :class:`~aeam.agents.rag.advanced_retrieval.BusinessRelevanceScorer`
+                        (Phase C6), or ``None`` if advanced retrieval is
+                        disabled.
 
     Raises:
         ValueError: If ``dense`` is ``None``.
@@ -151,6 +168,8 @@ class RetrievalDebugTracer:
         diversity_filter: Any | None,
         rerank_top_n: int,
         raw_pool_size: int = DEFAULT_RAW_CANDIDATE_POOL,
+        entity_extractor: Any | None = None,
+        relevance_scorer: Any | None = None,
     ) -> None:
         if dense is None:
             raise ValueError("dense must not be None.")
@@ -164,28 +183,67 @@ class RetrievalDebugTracer:
         self._diversity = diversity_filter
         self._rerank_top_n = int(rerank_top_n)
         self._raw_pool_size = max(1, int(raw_pool_size))
+        self._entity_extractor = entity_extractor
+        self._relevance_scorer = relevance_scorer
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def trace(self, query: str, top_k: int = 5) -> dict[str, Any]:
+    def trace(
+        self,
+        query: str,
+        top_k: int = 5,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """
         Trace retrieval for ``query`` and return a full stage-by-stage report.
+
+        Args:
+            query:    Free-text query to trace.
+            top_k:    Final number of chunks to return (>= 1).
+            metadata: Optional incident ``event.metadata`` dict (Phase C6).
+                      When provided AND an entity extractor is wired, this
+                      enables the ``extracted_entities`` /
+                      ``metadata_filtered_results`` stages and threads the
+                      derived ``filter_criteria`` into fusion, exactly
+                      mirroring what ``RAGAgent`` does for a real incident.
+                      AEAM does not persist ``event.metadata`` on the
+                      incident record, so a live re-trace of a HISTORICAL
+                      incident cannot reconstruct it automatically — this
+                      param exists for a developer to supply it manually (or
+                      for a caller that does have it in hand), following the
+                      same "explicitly unavailable, never reconstructed"
+                      honesty already used for Prompt Context / Final Context
+                      in the Retrieval Explorer. When omitted, every new
+                      Phase C6 stage below behaves as a no-op passthrough —
+                      identical to this method's behaviour before this phase.
 
         Returns:
             Dict with keys:
 
             - ``query``            — the input query (stripped).
             - ``expanded_queries`` — ``[{"query_index", "query_text"}, ...]``.
+            - ``extracted_entities`` — Phase C6 entities extracted from
+              ``metadata`` (``[]`` if no ``metadata``/extractor).
+            - ``metadata_filter_applied`` — whether a non-empty
+              ``filter_criteria`` was derived and applied to fusion.
             - ``dense_results``    — raw dense-only hits (informational).
             - ``bm25_results``     — raw BM25-only hits (informational).
+            - ``metadata_filtered_results`` — Phase C6: raw dense-only hits
+              WITH the metadata filter applied (informational; ``[]`` if no
+              filter was derived).
             - ``rrf_fused``        — the fused candidate pool feeding the
-              reranker (via the REAL hybrid/multi-query pipeline).
+              reranker (via the REAL hybrid/multi-query pipeline), with the
+              metadata filter applied if one was derived.
             - ``reranked``         — the reranked candidate pool feeding
               diversity filtering (via the REAL cross-encoder).
-            - ``final_chunks``     — exactly what ``RAGAgent`` receives
-              (via the REAL diversity filter), each with ``final_rank`` set.
+            - ``business_ranked``  — Phase C6: the diversity-filtered pool
+              re-scored/re-ordered by the REAL ``BusinessRelevanceScorer``
+              (identical to ``final_chunks`` if a scorer is wired; a plain
+              passthrough copy otherwise).
+            - ``final_chunks``     — exactly what ``RAGAgent`` receives,
+              each with ``final_rank`` set.
             - ``timings_ms``       — per-stage wall-clock milliseconds.
             - ``stage_survival``   — per-``chunk_id`` explanation of which
               stages it appeared in and why it was dropped, if it was.
@@ -212,12 +270,36 @@ class RetrievalDebugTracer:
         expanded = cached_expander.expand(query) if cached_expander else [query]
         timings["query_expansion_ms"] = _elapsed_ms(t0)
 
+        # --- Stage 1b (Phase C6): entity extraction from incident metadata.
+        # No-op (empty entities, no filter) if no metadata was supplied or no
+        # extractor is wired — identical behaviour to before this phase. ---
+        t0 = time.perf_counter()
+        entities: list[dict[str, str]] = []
+        filter_criteria: dict[str, str] | None = None
+        if self._entity_extractor is not None and metadata:
+            entities = self._entity_extractor.extract(metadata)
+            filter_criteria = self._entity_extractor.to_filter_criteria(entities) or None
+        timings["entity_extraction_ms"] = _elapsed_ms(t0)
+
         # --- Stage 2: raw dense (informational — real object, real call). ---
         t0 = time.perf_counter()
         dense_results = self._dense.search(query=query, top_k=self._raw_pool_size)
         for r in dense_results:
             r.setdefault("dense_similarity", r.get("similarity"))
         timings["embedding_search_ms"] = _elapsed_ms(t0)
+
+        # --- Stage 2b (Phase C6): raw dense WITH the metadata filter applied
+        # (informational — shows exactly what the filter alone would keep,
+        # before any relaxation). Empty if no filter_criteria was derived. ---
+        t0 = time.perf_counter()
+        metadata_filtered_results: list[dict[str, Any]] = []
+        if filter_criteria:
+            metadata_filtered_results = self._dense.search(
+                query=query, filter_criteria=filter_criteria, top_k=self._raw_pool_size,
+            )
+            for r in metadata_filtered_results:
+                r.setdefault("dense_similarity", r.get("similarity"))
+        timings["metadata_filter_ms"] = _elapsed_ms(t0)
 
         # --- Stage 3: raw BM25 (informational — real object, real call). ---
         t0 = time.perf_counter()
@@ -238,17 +320,30 @@ class RetrievalDebugTracer:
             if self._reranker is not None else pool_before_diversity
         )
 
-        # --- Stage 4: RRF fusion — via the REAL hybrid/multi-query pipeline. ---
+        # --- Stage 4: RRF fusion — via the REAL hybrid/multi-query pipeline,
+        # with the derived metadata filter applied. Mirrors
+        # AdvancedRetrievalPipeline's own relaxation: if the filter matches
+        # nothing, retry unfiltered rather than reporting a tagging mismatch
+        # as "no evidence". ---
         t0 = time.perf_counter()
-        if cached_expander is not None:
-            # Fresh, throwaway wrapper instance around the SAME shared
-            # hybrid_stage — identical behaviour to production's
-            # MultiQueryRetrievalPipeline, scoped to this one trace so the
-            # expansion cache never leaks across requests.
-            mq_pipeline = MultiQueryRetrievalPipeline(self._hybrid_stage, cached_expander)
-            rrf_fused = mq_pipeline.search(query=query, top_k=pool_before_rerank)
-        else:
-            rrf_fused = self._hybrid_stage.search(query=query, top_k=pool_before_rerank)
+
+        def _run_fusion(fc: dict[str, str] | None) -> list[dict[str, Any]]:
+            if cached_expander is not None:
+                # Fresh, throwaway wrapper instance around the SAME shared
+                # hybrid_stage — identical behaviour to production's
+                # MultiQueryRetrievalPipeline, scoped to this one trace so the
+                # expansion cache never leaks across requests.
+                mq_pipeline = MultiQueryRetrievalPipeline(self._hybrid_stage, cached_expander)
+                return mq_pipeline.search(query=query, filter_criteria=fc, top_k=pool_before_rerank)
+            return self._hybrid_stage.search(query=query, filter_criteria=fc, top_k=pool_before_rerank)
+
+        rrf_fused = _run_fusion(filter_criteria)
+        metadata_filter_relaxed = False
+        if not rrf_fused and filter_criteria:
+            rrf_fused = _run_fusion(None)
+            metadata_filter_relaxed = True
+            for r in rrf_fused:
+                r["metadata_filter_relaxed"] = True
         timings["rrf_fusion_ms"] = _elapsed_ms(t0)
 
         # --- Stage 5: cross-encoder reranking — via the REAL reranker. ---
@@ -262,11 +357,33 @@ class RetrievalDebugTracer:
         # --- Stage 6: evidence diversity — via the REAL filter. ---
         t0 = time.perf_counter()
         if self._diversity is not None and reranked:
-            final_chunks = self._diversity.filter(reranked, top_k=top_k)
+            diversity_output = self._diversity.filter(reranked, top_k=top_k)
         else:
-            final_chunks = list(reranked[:top_k])
+            diversity_output = list(reranked[:top_k])
         timings["diversity_ms"] = _elapsed_ms(t0)
 
+        # --- Stage 7 (Phase C6): business-relevance ranking — via the REAL
+        # scorer. Passthrough copy (no reordering, no new fields) if no
+        # scorer is wired — identical to the pre-Phase-C6 final_chunks. ---
+        t0 = time.perf_counter()
+        if self._relevance_scorer is not None and diversity_output:
+            business_ranked = []
+            for chunk in diversity_output:
+                item = dict(chunk)
+                score, reasons = self._relevance_scorer.score(item, filter_criteria)
+                item["business_relevance_score"] = score
+                item["ranking_reasons"] = reasons
+                item["retrieval_confidence"] = score
+                business_ranked.append(item)
+            business_ranked.sort(
+                key=lambda x: (x["business_relevance_score"], str(x.get("chunk_id"))),
+                reverse=True,
+            )
+        else:
+            business_ranked = list(diversity_output)
+        timings["business_relevance_ms"] = _elapsed_ms(t0)
+
+        final_chunks = business_ranked
         for rank, item in enumerate(final_chunks, start=1):
             item["final_rank"] = rank
 
@@ -279,10 +396,15 @@ class RetrievalDebugTracer:
             "expanded_queries": [
                 {"query_index": i, "query_text": q} for i, q in enumerate(expanded)
             ],
+            "extracted_entities": entities,
+            "metadata_filter_applied": bool(filter_criteria),
+            "metadata_filter_relaxed": metadata_filter_relaxed,
             "dense_results": [summarize_chunk(r) for r in dense_results],
+            "metadata_filtered_results": [summarize_chunk(r) for r in metadata_filtered_results],
             "bm25_results": [summarize_chunk(r) for r in bm25_results],
             "rrf_fused": [summarize_chunk(r) for r in rrf_fused],
             "reranked": [summarize_chunk(r) for r in reranked],
+            "business_ranked": [summarize_chunk(r) for r in business_ranked],
             # In the current frozen architecture, EvidenceDiversityFilter.filter()
             # performs diversity filtering AND the final Top-K selection in one
             # call (there is no separate post-diversity trimming stage) — so

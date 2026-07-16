@@ -392,6 +392,13 @@ export function getTopEvidence(incident) {
           reasonSelected: c.cited
             ? `Cited as contributing cause (confidence ${fmtPct(cause?.confidence)})`
             : "Retrieved but not cited by the LLM",
+          // Phase C6 — Advanced Retrieval Engine. Present (possibly null)
+          // even when the engine is disabled, so callers never need an
+          // `in` check.
+          businessRelevanceScore: c.business_relevance_score ?? null,
+          rankingReasons: Array.isArray(c.ranking_reasons) ? c.ranking_reasons : [],
+          retrievalConfidence: c.retrieval_confidence ?? null,
+          metadataFilterRelaxed: !!c.metadata_filter_relaxed,
         };
       })
       .sort((a, b) => (b.similarity ?? 0) - (a.similarity ?? 0));
@@ -407,7 +414,31 @@ export function getTopEvidence(incident) {
     preview: c.cause,
     cited: true,
     reasonSelected: `Cited as contributing cause (confidence ${fmtPct(c.confidence)})`,
+    businessRelevanceScore: null,
+    rankingReasons: [],
+    retrievalConfidence: null,
+    metadataFilterRelaxed: false,
   }));
+}
+
+/**
+ * Entities extracted from event.metadata by the Adaptive Retrieval Engine's
+ * IncidentEntityExtractor (Phase C6, type "rag" finding's nested
+ * `extracted_entities`) — e.g. [{key, label, value}, ...]. Empty array both
+ * when no entity extractor was wired and when the event carried no
+ * recognised metadata keys — this helper does not distinguish the two
+ * (unlike getMemoryData/getCrossDatasetData's null-vs-empty convention)
+ * because entity extraction is a sub-step of RAG, not its own findings type.
+ */
+export function getExtractedEntities(incident) {
+  const latest = getLatestRagData(incident);
+  return Array.isArray(latest?.extracted_entities) ? latest.extracted_entities : [];
+}
+
+/** Whether a metadata-aware retrieval filter was actually applied (Phase C6). */
+export function getMetadataFilterApplied(incident) {
+  const latest = getLatestRagData(incident);
+  return !!latest?.metadata_filter_applied;
 }
 
 // ─── Icons (inline SVG, no dependency) ──────────────────────────────────────

@@ -165,6 +165,9 @@ def test_summarize_chunk_has_uniform_schema():
         "chunk_id", "source", "text_preview", "similarity", "dense_similarity",
         "bm25_score", "hybrid_rrf_score", "rrf_score", "rerank_score",
         "originating_query", "query_index", "query_text", "final_rank",
+        # Phase C6 — Advanced Retrieval Engine.
+        "business_relevance_score", "ranking_reasons", "retrieval_confidence",
+        "metadata_filter_relaxed",
     }
     assert summary["chunk_id"] == "x"
     assert summary["source"] == "s"

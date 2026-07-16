@@ -69,6 +69,9 @@ from aeam.agents.rag.query_expansion import QueryExpansionAgent
 from aeam.agents.rag.multi_query_retrieval import MultiQueryRetrievalPipeline
 from aeam.agents.rag.reranker import CrossEncoderReranker, RerankingRetrievalPipeline
 from aeam.agents.rag.evidence_diversity import EvidenceDiversityFilter, EvidenceDiversityPipeline
+from aeam.agents.rag.advanced_retrieval import (
+    AdvancedRetrievalPipeline, BusinessRelevanceScorer, IncidentEntityExtractor,
+)
 from aeam.agents.rag.retrieval_debug import RetrievalDebugTracer
 from aeam.agents.rag.response_validator import RAGResponseValidator
 from aeam.integrations.embedding_service import EmbeddingService
@@ -524,6 +527,36 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.info("RAG evidence diversity DISABLED by configuration.")
 
+    # --- Phase C6: Advanced Retrieval Engine ---
+    # Outermost wrapper: entity extraction (from event.metadata) + metadata-
+    # aware filtering (with automatic relaxation) + business-relevance
+    # ranking. Wraps whatever the fully-composed pipeline above was (dense /
+    # hybrid / multi-query / reranked / diversified) unchanged. Falls back to
+    # the prior stage on any construction error, same as every Phase 7 stage.
+    entity_extractor = None
+    relevance_scorer = None
+    if settings.RAG_ADVANCED_RETRIEVAL_ENABLED:
+        try:
+            entity_extractor = IncidentEntityExtractor()
+            relevance_scorer = BusinessRelevanceScorer()
+            rag_retrieval = AdvancedRetrievalPipeline(
+                inner_pipeline=rag_retrieval,
+                relevance_scorer=relevance_scorer,
+            )
+            logger.info(
+                "RAG advanced retrieval (entity extraction + metadata-aware "
+                "filtering + business-relevance ranking) ENABLED"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "RAG advanced retrieval init failed (%s) — falling back to prior retrieval stage.",
+                exc,
+            )
+            entity_extractor = None
+            relevance_scorer = None
+    else:
+        logger.info("RAG advanced retrieval DISABLED by configuration.")
+
     # --- Retrieval explainability: developer-only debug tracer ---
     # Built from the same real, shared component references collected above.
     # Does not alter retrieval behaviour — read-only introspection, exposed
@@ -536,6 +569,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         reranker=reranker,
         diversity_filter=diversity_filter,
         rerank_top_n=settings.RAG_RERANK_TOP_N,
+        entity_extractor=entity_extractor,
+        relevance_scorer=relevance_scorer,
     )
     logger.info("Retrieval debug tracer initialised.")
 
@@ -545,6 +580,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         retrieval_pipeline=rag_retrieval,
         validator=validator,
         llm_service=llm_service,
+        entity_extractor=entity_extractor,
     )
     print("=== AFTER RAGAgent ===")
 
