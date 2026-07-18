@@ -45,7 +45,7 @@ export const NAV_GROUPS = [
   {
     label: "System",
     items: [
-      { to: "/settings", label: "Settings", icon: "code",   status: "soon", phase: "A7" },
+      { to: "/settings", label: "Settings", icon: "code",   status: "live" },
       { to: "/admin",    label: "Admin",    icon: "shield", status: "soon", phase: "A7" },
     ],
   },
