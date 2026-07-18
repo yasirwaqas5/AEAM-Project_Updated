@@ -173,7 +173,7 @@ function StageRow({ stage, last }) {
           <span style={{ fontSize: "0.85rem", fontWeight: 600, color: "var(--text)" }}>{stage.label}</span>
           <span style={{
             fontSize: "0.6rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em",
-            color, background: `${color}16`, border: `1px solid ${color}38`,
+            color, background: `color-mix(in srgb, ${color} 10%, transparent)`, border: `1px solid color-mix(in srgb, ${color} 24%, transparent)`,
             borderRadius: 20, padding: "0.1rem 0.5rem",
           }}>{stage.state}</span>
         </div>

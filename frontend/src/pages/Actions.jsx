@@ -104,7 +104,7 @@ function FilterGroup({ options, value, onChange }) {
           <button key={opt} onClick={() => onChange(opt)} style={{
             fontSize: "0.7rem", letterSpacing: "0.06em", textTransform: "uppercase",
             background: active ? "var(--accent-dim)" : "none",
-            border: `1px solid ${active ? "rgba(0,255,163,0.4)" : "var(--border)"}`,
+            border: `1px solid ${active ? "var(--accent-border)" : "var(--border)"}`,
             color: active ? "var(--accent)" : "var(--muted)",
             borderRadius: 6, padding: "0.3rem 0.75rem", cursor: "pointer", transition: "all 0.15s",
           }}>{opt}</button>
@@ -220,7 +220,7 @@ export default function Actions() {
     { key: "incident_id", label: "Triggering Incident", render: (r) => <IncidentChip incidentId={r.incident_id} incident={incidentsById.get(r.incident_id)} /> },
     { key: "status", label: "Status", render: (r) => <Badge label={statusOf(r)} color={stateColor(statusOf(r))} dot /> },
     { key: "execution_time_ms", label: "Execution Time", align: "right", render: (r) => <span style={{ fontFamily: "var(--font-mono)" }}>{fmtMs(r.execution_time_ms)}</span> },
-    { key: "retry_count", label: "Retries", align: "right", render: (r) => <span style={{ color: (r.retry_count ?? 0) > 0 ? "#ffb800" : "var(--text)" }}>{r.retry_count ?? "—"}</span> },
+    { key: "retry_count", label: "Retries", align: "right", render: (r) => <span style={{ color: (r.retry_count ?? 0) > 0 ? "var(--warn)" : "var(--text)" }}>{r.retry_count ?? "—"}</span> },
     { key: "timestamp", label: "Executed", render: (r) => <span title={fmtTime(r.timestamp)}>{fmtRelative(r.timestamp)}</span> },
     { key: "view", label: "", render: (r) => <Button icon="search" onClick={() => setDetailLog(r)}>View</Button> },
   ];
@@ -260,9 +260,9 @@ export default function Actions() {
           {/* 1. Action Overview — of the last `logs.length` (<=50) executions shown below */}
           <div className="aeam-grid-auto" style={{ marginBottom: "1.4rem" }}>
             <MetricCard label="Total Actions" icon="zap" value={actionTotal} sub={`most recent ${actionTotal} executions`} />
-            <MetricCard label="Successful" icon="check" value={actionSuccess} accent="var(--ok, #00ffa3)" />
-            <MetricCard label="Failed" icon="alert" value={actionFailure} accent={actionFailure > 0 ? "#ff5f57" : undefined} />
-            <MetricCard label="Skipped" icon="x" value={skippedCount} sub="config error (validation_result=SKIPPED)" accent="#ffb800" />
+            <MetricCard label="Successful" icon="check" value={actionSuccess} accent="var(--ok, var(--ok))" />
+            <MetricCard label="Failed" icon="alert" value={actionFailure} accent={actionFailure > 0 ? "var(--err)" : undefined} />
+            <MetricCard label="Skipped" icon="x" value={skippedCount} sub="config error (validation_result=SKIPPED)" accent="var(--warn)" />
             <MetricCard label="Pending" icon="clock" value="N/A" sub="actions execute synchronously — no pending queue exists" />
           </div>
 
@@ -318,7 +318,7 @@ export default function Actions() {
               right={<span style={{ fontSize: "0.62rem", color: "var(--muted)", fontFamily: "var(--font-mono)" }}>of last {logs.length} shown</span>}>
               <div className="aeam-grid-auto">
                 <Field label="Success Rate" value={successRate != null ? `${successRate.toFixed(1)}%` : "—"} mono />
-                <Field label="Failure Rate" value={failureRate != null ? `${failureRate.toFixed(1)}%` : "—"} mono color={failureRate > 0 ? "#ff5f57" : undefined} />
+                <Field label="Failure Rate" value={failureRate != null ? `${failureRate.toFixed(1)}%` : "—"} mono color={failureRate > 0 ? "var(--err)" : undefined} />
                 <Field label="Most Used Action" value={mostUsedAction ? `${actionLabel(mostUsedAction.type)} (${mostUsedAction.total})` : "—"} />
                 <Field label="Average Execution Time" value={avgExecutionMs != null ? fmtMs(avgExecutionMs) : "—"} mono />
               </div>
@@ -327,7 +327,7 @@ export default function Actions() {
             <Panel title="Retry Information" icon="activity"
               right={<span style={{ fontSize: "0.62rem", color: "var(--muted)", fontFamily: "var(--font-mono)" }}>of last {logs.length} shown</span>}>
               <div className="aeam-grid-auto">
-                <Field label="Actions Retried" value={retriedCount} mono color={retriedCount > 0 ? "#ffb800" : undefined} />
+                <Field label="Actions Retried" value={retriedCount} mono color={retriedCount > 0 ? "var(--warn)" : undefined} />
                 <Field label="Never Retried" value={logs.length - retriedCount} mono />
               </div>
               <div style={{ fontSize: "0.66rem", color: "var(--muted)", fontStyle: "italic", marginTop: "0.6rem" }}>

@@ -194,27 +194,27 @@ export default function Agents() {
 
       {/* 1. Agent Overview cards */}
       <div className="aeam-grid-auto" style={{ marginBottom: "1.4rem" }}>
-        <AgentOverviewCard name="Monitor Agent" icon="activity" color="#00b4ff"
+        <AgentOverviewCard name="Monitor Agent" icon="activity" color="var(--info)"
           status={{ known: false }}
           lastActivity={null}
           health={{ known: activation.activated_dataset_ids?.length >= 0, label: `${activation.activated_dataset_ids?.length || 0} dataset(s) watched`, color: "var(--ok)" }} />
-        <AgentOverviewCard name="Rule Engine" icon="shield" color="#8b5cf6"
+        <AgentOverviewCard name="Rule Engine" icon="shield" color="var(--c-memory)"
           status={{ known: !!ruleEngine, label: ruleEngine ? `${ruleEngine.count} domain(s) loaded` : "unknown", color: "var(--ok)" }}
           lastActivity={null}
           health={{ known: !!ruleEngine, label: "Configured", color: "var(--ok)" }} />
-        <AgentOverviewCard name="Forecast Agent" icon="target" color="#ffb800"
+        <AgentOverviewCard name="Forecast Agent" icon="target" color="var(--warn)"
           status={{ known: forecastCount != null, label: forecastCount != null ? `${forecastCount} executed` : "unknown", color: forecastCount > 0 ? "var(--ok)" : "var(--muted)" }}
           lastActivity={lastForecastIncident?.timestamp}
           health={{ known: forecastCount != null, label: forecastCount > 0 ? "Active" : "No invocations yet", color: forecastCount > 0 ? "var(--ok)" : "var(--muted)" }} />
-        <AgentOverviewCard name="RAG Agent" icon="database" color="#00ffa3"
+        <AgentOverviewCard name="RAG Agent" icon="database" color="var(--ok)"
           status={{ known: ragCount != null, label: ragCount != null ? `${ragCount} requests` : "unknown", color: ragCount > 0 ? "var(--ok)" : "var(--muted)" }}
           lastActivity={lastRagIncident?.timestamp}
           health={{ known: true, label: `${indexedDocs}/${documents.length} docs indexed`, color: "var(--ok)" }} />
-        <AgentOverviewCard name="Report Agent" icon="code" color="#00b4ff"
+        <AgentOverviewCard name="Report Agent" icon="code" color="var(--info)"
           status={{ known: reportCount != null, label: reportCount != null ? `${reportCount} generated` : "unknown", color: reportCount > 0 ? "var(--ok)" : "var(--muted)" }}
           lastActivity={mostRecentIncident?.timestamp}
           health={{ known: true, label: "Configured", color: "var(--ok)" }} />
-        <AgentOverviewCard name="Action Agent" icon="zap" color="#ff5f57"
+        <AgentOverviewCard name="Action Agent" icon="zap" color="var(--err)"
           status={{ known: actionTotal > 0, label: `${actionTotal} run(s)`, color: actionFailure > 0 ? "var(--warn)" : "var(--ok)" }}
           lastActivity={mostRecentAction?.timestamp}
           health={{ known: successRate != null, label: successRate != null ? `${successRate}% success` : "unknown", color: successRate >= 80 ? "var(--ok)" : successRate != null ? "var(--warn)" : "var(--muted)" }} />
@@ -246,7 +246,7 @@ export default function Agents() {
             <div style={{ marginTop: "0.6rem" }}>
               <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>Domains</span>
               <div style={{ display: "flex", flexWrap: "wrap", gap: "0.4rem", marginTop: "0.4rem" }}>
-                {ruleEngine.loaded_domains.map((d) => <Badge key={d} label={d} color="#8b5cf6" />)}
+                {ruleEngine.loaded_domains.map((d) => <Badge key={d} label={d} color="var(--c-memory)" />)}
               </div>
             </div>
           )}
@@ -331,7 +331,7 @@ export default function Agents() {
             <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem" }}>
               <div style={{ display: "flex", justifyContent: "space-between" }}>
                 <span style={{ fontSize: "0.78rem", color: "var(--muted)" }}>Status</span>
-                <Badge label={(status.status || "unknown").toUpperCase()} color={status.status === "healthy" ? "#00ffa3" : "#ff5f57"} dot />
+                <Badge label={(status.status || "unknown").toUpperCase()} color={status.status === "healthy" ? "var(--ok)" : "var(--err)"} dot />
               </div>
               <div style={{ display: "flex", justifyContent: "space-between" }}>
                 <span style={{ fontSize: "0.78rem", color: "var(--muted)" }}>Active Incidents</span>

@@ -5,6 +5,7 @@ import { ShellStyles } from "../components/library";
 import Sidebar from "./Sidebar";
 import TopBar from "./TopBar";
 import StatusBar from "./StatusBar";
+import CommandPalette from "./CommandPalette";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * layout/AppShell.jsx
@@ -24,12 +25,27 @@ export default function AppShell({ children }) {
     return Number.isFinite(w) ? Math.min(MAX_W, Math.max(MIN_W, w)) : 248;
   });
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const draggingRef = useRef(false);
   const { pathname } = useLocation();
 
   // Persist collapse; close the mobile drawer on route change.
   useEffect(() => { localStorage.setItem(LS_COLLAPSED, collapsed ? "1" : "0"); }, [collapsed]);
   useEffect(() => { setMobileOpen(false); }, [pathname]);
+
+  // Global hotkeys: Ctrl/Cmd+K anywhere, "/" outside form fields.
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault(); setPaletteOpen((o) => !o);
+      } else if (e.key === "/" && !/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "") &&
+        !document.activeElement?.isContentEditable) {
+        e.preventDefault(); setPaletteOpen(true);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   // Sidebar resize (pointer drag on the handle).
   const onResizeStart = useCallback((e) => {
@@ -66,6 +82,9 @@ export default function AppShell({ children }) {
       <UIStyles />
       <ShellStyles />
 
+      <a className="aeam-skip" href="#aeam-main">Skip to content</a>
+      <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
+
       <Sidebar
         collapsed={collapsed}
         onToggle={() => setCollapsed((c) => !c)}
@@ -76,8 +95,8 @@ export default function AppShell({ children }) {
       {mobileOpen && <div className="aeam-backdrop" onClick={() => setMobileOpen(false)} aria-hidden="true" />}
 
       <div className="aeam-maincol">
-        <TopBar onHamburger={() => setMobileOpen((o) => !o)} />
-        <main className="aeam-workspace">{children}</main>
+        <TopBar onHamburger={() => setMobileOpen((o) => !o)} onSearch={() => setPaletteOpen(true)} />
+        <main id="aeam-main" className="aeam-workspace">{children}</main>
         <StatusBar />
       </div>
     </div>

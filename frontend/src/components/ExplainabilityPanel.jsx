@@ -28,7 +28,7 @@ import { Badge, Icon, getExplainabilityData } from "./ui";
 function SectionLabel({ icon, children }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
-      <Icon name={icon} size={13} color="#00b4ff" />
+      <Icon name={icon} size={13} color="var(--info)" />
       <span style={{ fontSize: "0.68rem", textTransform: "uppercase", letterSpacing: "0.1em", color: "var(--muted)", fontWeight: 700 }}>
         {children}
       </span>
@@ -55,7 +55,7 @@ function DecisionGraphRow({ node }) {
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", flexWrap: "wrap", fontSize: "0.71rem", color: "var(--muted)" }}>
         <span>↓ evidence: {node.evidence_id != null ? <code style={{ fontFamily: "var(--font-mono)" }}>{node.evidence_id}</code> : "none (not evidence-derived)"}</span>
-        {node.confidence_contribution != null && <Badge label={`signal ${node.confidence_contribution}`} color="#00b4ff" />}
+        {node.confidence_contribution != null && <Badge label={`signal ${node.confidence_contribution}`} color="var(--info)" />}
       </div>
       <span style={{ fontSize: "0.71rem", color: "var(--muted)" }}>{node.evidence_summary}</span>
       <span style={{ fontSize: "0.66rem", color: "var(--muted)", fontStyle: "italic" }}>Report section: {node.report_section}</span>
@@ -119,7 +119,7 @@ export default function ExplainabilityPanel({ incident }) {
       )}
 
       <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-        {data.evidence_quality && <Badge label={`evidence: ${data.evidence_quality}`} color={data.evidence_quality === "high" ? "#00ffa3" : data.evidence_quality === "insufficient" ? "#ff5f57" : "#ffb800"} />}
+        {data.evidence_quality && <Badge label={`evidence: ${data.evidence_quality}`} color={data.evidence_quality === "high" ? "var(--ok)" : data.evidence_quality === "insufficient" ? "var(--err)" : "var(--warn)"} />}
       </div>
 
       {/* Recommendation Trace */}
@@ -154,13 +154,13 @@ export default function ExplainabilityPanel({ incident }) {
             raw=<strong>{cb.raw_confidence ?? "—"}</strong>{"  →  "}plan=<strong>{cb.plan_confidence ?? "—"}</strong>
           </span>
           {cb.adjustment != null && (
-            <Badge label={`${cb.adjustment >= 0 ? "+" : ""}${cb.adjustment}`} color={cb.adjustment < 0 ? "#ff5f57" : "#00ffa3"} />
+            <Badge label={`${cb.adjustment >= 0 ? "+" : ""}${cb.adjustment}`} color={cb.adjustment < 0 ? "var(--err)" : "var(--ok)"} />
           )}
         </div>
         <span style={{ fontSize: "0.71rem", color: "var(--muted)" }}>{cb.adjustment_reason}</span>
         {(cb.per_source || []).map((s, i) => (
           <div key={i} style={{ display: "flex", alignItems: "center", gap: "0.5rem", fontSize: "0.72rem", color: "var(--text)", flexWrap: "wrap" }}>
-            <Badge label={s.source} color={s.has_signal ? "#00b4ff" : "var(--muted)"} />
+            <Badge label={s.source} color={s.has_signal ? "var(--info)" : "var(--muted)"} />
             <span style={{ color: "var(--muted)" }}>
               {s.raw_value != null ? `${s.raw_value} — ${s.raw_value_label}` : s.raw_value_label}
             </span>
@@ -189,10 +189,10 @@ export default function ExplainabilityPanel({ incident }) {
           contradictions.map((c, i) => (
             <div key={i} style={{
               display: "flex", alignItems: "flex-start", gap: "0.5rem",
-              padding: "0.5rem 0.75rem", border: "1px solid #ffb800", borderRadius: 8,
+              padding: "0.5rem 0.75rem", border: "1px solid var(--warn)", borderRadius: 8,
               background: "rgba(255,184,0,0.06)", fontSize: "0.74rem", color: "var(--text)",
             }}>
-              <Icon name="alert" size={12} color="#ffb800" style={{ marginTop: "0.1rem", flexShrink: 0 }} />
+              <Icon name="alert" size={12} color="var(--warn)" style={{ marginTop: "0.1rem", flexShrink: 0 }} />
               <span>{c.description}</span>
             </div>
           ))

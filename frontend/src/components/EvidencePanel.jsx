@@ -18,7 +18,7 @@ import {
  * ────────────────────────────────────────────────────────────────────────── */
 
 function scoreColor(pct) {
-  return pct >= 80 ? "#00ffa3" : pct >= 50 ? "#ffb800" : "#ff5f57";
+  return pct >= 80 ? "var(--ok)" : pct >= 50 ? "var(--warn)" : "var(--err)";
 }
 
 // ─── Retrieval Summary (no evidence case) ───────────────────────────────────
@@ -65,7 +65,7 @@ function RetrievalSummary({ incident }) {
                       <span style={{ color: "var(--muted)", fontWeight: 400 }}> — {a.strategy}</span>
                     )}
                   </span>
-                  <Badge label={`Retrieved: ${a.retrieved_count ?? 0}`} color={(a.retrieved_count ?? 0) > 0 ? "#00ffa3" : "#5a5f72"} />
+                  <Badge label={`Retrieved: ${a.retrieved_count ?? 0}`} color={(a.retrieved_count ?? 0) > 0 ? "var(--ok)" : "var(--faint)"} />
                 </div>
                 {i > 0 && a.query && (
                   <div style={{ fontFamily: "var(--font-mono)", fontSize: "0.74rem", color: "var(--text)", marginBottom: "0.3rem" }}>
@@ -96,7 +96,7 @@ function RetrievalSummary({ incident }) {
 
       <div style={{
         display: "flex", alignItems: "center", gap: "0.5rem",
-        fontSize: "0.74rem", color: validation.status === "PASSED" ? "#00ffa3" : "#ff8f88",
+        fontSize: "0.74rem", color: validation.status === "PASSED" ? "var(--ok)" : "#ff8f88",
       }}>
         <Icon name={validation.status === "PASSED" ? "check" : "alert"} size={13} />
         Validation: {validation.status} — {validation.reason}
@@ -141,7 +141,7 @@ function EvidenceCard({ item }) {
 
         <div style={{ display: "flex", gap: "1.2rem", flexWrap: "wrap", fontSize: "0.7rem", color: "var(--muted)" }}>
           {item.source && <span>Source: {item.source}</span>}
-          <span style={{ color: item.cited ? "#00ffa3" : "var(--muted)" }}>{item.reasonSelected}</span>
+          <span style={{ color: item.cited ? "var(--ok)" : "var(--muted)" }}>{item.reasonSelected}</span>
         </div>
 
         {item.rankingReasons && item.rankingReasons.length > 0 && (

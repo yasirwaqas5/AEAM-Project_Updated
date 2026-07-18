@@ -42,7 +42,7 @@ function BaselineSection({ data }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem" }}>
       <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
-        <Icon name="branch" size={13} color="#00b4ff" />
+        <Icon name="branch" size={13} color="var(--info)" />
         <span style={{ fontSize: "0.68rem", textTransform: "uppercase", letterSpacing: "0.1em", color: "var(--muted)", fontWeight: 700 }}>
           Adaptive Baseline
         </span>
@@ -62,8 +62,8 @@ function BaselineSection({ data }) {
           <div style={{ display: "flex", gap: "0.4rem", alignItems: "center" }}>
             <Badge label={`history=${data.history_points_used ?? 0}`} color="var(--muted)" />
             {data.adaptive_baseline?.statistical_anomaly
-              ? <Badge label="anomaly" color="#ffb800" />
-              : <Badge label="normal" color="#00ffa3" />}
+              ? <Badge label="anomaly" color="var(--warn)" />
+              : <Badge label="normal" color="var(--ok)" />}
           </div>
         </div>
       )}
@@ -76,7 +76,7 @@ function SeasonalitySection({ data }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem" }}>
       <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
-        <Icon name="database" size={13} color="#00b4ff" />
+        <Icon name="database" size={13} color="var(--info)" />
         <span style={{ fontSize: "0.68rem", textTransform: "uppercase", letterSpacing: "0.1em", color: "var(--muted)", fontWeight: 700 }}>
           Seasonality
         </span>
@@ -92,7 +92,7 @@ function SeasonalitySection({ data }) {
           <span style={{ fontSize: "0.78rem", color: "var(--text)" }}>
             Highest: <strong>{seasonality.highest_weekday}</strong> · Lowest: <strong>{seasonality.lowest_weekday}</strong>
           </span>
-          <Badge label={`strength=${seasonality.strength}`} color="#00b4ff" />
+          <Badge label={`strength=${seasonality.strength}`} color="var(--info)" />
         </div>
       ) : (
         <div style={{
@@ -139,7 +139,7 @@ export default function AdaptiveDetectionPanel({ incident }) {
             : "No corroborating evidence across adaptive baseline, statistical, or forecast signals."}
         </span>
         {data.combined_signal
-          ? <Badge label="combined signal" color="#ffb800" />
+          ? <Badge label="combined signal" color="var(--warn)" />
           : <Badge label="no signal" color="var(--muted)" />}
       </div>
     </div>

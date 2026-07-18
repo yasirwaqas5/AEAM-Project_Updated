@@ -24,9 +24,9 @@ import { Badge, Icon, getExecutionPlanData } from "./ui";
  * ────────────────────────────────────────────────────────────────────────── */
 
 function classificationColor(classification) {
-  if (classification === "execute_immediately") return "#00ffa3";
-  if (classification === "requires_human_approval") return "#ffb800";
-  return "#00b4ff"; // informational_only
+  if (classification === "execute_immediately") return "var(--ok)";
+  if (classification === "requires_human_approval") return "var(--warn)";
+  return "var(--info)"; // informational_only
 }
 
 function classificationLabel(classification) {
@@ -52,7 +52,7 @@ function InsufficientNote({ children }) {
 function SectionLabel({ icon, children }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
-      <Icon name={icon} size={13} color="#00b4ff" />
+      <Icon name={icon} size={13} color="var(--info)" />
       <span style={{ fontSize: "0.68rem", textTransform: "uppercase", letterSpacing: "0.1em", color: "var(--muted)", fontWeight: 700 }}>
         {children}
       </span>
@@ -117,9 +117,9 @@ export default function ExecutionPlanPanel({ incident }) {
 
       {/* Confidence / Evidence Quality / Human Approval */}
       <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-        {confidencePct != null && <Badge label={`confidence ${confidencePct}%`} color={confidencePct >= 70 ? "#00ffa3" : confidencePct >= 40 ? "#ffb800" : "#ff5f57"} />}
-        {data.evidence_quality && <Badge label={`evidence: ${data.evidence_quality}`} color={data.evidence_quality === "high" ? "#00ffa3" : data.evidence_quality === "insufficient" ? "#ff5f57" : "#ffb800"} />}
-        <Badge label={data.human_approval_required ? "human approval required" : "no approval required"} color={data.human_approval_required ? "#ffb800" : "#00ffa3"} />
+        {confidencePct != null && <Badge label={`confidence ${confidencePct}%`} color={confidencePct >= 70 ? "var(--ok)" : confidencePct >= 40 ? "var(--warn)" : "var(--err)"} />}
+        {data.evidence_quality && <Badge label={`evidence: ${data.evidence_quality}`} color={data.evidence_quality === "high" ? "var(--ok)" : data.evidence_quality === "insufficient" ? "var(--err)" : "var(--warn)"} />}
+        <Badge label={data.human_approval_required ? "human approval required" : "no approval required"} color={data.human_approval_required ? "var(--warn)" : "var(--ok)"} />
       </div>
 
       {/* Recommended Actions (order) */}
@@ -159,10 +159,10 @@ export default function ExecutionPlanPanel({ incident }) {
           conflicts.map((c, i) => (
             <div key={i} style={{
               display: "flex", alignItems: "flex-start", gap: "0.5rem",
-              padding: "0.5rem 0.75rem", border: "1px solid #ffb800", borderRadius: 8,
+              padding: "0.5rem 0.75rem", border: "1px solid var(--warn)", borderRadius: 8,
               background: "rgba(255,184,0,0.06)", fontSize: "0.74rem", color: "var(--text)",
             }}>
-              <Icon name="alert" size={12} color="#ffb800" style={{ marginTop: "0.1rem", flexShrink: 0 }} />
+              <Icon name="alert" size={12} color="var(--warn)" style={{ marginTop: "0.1rem", flexShrink: 0 }} />
               <span>{c.description}</span>
             </div>
           ))

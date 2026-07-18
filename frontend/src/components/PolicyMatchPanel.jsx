@@ -25,7 +25,7 @@ import { Badge, Icon, getPolicyMatchData, getPolicyMatches } from "./ui";
  * ────────────────────────────────────────────────────────────────────────── */
 
 const REASON_LABEL = { metric: "Metric match", semantic: "Semantic match" };
-const REASON_COLOR = { metric: "#00ffa3", semantic: "#00b4ff" };
+const REASON_COLOR = { metric: "var(--ok)", semantic: "var(--info)" };
 
 function PolicyMatchCard({ match }) {
   const label = match.business_rule || match.condition || "(unlabeled policy)";
@@ -48,7 +48,7 @@ function PolicyMatchCard({ match }) {
           <Badge label={REASON_LABEL[match.match_reason] || match.match_reason || "unknown"} color={REASON_COLOR[match.match_reason] || "var(--muted)"} />
           {simPct != null && <Badge label={`similarity ${simPct}%`} color="var(--muted)" />}
           {match.priority && <Badge label={match.priority} color={
-            match.priority === "critical" || match.priority === "high" ? "#ff5f57" : match.priority === "medium" ? "#ffb800" : "var(--muted)"
+            match.priority === "critical" || match.priority === "high" ? "var(--err)" : match.priority === "medium" ? "var(--warn)" : "var(--muted)"
           } />}
         </div>
       </div>

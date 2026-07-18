@@ -482,7 +482,7 @@ function DetailModal({ kind, id, onClose, onChanged }) {
                 <button key={key} onClick={() => setTab(key)} style={{
                   fontSize: "0.7rem", letterSpacing: "0.06em", textTransform: "uppercase",
                   background: tab === key ? "var(--accent-dim)" : "none",
-                  border: `1px solid ${tab === key ? "rgba(0,255,163,0.4)" : "var(--border)"}`,
+                  border: `1px solid ${tab === key ? "var(--accent-border)" : "var(--border)"}`,
                   color: tab === key ? "var(--accent)" : "var(--muted)",
                   borderRadius: 6, padding: "0.32rem 0.75rem", cursor: "pointer", transition: "all 0.15s",
                 }}>{label}</button>

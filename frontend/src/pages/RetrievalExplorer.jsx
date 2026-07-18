@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, lazy, Suspense } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
   PageHeader, Badge, SeverityBadge, Field, Icon, Button, Collapsible,
@@ -12,6 +12,61 @@ import {
 import { SearchBox } from "./KnowledgeCenter";
 import { IncidentPicker } from "./Investigation";
 import EvidencePanel from "../components/EvidencePanel";
+
+const NodeGraph = lazy(() => import("../components/three/NodeGraph"));
+
+/* Pipeline layers for the 3D trace visualization — one column per real
+   trace stage, in true pipeline order. Colors mirror the --c-* tokens. */
+export const PIPELINE_LAYERS = [
+  { key: "dense_results", label: "Dense", color: "#38bdf8", layer: 0 },
+  { key: "bm25_results", label: "BM25", color: "#2dd4bf", layer: 0 },
+  { key: "rrf_fused", label: "RRF Fusion", color: "#5b9dff", layer: 1 },
+  { key: "reranked", label: "Reranked", color: "#a78bfa", layer: 2 },
+  { key: "business_ranked", label: "Business Ranked", color: "#fbbf24", layer: 3 },
+  { key: "final_chunks", label: "Selected Evidence", color: "#34d399", layer: 4 },
+];
+
+function buildPipelineGraph(trace) {
+  const nodes = [];
+  const edges = [];
+  const perStage = new Map(); // stage key -> Set of node ids (chunk-level)
+  let any = false;
+
+  for (const stage of PIPELINE_LAYERS) {
+    const chunks = Array.isArray(trace?.[stage.key]) ? trace[stage.key].slice(0, 10) : [];
+    if (!chunks.length) continue;
+    any = true;
+    const ids = new Set();
+    for (const c of chunks) {
+      const cid = c?.chunk_id;
+      if (!cid) continue;
+      const nodeId = `${stage.key}:${cid}`;
+      ids.add(cid);
+      nodes.push({
+        id: nodeId, color: stage.color, layer: stage.layer,
+        size: stage.key === "final_chunks" ? 0.11 : 0.07,
+        label: `${stage.label} · ${String(cid).slice(0, 10)}…`,
+      });
+      perStage.set(stage.key, ids);
+    }
+  }
+  if (!any) return null;
+
+  // Edges: the same chunk surviving from one layer to the next.
+  for (let i = 0; i < PIPELINE_LAYERS.length; i++) {
+    const from = PIPELINE_LAYERS[i];
+    const fromIds = perStage.get(from.key);
+    if (!fromIds) continue;
+    const next = PIPELINE_LAYERS.find((s, j) => j > i && s.layer > from.layer && perStage.has(s.key));
+    if (!next) continue;
+    for (const cid of fromIds) {
+      if (perStage.get(next.key)?.has(cid)) {
+        edges.push({ from: `${from.key}:${cid}`, to: `${next.key}:${cid}`, weight: 0.6 });
+      }
+    }
+  }
+  return { nodes, edges };
+}
 
 /* ──────────────────────────────────────────────────────────────────────────
  * pages/RetrievalExplorer.jsx  (Enterprise Retrieval Explorer)
@@ -62,7 +117,7 @@ const fetchTrace = (query, topK, metadataJson) => {
 // ─── Small building blocks ─────────────────────────────────────────────────
 
 function scoreColor(pct) {
-  return pct >= 80 ? "#00ffa3" : pct >= 50 ? "#ffb800" : "#ff5f57";
+  return pct >= 80 ? "var(--ok)" : pct >= 50 ? "var(--warn)" : "var(--err)";
 }
 
 /** Compact chunk row for LIVE TRACE stages — distinct shape from EvidencePanel's
@@ -84,7 +139,7 @@ function TraceChunkRow({ chunk, scoreLabel, scoreValue }) {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
           {chunk.metadata_filter_relaxed && <Badge label="filter relaxed" color="var(--muted)" />}
-          {scoreValue != null && <Badge label={`${scoreLabel} ${typeof scoreValue === "number" ? scoreValue.toFixed(3) : scoreValue}`} color="var(--info, #00b4ff)" />}
+          {scoreValue != null && <Badge label={`${scoreLabel} ${typeof scoreValue === "number" ? scoreValue.toFixed(3) : scoreValue}`} color="var(--info, var(--info))" />}
         </div>
       </div>
       {Array.isArray(chunk.ranking_reasons) && chunk.ranking_reasons.length > 0 && (
@@ -276,7 +331,7 @@ export default function RetrievalExplorer() {
                   <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>
                     Extracted Entities
                   </span>
-                  <Badge label={metadataFilterApplied ? "metadata filter applied" : "no metadata filter"} color={metadataFilterApplied ? "#00ffa3" : "var(--muted)"} />
+                  <Badge label={metadataFilterApplied ? "metadata filter applied" : "no metadata filter"} color={metadataFilterApplied ? "var(--ok)" : "var(--muted)"} />
                 </div>
                 {extractedEntities.length === 0 ? (
                   <span style={{ fontSize: "0.74rem", color: "var(--muted)", fontStyle: "italic" }}>
@@ -285,7 +340,7 @@ export default function RetrievalExplorer() {
                 ) : (
                   <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap" }}>
                     {extractedEntities.map((e, i) => (
-                      <Badge key={i} label={`${e.label}=${e.value}`} color="#00b4ff" />
+                      <Badge key={i} label={`${e.label}=${e.value}`} color="var(--info)" />
                     ))}
                   </div>
                 )}
@@ -305,7 +360,7 @@ export default function RetrievalExplorer() {
                       <span style={{ fontSize: "0.78rem", fontWeight: 600, color: "var(--text)" }}>
                         Attempt {a.attempt ?? i + 1}{a.strategy && a.strategy !== "original" ? ` — ${a.strategy}` : ""}
                       </span>
-                      <Badge label={`Retrieved: ${a.retrieved_count ?? 0}`} color={(a.retrieved_count ?? 0) > 0 ? "#00ffa3" : "#5a5f72"} />
+                      <Badge label={`Retrieved: ${a.retrieved_count ?? 0}`} color={(a.retrieved_count ?? 0) > 0 ? "var(--ok)" : "var(--faint)"} />
                     </div>
                     <div style={{ fontFamily: "var(--font-mono)", fontSize: "0.78rem", color: "var(--text)" }}>{a.query || "—"}</div>
                     {a.threshold != null && <div style={{ fontSize: "0.68rem", color: "var(--muted)", marginTop: "0.3rem" }}>Similarity threshold: {a.threshold}</div>}
@@ -368,6 +423,26 @@ export default function RetrievalExplorer() {
 
               {trace && (
                 <>
+                  {/* Dimensional pipeline — every node is a REAL chunk from the
+                      trace; edges follow the same chunk_id surviving from one
+                      stage to the next. */}
+                  {(() => {
+                    const g = buildPipelineGraph(trace);
+                    return g && (
+                      <div style={{ border: "1px solid var(--border)", borderRadius: "var(--r-lg)", overflow: "hidden", background: "rgba(255,255,255,.012)" }}>
+                        <Suspense fallback={<div style={{ height: 280 }} />}>
+                          <NodeGraph height={280} layout="columns" nodes={g.nodes} edges={g.edges} />
+                        </Suspense>
+                        <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", padding: ".6rem 1rem", borderTop: "1px solid var(--border)", fontSize: "var(--fs-2xs)", color: "var(--muted)" }}>
+                          {PIPELINE_LAYERS.map((l) => (
+                            <span key={l.key} style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                              <span style={{ width: 8, height: 8, borderRadius: "50%", background: l.color }} />{l.label}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })()}
                   <div className="aeam-grid-2" style={{ gap: "0.8rem" }}>
                     <StageCard title="Query" icon="search" count={trace.expanded_queries?.length ?? 0}
                       timingMs={trace.timings_ms?.query_expansion_ms}
@@ -436,7 +511,7 @@ export default function RetrievalExplorer() {
                           Where chunks were dropped
                         </span>
                         <div className="aeam-grid-auto" style={{ marginTop: "0.4rem" }}>
-                          <Field label="Survived every stage" value={stageSurvivalCounts.survived} mono color="#00ffa3" />
+                          <Field label="Survived every stage" value={stageSurvivalCounts.survived} mono color="var(--ok)" />
                           <Field label="Dropped at fusion" value={stageSurvivalCounts.fusion} mono />
                           <Field label="Dropped by reranker" value={stageSurvivalCounts.reranker} mono />
                           <Field label="Dropped by diversity filter" value={stageSurvivalCounts.evidence_diversity} mono />

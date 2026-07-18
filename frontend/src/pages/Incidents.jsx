@@ -139,7 +139,7 @@ export default function Incidents() {
               <button key={f} onClick={() => setFilter(f)} style={{
                 fontSize: "0.7rem", letterSpacing: "0.08em", textTransform: "uppercase",
                 background: active ? "var(--accent-dim)" : "none",
-                border: `1px solid ${active ? "rgba(0,255,163,0.4)" : "var(--border)"}`,
+                border: `1px solid ${active ? "var(--accent-border)" : "var(--border)"}`,
                 color: active ? "var(--accent)" : "var(--muted)",
                 borderRadius: 6, padding: "0.3rem 0.75rem", cursor: "pointer", transition: "all 0.15s",
               }}>{f}</button>
@@ -154,7 +154,7 @@ export default function Incidents() {
         )}
 
         {error && (
-          <div style={{ background: "rgba(255,95,87,0.08)", border: "1px solid rgba(255,95,87,0.25)", borderRadius: 10, padding: "1rem 1.25rem", color: "#ff5f57", fontSize: "0.8rem", fontFamily: "var(--font-mono)" }}>
+          <div style={{ background: "rgba(255,95,87,0.08)", border: "1px solid rgba(255,95,87,0.25)", borderRadius: 10, padding: "1rem 1.25rem", color: "var(--err)", fontSize: "0.8rem", fontFamily: "var(--font-mono)" }}>
             ⚠ Failed to load incidents: {error}
           </div>
         )}

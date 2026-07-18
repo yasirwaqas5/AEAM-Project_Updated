@@ -74,7 +74,7 @@ function VerdictBar({ onRecord }) {
   if (pendingVerdict) {
     const v = VERDICTS[pendingVerdict];
     return (
-      <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem", padding: "0.8rem", border: `1px solid ${v.color}55`, borderRadius: 9, background: `${v.color}0f` }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem", padding: "0.8rem", border: `1px solid color-mix(in srgb, ${v.color} 33%, transparent)`, borderRadius: 9, background: `color-mix(in srgb, ${v.color} 6%, transparent)` }}>
         <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", fontSize: "0.78rem", color: v.color, fontWeight: 600 }}>
           <Icon name={v.icon} size={14} /> Confirm: {v.label}
         </div>

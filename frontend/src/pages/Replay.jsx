@@ -308,7 +308,7 @@ export default function Replay() {
                   />
                 </Panel>
 
-                <Card accent="#00b4ff">
+                <Card accent="var(--info)">
                   <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", marginBottom: "1rem" }}>
                     <Icon name={steps[stepIndex]?.icon || "play"} size={16} color="var(--accent)" />
                     <span style={{ fontSize: "1rem", fontWeight: 700, color: "var(--text)" }}>{steps[stepIndex]?.label}</span>

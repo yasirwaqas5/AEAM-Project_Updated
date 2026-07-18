@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * Shared UI primitives for the AEAM operator console.
@@ -10,31 +10,31 @@ import { useEffect } from "react";
 // ─── Colour tokens ──────────────────────────────────────────────────────────
 
 export const SEVERITY = {
-  CRITICAL: { color: "#ff5f57", label: "Critical", rank: 4 },
-  HIGH:     { color: "#ffb800", label: "High",     rank: 3 },
-  MEDIUM:   { color: "#00b4ff", label: "Medium",   rank: 2 },
-  LOW:      { color: "#00ffa3", label: "Low",      rank: 1 },
+  CRITICAL: { color: "var(--err)", label: "Critical", rank: 4 },
+  HIGH:     { color: "var(--warn)", label: "High",     rank: 3 },
+  MEDIUM:   { color: "var(--info)", label: "Medium",   rank: 2 },
+  LOW:      { color: "var(--ok)", label: "Low",      rank: 1 },
 };
 
 export const STATE = {
-  done:    "#00ffa3",
-  success: "#00ffa3",
-  passed:  "#00ffa3",
-  active:  "#00b4ff",
-  running: "#00b4ff",
-  pending: "#ffb800",
-  skipped: "#ffb800",
-  failed:  "#ff5f57",
-  error:   "#ff5f57",
-  idle:    "#5a5f72",
+  done:    "var(--ok)",
+  success: "var(--ok)",
+  passed:  "var(--ok)",
+  active:  "var(--info)",
+  running: "var(--info)",
+  pending: "var(--warn)",
+  skipped: "var(--warn)",
+  failed:  "var(--err)",
+  error:   "var(--err)",
+  idle:    "var(--faint)",
 };
 
 export function severityOf(key) {
-  return SEVERITY[(key ?? "").toUpperCase()] ?? { color: "#5a5f72", label: key || "Unknown", rank: 0 };
+  return SEVERITY[(key ?? "").toUpperCase()] ?? { color: "var(--faint)", label: key || "Unknown", rank: 0 };
 }
 
 export function stateColor(key) {
-  return STATE[(key ?? "").toLowerCase()] ?? "#5a5f72";
+  return STATE[(key ?? "").toLowerCase()] ?? "var(--faint)";
 }
 
 // ─── Formatters ─────────────────────────────────────────────────────────────
@@ -498,6 +498,61 @@ export function getMetadataFilterApplied(incident) {
   return !!latest?.metadata_filter_applied;
 }
 
+/**
+ * Real per-agent activity for the Agent Mesh, derived ONLY from persisted
+ * incidents (newest-first) + the Observability engine's summary. An agent is
+ * "active" when it contributed to the LATEST investigation; health strings
+ * come from real observability rates; anything unrecorded stays undefined so
+ * the mesh renders "no recorded activity" instead of inventing one.
+ */
+export function buildMeshLive(incidents = [], observability = null) {
+  const types = {
+    memory: "memory", policy: "policy", cross: "cross_dataset", adaptive: "adaptive",
+    retrieval: "rag", plan: "execution_plan", explain: "explainability",
+    eval: "ai_evaluation", report: "audit_summary",
+  };
+  const latest = incidents[0] || null;
+  const latestTypes = new Set(latest ? getFindings(latest).map((f) => f?.type) : []);
+  const lastSeen = {};
+  for (const inc of incidents) {
+    const present = new Set(getFindings(inc).map((f) => f?.type));
+    for (const [key, t] of Object.entries(types)) {
+      if (lastSeen[key] == null && present.has(t)) lastSeen[key] = inc.timestamp;
+    }
+    if (lastSeen.action == null && (getAuditSummary(inc)?.executed_actions || []).length) lastSeen.action = inc.timestamp;
+    if (lastSeen.monitor == null) lastSeen.monitor = inc.timestamp;
+  }
+  const rate = (m, label = "hit rate") =>
+    observability?.[m]?.available ? `${Math.round(observability[m].rate * 100)}% ${label}` : undefined;
+  const trendAvg = (m, label) =>
+    observability?.[m]?.available ? `${Math.round(observability[m].average * 100)}% avg ${label}` : undefined;
+  const health = {
+    memory: rate("memory_hit_rate"), policy: rate("policy_hit_rate"),
+    retrieval: rate("retrieval_success_rate", "success"),
+    cross: rate("cross_dataset_usage_rate", "usage"), adaptive: rate("adaptive_detection_usage_rate", "usage"),
+    plan: trendAvg("execution_plan_confidence_trend", "confidence"),
+    eval: trendAvg("ai_evaluation_trend", "quality"),
+    observe: observability?.overall_ai_health?.available
+      ? `${Math.round(observability.overall_ai_health.score * 100)}% AI health` : undefined,
+  };
+  const out = {};
+  for (const key of ["monitor", "memory", "policy", "cross", "adaptive", "retrieval", "plan", "explain", "eval", "observe", "report", "action"]) {
+    const activeNow =
+      key === "monitor" ? !!latest
+      : key === "action" ? !!(latest && (getAuditSummary(latest)?.executed_actions || []).length)
+      : key === "observe" ? !!observability
+      : latestTypes.has(types[key]);
+    out[key] = {
+      state: activeNow ? "active" : "idle",
+      health: health[key],
+      lastActivity: key === "observe"
+        ? (observability ? "live — recomputed on read" : undefined)
+        : lastSeen[key] ? fmtRelative(lastSeen[key]) : undefined,
+    };
+  }
+  return out;
+}
+
 // ─── Icons (inline SVG, no dependency) ──────────────────────────────────────
 
 const ICON_PATHS = {
@@ -520,6 +575,15 @@ const ICON_PATHS = {
   shield:    "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z",
   bolt:      "M13 2 3 14h9l-1 8 10-12h-9l1-8z",
   play:      "m5 3 14 9-14 9V3z",
+  sliders:   "M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6",
+  filter:    "M22 3H2l8 9.46V19l4 2v-8.54L22 3z",
+  arrowr:    "M5 12h14M12 5l7 7-7 7",
+  external:  "M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14 21 3",
+  sparkle:   "M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z",
+  home:      "M3 9.5 12 3l9 6.5V21a1 1 0 0 1-1 1h-5v-7h-6v7H4a1 1 0 0 1-1-1V9.5z",
+  grid:      "M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z",
+  book:      "M4 19.5A2.5 2.5 0 0 1 6.5 17H20M4 19.5A2.5 2.5 0 0 0 6.5 22H20V2H6.5A2.5 2.5 0 0 0 4 4.5v15z",
+  command:   "M9 9V6a3 3 0 1 0-3 3h3zm0 0v6m0-6h6m-6 6v3a3 3 0 1 1-3-3h3zm6 0h3a3 3 0 1 1-3 3v-3zm0-6V6a3 3 0 1 1 3 3h-3z",
 };
 
 export function Icon({ name, size = 16, color = "currentColor", style = {} }) {
@@ -558,15 +622,15 @@ export function CardTitle({ icon, children, right }) {
 
 // ─── Badge ──────────────────────────────────────────────────────────────────
 
-export function Badge({ label, color = "#5a5f72", dot = false, subtle = true, style = {} }) {
+export function Badge({ label, color = "var(--faint)", dot = false, subtle = true, style = {} }) {
   return (
     <span
       style={{
         display: "inline-flex", alignItems: "center", gap: "0.4rem",
         fontSize: "0.68rem", fontWeight: 700, letterSpacing: "0.08em",
         textTransform: "uppercase",
-        color, background: subtle ? `${color}16` : color,
-        border: `1px solid ${color}40`, borderRadius: "20px",
+        color, background: subtle ? `color-mix(in srgb, ${color} 10%, transparent)` : color,
+        border: `1px solid color-mix(in srgb, ${color} 28%, transparent)`, borderRadius: "20px",
         padding: "0.22rem 0.65rem", whiteSpace: "nowrap", ...style,
       }}
     >
@@ -612,13 +676,18 @@ export function Field({ label, value, mono = false, color, title }) {
 
 export function ConfidenceBar({ value, width = "100%" }) {
   const pct = value == null ? 0 : Math.round((value <= 1 ? value * 100 : value));
-  const color = pct >= 80 ? "#00ffa3" : pct >= 50 ? "#ffb800" : "#ff5f57";
+  const color = pct >= 80 ? "var(--ok)" : pct >= 50 ? "var(--warn)" : "var(--err)";
   return (
     <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", width }}>
-      <div style={{ flex: 1, height: 6, background: "var(--border)", borderRadius: 3, overflow: "hidden" }}>
-        <div style={{ height: "100%", width: `${pct}%`, background: color, borderRadius: 3, transition: "width 0.4s ease" }} />
+      <div style={{ flex: 1, height: 6, background: "var(--surface-3)", borderRadius: 3, overflow: "hidden" }}>
+        <div style={{
+          height: "100%", width: `${pct}%`, borderRadius: 3,
+          background: `linear-gradient(90deg, color-mix(in srgb, ${color} 70%, transparent), ${color})`,
+          boxShadow: `0 0 8px color-mix(in srgb, ${color} 45%, transparent)`,
+          transition: "width 0.6s var(--ease-out)",
+        }} />
       </div>
-      <span style={{ fontFamily: "var(--font-mono)", fontSize: "0.72rem", color, fontWeight: 700 }}>
+      <span style={{ fontFamily: "var(--font-mono)", fontSize: "var(--fs-xs)", color, fontWeight: 700 }}>
         {value == null ? "—" : `${pct}%`}
       </span>
     </div>
@@ -627,10 +696,13 @@ export function ConfidenceBar({ value, width = "100%" }) {
 
 // ─── Button ───────────────────────────────────────────────────────────────────
 
-export function Button({ children, icon, onClick, variant = "ghost", disabled, style = {} }) {
+export function Button({ children, icon, onClick, variant = "ghost", size, disabled, title, style = {} }) {
   return (
-    <button className={`aeam-btn aeam-btn-${variant}`} onClick={onClick} disabled={disabled} style={style}>
-      {icon && <Icon name={icon} size={13} />}
+    <button
+      className={`aeam-btn aeam-btn-${variant}${size === "sm" ? " aeam-btn-sm" : ""}`}
+      onClick={onClick} disabled={disabled} title={title} style={style}
+    >
+      {icon && <Icon name={icon} size={size === "sm" ? 12 : 13} />}
       {children}
     </button>
   );
@@ -639,20 +711,49 @@ export function Button({ children, icon, onClick, variant = "ghost", disabled, s
 // ─── Modal ────────────────────────────────────────────────────────────────────
 
 export function Modal({ title, icon, onClose, children, maxWidth = 760 }) {
+  const panelRef = useRef(null);
+  const restoreRef = useRef(null);
+
   useEffect(() => {
-    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    restoreRef.current = document.activeElement;
+    const panel = panelRef.current;
+    const focusables = () => panel.querySelectorAll(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+    );
+    (focusables()[0] || panel).focus();
+
+    const onKey = (e) => {
+      if (e.key === "Escape") { onClose(); return; }
+      // Focus trap: Tab cycles within the dialog.
+      if (e.key === "Tab") {
+        const els = Array.from(focusables());
+        if (!els.length) return;
+        const first = els[0], last = els[els.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
+    };
     document.addEventListener("keydown", onKey);
     document.body.style.overflow = "hidden";
-    return () => { document.removeEventListener("keydown", onKey); document.body.style.overflow = ""; };
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.body.style.overflow = "";
+      restoreRef.current?.focus?.();
+    };
   }, [onClose]);
 
   return (
     <div className="aeam-modal-overlay" onClick={onClose}>
-      <div className="aeam-modal" style={{ maxWidth }} onClick={(e) => e.stopPropagation()}>
+      <div
+        ref={panelRef} className="aeam-modal" style={{ maxWidth }}
+        onClick={(e) => e.stopPropagation()}
+        role="dialog" aria-modal="true" aria-label={typeof title === "string" ? title : undefined}
+        tabIndex={-1}
+      >
         <div className="aeam-modal-head">
           <div className="aeam-card-title">
             {icon && <Icon name={icon} size={15} />}
-            <span style={{ fontSize: "0.9rem", color: "var(--text)", letterSpacing: "0.04em" }}>{title}</span>
+            <span style={{ fontSize: "var(--fs-md)", color: "var(--text)", letterSpacing: "0.03em" }}>{title}</span>
           </div>
           <button className="aeam-modal-close" onClick={onClose} aria-label="Close"><Icon name="x" size={16} /></button>
         </div>
@@ -676,6 +777,26 @@ export function Collapsible({ summary, children, defaultOpen = false }) {
   );
 }
 
+// ─── Tabs ───────────────────────────────────────────────────────────────────────
+
+export function Tabs({ tabs, active, onChange, ariaLabel }) {
+  return (
+    <div role="tablist" aria-label={ariaLabel} className="aeam-tabs">
+      {tabs.map((t) => (
+        <button
+          key={t.key} role="tab" aria-selected={active === t.key}
+          className={`aeam-tab${active === t.key ? " active" : ""}`}
+          onClick={() => onChange(t.key)}
+        >
+          {t.icon && <Icon name={t.icon} size={13} />}
+          {t.label}
+          {t.badge != null && <span className="aeam-tab-badge">{t.badge}</span>}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 // ─── Skeleton ───────────────────────────────────────────────────────────────────
 
 export function Skeleton({ width = "100%", height = 16, style = {} }) {
@@ -686,75 +807,137 @@ export function Skeleton({ width = "100%", height = 16, style = {} }) {
 
 const UI_CSS = `
   @keyframes aeamPulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
-  @keyframes aeamFade { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+  @keyframes aeamFade { from{opacity:0;transform:translateY(10px)} to{opacity:1;transform:translateY(0)} }
+  @keyframes aeamScaleIn { from{opacity:0;transform:scale(.96) translateY(8px)} to{opacity:1;transform:scale(1) translateY(0)} }
+  @keyframes aeamRise { from{opacity:0;transform:translateY(14px)} to{opacity:1;transform:translateY(0)} }
+  @keyframes aeamGrowX { from{transform:scaleX(0)} to{transform:scaleX(1)} }
 
-  .aeam-page { animation: aeamFade 0.3s ease forwards; }
+  .aeam-page { animation: aeamFade var(--t-slow) var(--ease-out) forwards; }
 
-  .aeam-grid-auto { display:grid; gap:1.1rem; grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); }
-  .aeam-grid-2 { display:grid; gap:1.1rem; grid-template-columns:repeat(auto-fit,minmax(330px,1fr)); }
+  /* Staggered card entrance — applied to direct children of stagger groups. */
+  .aeam-stagger > * { animation: aeamRise .5s var(--ease-out) backwards; }
+  .aeam-stagger > *:nth-child(1){ animation-delay:.02s } .aeam-stagger > *:nth-child(2){ animation-delay:.07s }
+  .aeam-stagger > *:nth-child(3){ animation-delay:.12s } .aeam-stagger > *:nth-child(4){ animation-delay:.17s }
+  .aeam-stagger > *:nth-child(5){ animation-delay:.22s } .aeam-stagger > *:nth-child(6){ animation-delay:.27s }
+  .aeam-stagger > *:nth-child(n+7){ animation-delay:.32s }
+
+  .aeam-grid-auto { display:grid; gap:var(--sp-4); grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); }
+  .aeam-grid-2 { display:grid; gap:var(--sp-4); grid-template-columns:repeat(auto-fit,minmax(330px,1fr)); }
 
   .aeam-card {
     position:relative; overflow:hidden;
-    background:var(--surface); border:1px solid var(--border);
-    border-radius:12px; padding:1.35rem 1.5rem;
-    transition:border-color 0.15s, box-shadow 0.15s, transform 0.15s;
+    background:linear-gradient(180deg, var(--surface-2), var(--surface));
+    border:1px solid var(--border);
+    border-radius:var(--r-lg); padding:1.25rem 1.4rem;
+    box-shadow:var(--e1), var(--edge);
+    transition:border-color var(--t-fast) var(--ease-out), box-shadow var(--t-med) var(--ease-out), transform var(--t-med) var(--ease-out);
   }
-  .aeam-card-hover:hover { border-color:#2c3142; box-shadow:0 4px 18px rgba(0,0,0,0.35); }
-  .aeam-card-accent { position:absolute; top:0; left:0; width:100%; height:2px; }
+  .aeam-card-hover:hover {
+    border-color:var(--border-hi);
+    box-shadow:var(--e3), var(--edge);
+    transform:translateY(-2px);
+  }
+  .aeam-card-accent { position:absolute; top:0; left:0; width:100%; height:2px; opacity:.9; }
 
   .aeam-card-title-row { display:flex; align-items:center; justify-content:space-between; margin-bottom:1rem; }
   .aeam-card-title {
     display:flex; align-items:center; gap:0.5rem;
-    font-size:0.65rem; text-transform:uppercase; letter-spacing:0.14em;
+    font-size:var(--fs-2xs); text-transform:uppercase; letter-spacing:0.13em;
     color:var(--muted); font-weight:600;
   }
 
+  /* ─ Buttons ─ */
   .aeam-btn {
-    display:inline-flex; align-items:center; gap:0.4rem;
-    font-size:0.72rem; letter-spacing:0.06em; font-family:var(--font-body);
-    border-radius:7px; padding:0.4rem 0.75rem; cursor:pointer;
-    transition:all 0.15s; background:none;
+    display:inline-flex; align-items:center; justify-content:center; gap:0.45rem;
+    font-size:var(--fs-xs); font-weight:600; letter-spacing:0.02em; font-family:var(--font-body);
+    border-radius:var(--r-sm); padding:0.48rem 0.9rem; cursor:pointer;
+    border:1px solid transparent; background:none; color:var(--text-2);
+    transition:background var(--t-fast) var(--ease-out), border-color var(--t-fast) var(--ease-out),
+      color var(--t-fast) var(--ease-out), box-shadow var(--t-fast) var(--ease-out), transform var(--t-fast) var(--ease-out);
+    white-space:nowrap; user-select:none;
   }
-  .aeam-btn:disabled { opacity:0.5; cursor:default; }
-  .aeam-btn-ghost { color:var(--muted); border:1px solid var(--border); }
-  .aeam-btn-ghost:hover:not(:disabled) { color:var(--accent); border-color:var(--accent); }
-  .aeam-btn-primary { color:var(--accent); border:1px solid rgba(0,255,163,0.4); background:var(--accent-dim); }
-  .aeam-btn-primary:hover:not(:disabled) { background:rgba(0,255,163,0.16); }
+  .aeam-btn:active:not(:disabled) { transform:translateY(1px) scale(.99); }
+  .aeam-btn:disabled { opacity:0.45; cursor:default; }
 
+  .aeam-btn-ghost { color:var(--text-2); border-color:var(--border-2); background:rgba(255,255,255,.015); }
+  .aeam-btn-ghost:hover:not(:disabled) { color:var(--text); border-color:var(--border-hi); background:var(--surface-3); }
+
+  .aeam-btn-primary {
+    color:#f4f8ff; border-color:rgba(122,174,255,.55);
+    background:linear-gradient(180deg,#6aa6ff,#4a8bf0);
+    box-shadow:0 1px 2px rgba(2,6,12,.5), inset 0 1px 0 rgba(255,255,255,.22);
+  }
+  .aeam-btn-primary:hover:not(:disabled) {
+    background:linear-gradient(180deg,#79b0ff,#5b9dff);
+    box-shadow:0 2px 10px rgba(91,157,255,.35), inset 0 1px 0 rgba(255,255,255,.24);
+  }
+
+  .aeam-btn-secondary { color:var(--accent); border-color:var(--accent-border); background:var(--accent-dim); }
+  .aeam-btn-secondary:hover:not(:disabled) { background:rgba(91,157,255,.18); }
+
+  .aeam-btn-danger { color:var(--err); border-color:rgba(248,113,113,.4); background:var(--err-dim); }
+  .aeam-btn-danger:hover:not(:disabled) { background:rgba(248,113,113,.18); }
+
+  .aeam-btn-sm { padding:0.3rem 0.6rem; font-size:var(--fs-2xs); }
+
+  /* ─ Modal ─ */
   .aeam-modal-overlay {
     position:fixed; inset:0; z-index:1000;
-    background:rgba(3,5,10,0.72); backdrop-filter:blur(3px);
+    background:rgba(4,7,12,0.6); backdrop-filter:var(--glass-blur);
     display:flex; align-items:center; justify-content:center; padding:1.5rem;
-    animation:aeamFade 0.18s ease forwards;
+    animation:aeamFade var(--t-fast) var(--ease-out) forwards;
   }
   .aeam-modal {
     width:100%; max-height:86vh; display:flex; flex-direction:column;
-    background:var(--surface); border:1px solid var(--border);
-    border-radius:14px; overflow:hidden; box-shadow:0 24px 60px rgba(0,0,0,0.55);
+    background:linear-gradient(180deg,var(--surface-2),var(--surface));
+    border:1px solid var(--border-2);
+    border-radius:var(--r-xl); overflow:hidden;
+    box-shadow:var(--e4), var(--edge);
+    animation:aeamScaleIn var(--t-med) var(--ease-spring) forwards;
   }
   .aeam-modal-head {
     display:flex; align-items:center; justify-content:space-between;
     padding:1.1rem 1.4rem; border-bottom:1px solid var(--border); flex-shrink:0;
   }
-  .aeam-modal-close { background:none; border:none; color:var(--muted); cursor:pointer; padding:0.25rem; border-radius:6px; transition:color 0.15s; }
+  .aeam-modal-close { background:none; border:none; color:var(--muted); cursor:pointer; padding:0.25rem; border-radius:var(--r-sm); transition:color var(--t-fast); }
   .aeam-modal-close:hover { color:var(--text); }
   .aeam-modal-body { padding:1.4rem; overflow-y:auto; }
 
-  .aeam-collapsible { border:1px solid var(--border); border-radius:9px; background:rgba(255,255,255,0.015); }
+  .aeam-collapsible { border:1px solid var(--border); border-radius:var(--r-md); background:rgba(255,255,255,0.015); }
   .aeam-collapsible-summary {
     list-style:none; cursor:pointer; display:flex; align-items:center; gap:0.5rem;
-    padding:0.75rem 0.9rem; font-size:0.78rem; color:var(--text); user-select:none;
+    padding:0.75rem 0.9rem; font-size:var(--fs-sm); color:var(--text); user-select:none;
+    border-radius:var(--r-md); transition:background var(--t-fast);
   }
+  .aeam-collapsible-summary:hover { background:rgba(255,255,255,.02); }
   .aeam-collapsible-summary::-webkit-details-marker { display:none; }
   .aeam-collapsible[open] > .aeam-collapsible-summary svg { transform:rotate(180deg); }
   .aeam-collapsible-body { padding:0 0.9rem 0.9rem; }
 
   .aeam-json {
-    font-family:var(--font-mono); font-size:0.72rem; line-height:1.55;
-    color:#9fe8c8; background:#0a0c11; border:1px solid var(--border);
-    border-radius:9px; padding:1rem 1.1rem; overflow:auto; max-height:60vh;
+    font-family:var(--font-mono); font-size:var(--fs-xs); line-height:1.6;
+    color:var(--text-2); background:var(--bg);
+    border:1px solid var(--border);
+    border-radius:var(--r-md); padding:1rem 1.1rem; overflow:auto; max-height:60vh;
     white-space:pre; margin:0;
   }
+
+  /* ─ Tabs ─ */
+  .aeam-tabs { display:flex; gap:.25rem; border-bottom:1px solid var(--border); overflow-x:auto; }
+  .aeam-tab {
+    display:inline-flex; align-items:center; gap:.45rem; white-space:nowrap;
+    background:none; border:none; border-bottom:2px solid transparent; cursor:pointer;
+    padding:.6rem .9rem; font-size:var(--fs-sm); font-weight:600; font-family:var(--font-body);
+    color:var(--muted); transition:color var(--t-fast), border-color var(--t-fast);
+    margin-bottom:-1px;
+  }
+  .aeam-tab:hover { color:var(--text-2); }
+  .aeam-tab.active { color:var(--accent); border-bottom-color:var(--accent); }
+  .aeam-tab-badge {
+    font-family:var(--font-mono); font-size:var(--fs-2xs); color:var(--text-2);
+    background:var(--surface-3); border-radius:9px; padding:0 6px; min-width:17px; text-align:center;
+  }
+  .aeam-tabpanel { animation: aeamFade var(--t-med) var(--ease-out) forwards; }
 
   @media (max-width:760px) {
     main { padding:1.4rem !important; }
@@ -776,10 +959,10 @@ export function PageHeader({ title, subtitle, right }) {
     }}>
       <div>
         <h1 style={{
-          fontSize: "1.7rem", fontWeight: 700, fontFamily: "var(--font-display)",
-          color: "var(--text)", margin: 0, lineHeight: 1.2,
+          fontSize: "var(--fs-2xl)", fontWeight: 650, fontFamily: "var(--font-display)",
+          color: "var(--text)", margin: 0, lineHeight: 1.15, letterSpacing: "-0.02em",
         }}>{title}</h1>
-        {subtitle && <p style={{ margin: "0.4rem 0 0", color: "var(--muted)", fontSize: "0.8rem", letterSpacing: "0.04em" }}>{subtitle}</p>}
+        {subtitle && <p style={{ margin: "0.45rem 0 0", color: "var(--muted)", fontSize: "var(--fs-sm)", letterSpacing: "0.01em" }}>{subtitle}</p>}
       </div>
       {right && <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>{right}</div>}
     </div>

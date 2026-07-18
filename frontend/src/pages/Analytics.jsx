@@ -4,6 +4,7 @@ import {
   SEVERITY, severityOf, deriveStatus, fmtTime, fmtRelative,
 } from "../components/ui";
 import { PageContainer, MetricCard, Panel, EmptyState, LoadingState, ErrorState, DataTable } from "../components/library";
+import { BarTrend, SegmentBar } from "../components/charts";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * pages/Analytics.jsx  (Analytics Center)
@@ -79,53 +80,12 @@ async function fetchObservability() {
 
 function TrendBarChart({ buckets }) {
   if (!buckets.length) return <EmptyState icon="target" title="No incident history yet" tone="muted" />;
-  const max = Math.max(...buckets.map((b) => b.count), 1);
-  const w = 640, h = 160, padL = 28, padB = 22, barGap = 4;
-  const barW = (w - padL) / buckets.length - barGap;
-  return (
-    <svg viewBox={`0 0 ${w} ${h}`} style={{ width: "100%", height: "auto", display: "block" }}>
-      <line x1={padL} y1={h - padB} x2={w} y2={h - padB} stroke="var(--border)" strokeWidth="1" />
-      <line x1={padL} y1="4" x2={padL} y2={h - padB} stroke="var(--border)" strokeWidth="1" />
-      <text x="2" y="12" fontSize="9" fill="var(--muted)">{max}</text>
-      <text x="2" y={h - padB} fontSize="9" fill="var(--muted)">0</text>
-      {buckets.map((b, i) => {
-        const barH = (b.count / max) * (h - padB - 10);
-        const x = padL + i * (barW + barGap);
-        const y = h - padB - barH;
-        return (
-          <g key={b.label}>
-            <rect x={x} y={y} width={barW} height={barH} fill="var(--accent)" opacity="0.85" rx="2">
-              <title>{`${b.label}: ${b.count}`}</title>
-            </rect>
-            {i % Math.ceil(buckets.length / 8 || 1) === 0 && (
-              <text x={x + barW / 2} y={h - 6} fontSize="8" fill="var(--muted)" textAnchor="middle">{b.label}</text>
-            )}
-          </g>
-        );
-      })}
-    </svg>
-  );
+  return <BarTrend buckets={buckets} color="var(--accent)" height={150} valueLabel="incidents" />;
 }
 
 function DistributionBar({ segments, total }) {
   if (!total) return <EmptyState icon="target" title="No incidents to distribute" tone="muted" />;
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: "0.7rem" }}>
-      <div style={{ display: "flex", height: 14, borderRadius: 7, overflow: "hidden", background: "var(--border)" }}>
-        {segments.filter((s) => s.count > 0).map((s) => (
-          <div key={s.label} style={{ width: `${(s.count / total) * 100}%`, background: s.color }} title={`${s.label}: ${s.count}`} />
-        ))}
-      </div>
-      <div style={{ display: "flex", flexWrap: "wrap", gap: "0.9rem" }}>
-        {segments.map((s) => (
-          <div key={s.label} style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.74rem", color: "var(--muted)" }}>
-            <span style={{ width: 8, height: 8, borderRadius: "50%", background: s.color, flexShrink: 0 }} />
-            {s.label} <span style={{ color: "var(--text)", fontFamily: "var(--font-mono)" }}>{s.count}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
+  return <SegmentBar segments={segments.map((s) => ({ label: s.label, value: s.count, color: s.color }))} height={12} />;
 }
 
 // ─── Derivation helpers (client-side, over already-fetched data) ────────────
@@ -156,9 +116,9 @@ function statusDistribution(incidents) {
     else resolved += 1; // RESOLVED, COMPLETE
   }
   return [
-    { label: "Active", count: active, color: "#00b4ff" },
-    { label: "Resolved", count: resolved, color: "#00ffa3" },
-    { label: "Failed", count: failed, color: "#ff5f57" },
+    { label: "Active", count: active, color: "var(--info)" },
+    { label: "Resolved", count: resolved, color: "var(--ok)" },
+    { label: "Failed", count: failed, color: "var(--err)" },
   ];
 }
 
@@ -193,7 +153,7 @@ function ObservabilityRateRow({ label, metric }) {
           <span style={{ fontSize: "0.68rem", color: "var(--muted)", fontFamily: "var(--font-mono)" }}>
             {metric.hit_count ?? metric.resolved_count}/{metric.consulted_count ?? metric.total_with_status}
           </span>
-          <Badge label={`${pct}%`} color={pct >= 70 ? "#00ffa3" : pct >= 40 ? "#ffb800" : "#ff5f57"} />
+          <Badge label={`${pct}%`} color={pct >= 70 ? "var(--ok)" : pct >= 40 ? "var(--warn)" : "var(--err)"} />
         </span>
       ) : (
         <Badge label="not available" color="var(--muted)" />
@@ -307,11 +267,11 @@ export default function Analytics() {
 
       {/* Current KPI snapshot */}
       <div className="aeam-grid-metrics" style={{ marginBottom: "1.4rem" }}>
-        <MetricCard label="Active Incidents" value={status?.active_incidents ?? "—"} icon="alert" accent="#ffb800" />
-        <MetricCard label="Agents Active" value={status?.agents_active ?? "—"} icon="activity" accent="#00b4ff" />
+        <MetricCard label="Active Incidents" value={status?.active_incidents ?? "—"} icon="alert" accent="var(--warn)" />
+        <MetricCard label="Agents Active" value={status?.agents_active ?? "—"} icon="activity" accent="var(--info)" />
         <MetricCard label="Total Incidents" value={incidents.length} icon="branch" />
         <MetricCard label="System Status" value={(status?.status || "unknown").toUpperCase()}
-          icon="shield" accent={status?.status === "healthy" ? "#00ffa3" : "#ff5f57"} />
+          icon="shield" accent={status?.status === "healthy" ? "var(--ok)" : "var(--err)"} />
       </div>
 
       <div className="aeam-grid-2" style={{ marginBottom: "1.4rem" }}>
@@ -344,14 +304,14 @@ export default function Analytics() {
             <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem" }}>
               <div style={{ display: "flex", justifyContent: "space-between" }}>
                 <span style={{ fontSize: "0.78rem", color: "var(--muted)" }}>Overall status</span>
-                <Badge label={(status.status || "unknown").toUpperCase()} color={status.status === "healthy" ? "#00ffa3" : "#ff5f57"} dot />
+                <Badge label={(status.status || "unknown").toUpperCase()} color={status.status === "healthy" ? "var(--ok)" : "var(--err)"} dot />
               </div>
               {Object.entries(status)
                 .filter(([k]) => !["status", "active_incidents", "agents_active", "last_event_time"].includes(k))
                 .map(([k, v]) => (
                   <div key={k} style={{ display: "flex", justifyContent: "space-between" }}>
                     <span style={{ fontSize: "0.78rem", color: "var(--muted)", textTransform: "capitalize" }}>{k.replace(/_/g, " ")}</span>
-                    <Badge label={String(v).toUpperCase()} color={String(v) === "true" || v === "healthy" ? "#00ffa3" : "var(--muted)"} dot />
+                    <Badge label={String(v).toUpperCase()} color={String(v) === "true" || v === "healthy" ? "var(--ok)" : "var(--muted)"} dot />
                   </div>
                 ))}
               {Object.keys(status).filter((k) => !["status", "active_incidents", "agents_active", "last_event_time"].includes(k)).length === 0 && (
@@ -392,7 +352,7 @@ export default function Analytics() {
             <MetricCard label="Registered Datasets" value={datasets.length} icon="layers" />
             <MetricCard label="Monitorable Metrics" value={totalMonitorableMetrics} icon="target"
               sub="measure columns discovered across datasets" />
-            <MetricCard label="Activated for Monitoring" value={activatedCount} icon="activity" accent="#00ffa3" />
+            <MetricCard label="Activated for Monitoring" value={activatedCount} icon="activity" accent="var(--ok)" />
             <MetricCard label="Inactive Datasets" value={Math.max(0, datasets.length - activatedCount)} icon="database" accent="var(--muted)" />
           </div>
         </Panel>
@@ -411,7 +371,7 @@ export default function Analytics() {
                   <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>
                     Overall AI Health ({observability.total_investigations} investigation{observability.total_investigations === 1 ? "" : "s"})
                   </span>
-                  <div style={{ fontSize: "1.6rem", fontWeight: 800, fontFamily: "var(--font-mono)", color: observability.overall_ai_health?.available ? "#00ffa3" : "var(--muted)" }}>
+                  <div style={{ fontSize: "1.6rem", fontWeight: 800, fontFamily: "var(--font-mono)", color: observability.overall_ai_health?.available ? "var(--ok)" : "var(--muted)" }}>
                     {observability.overall_ai_health?.available ? `${Math.round(observability.overall_ai_health.score * 100)}%` : "N/A"}
                   </div>
                 </div>
@@ -500,7 +460,7 @@ export default function Analytics() {
           <DataTable
             columns={[
               { key: "agent", label: "Action" },
-              { key: "status", label: "Status", render: (r) => <Badge label={r.status} color={(r.status || "").toUpperCase() === "SUCCESS" ? "#00ffa3" : "#ff5f57"} dot /> },
+              { key: "status", label: "Status", render: (r) => <Badge label={r.status} color={(r.status || "").toUpperCase() === "SUCCESS" ? "var(--ok)" : "var(--err)"} dot /> },
               { key: "timestamp", label: "When", render: (r) => fmtRelative(r.timestamp) },
             ]}
             rows={recentActions}

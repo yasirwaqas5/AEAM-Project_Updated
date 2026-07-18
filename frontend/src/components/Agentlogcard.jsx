@@ -41,8 +41,8 @@ export default function AgentLogCard({ log }) {
           borderRadius: 8, padding: "0.55rem 0.75rem",
           display: "flex", gap: "0.5rem", alignItems: "flex-start",
         }}>
-          <Icon name="alert" size={14} color="#ff5f57" style={{ marginTop: 1 }} />
-          <span><strong style={{ color: "#ff5f57" }}>Reason:</strong> {failure_reason ?? "Unknown failure"}</span>
+          <Icon name="alert" size={14} color="var(--err)" style={{ marginTop: 1 }} />
+          <span><strong style={{ color: "var(--err)" }}>Reason:</strong> {failure_reason ?? "Unknown failure"}</span>
         </div>
       )}
 
@@ -63,7 +63,7 @@ export default function AgentLogCard({ log }) {
       <div className="aeam-grid-auto" style={{ gap: "1rem", paddingTop: "0.6rem", borderTop: "1px solid var(--border)" }}>
         <Field label="Execution Time" value={fmtMs(execution_time_ms)} mono />
         <Field label="Retry Count" value={retry_count ?? "—"} mono
-          color={retry_count > 0 ? "#ffb800" : "var(--text)"} />
+          color={retry_count > 0 ? "var(--warn)" : "var(--text)"} />
         <div style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
           <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>Validation</span>
           {validation_result

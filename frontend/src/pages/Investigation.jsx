@@ -1,7 +1,7 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, lazy, Suspense } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
-  PageHeader, Card, Badge, SeverityBadge, ConfidenceBar, Field, Button, Icon,
+  PageHeader, Card, Badge, SeverityBadge, ConfidenceBar, Field, Button, Icon, Tabs,
   fmtTime, fmtRelative, severityOf, deriveStatus,
   getAuditSummary, getRetrievedCount, getRecommendedActions, getActionOutcome,
   actionLabel, getValidationStatus, getEvidence, parseMaybeJSON,
@@ -10,8 +10,45 @@ import {
   PageContainer, SplitLayout, Panel, EmptyState, LoadingState, ErrorState,
   TimelineContainer, MetricCard,
 } from "../components/library";
+import { ProgressRing } from "../components/charts";
 import { SearchBox } from "./KnowledgeCenter";
 import Timeline from "../components/Timeline";
+import PipelineStepper from "../components/PipelineStepper";
+import { getExplainabilityData } from "../components/ui";
+
+const NodeGraph = lazy(() => import("../components/three/NodeGraph"));
+
+/* Engine colors for the 3D evidence graph (mirror the --c-* tokens). */
+const SOURCE_HEX = {
+  memory: "#a78bfa", policy: "#5b9dff", cross_dataset: "#2dd4bf",
+  adaptive: "#fbbf24", retrieval: "#38bdf8",
+};
+
+/* Build {nodes, edges} for the REAL explainability evidence graph:
+   decision core ← per-source hubs ← individual evidence items. */
+function buildEvidenceGraph(incident) {
+  const data = getExplainabilityData(incident);
+  const graph = data?.evidence_graph;
+  if (!graph || typeof graph !== "object") return null;
+  const nodes = [{ id: "__decision__", label: "Decision", color: "#f472b6", size: 0.16 }];
+  const edges = [];
+  let any = false;
+  for (const [source, items] of Object.entries(graph)) {
+    if (!Array.isArray(items) || items.length === 0) continue;
+    any = true;
+    const hubId = `src:${source}`;
+    const color = SOURCE_HEX[source] || "#94a3b8";
+    nodes.push({ id: hubId, label: source.replace(/_/g, " "), color, size: 0.12 });
+    edges.push({ from: hubId, to: "__decision__", weight: 0.8 });
+    items.slice(0, 8).forEach((item, i) => {
+      const id = `${hubId}:${i}`;
+      const label = item?.label || item?.id || item?.summary || item?.description || `${source} evidence ${i + 1}`;
+      nodes.push({ id, label: String(label).slice(0, 60), color, size: 0.065 });
+      edges.push({ from: id, to: hubId, weight: 0.45 });
+    });
+  }
+  return any ? { nodes, edges } : null;
+}
 import EvidencePanel from "../components/EvidencePanel";
 import MemoryPanel from "../components/MemoryPanel";
 import PolicyMatchPanel from "../components/PolicyMatchPanel";
@@ -142,24 +179,23 @@ function InvestigationSummary({ incident }) {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "0.6rem" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "0.7rem" }}>
           <SeverityBadge severity={incident.severity} />
-          <span style={{ fontFamily: "var(--font-mono)", fontSize: "0.9rem", fontWeight: 700, color: "var(--text)" }}>
+          <span style={{ fontFamily: "var(--font-mono)", fontSize: "var(--fs-md)", fontWeight: 700, color: "var(--text)" }}>
             {incident.event_type || "—"}
           </span>
         </div>
         <Badge label={status.label} color={status.color} dot />
       </div>
 
-      <div className="aeam-grid-auto">
-        <Field label="Root Cause" value={incident.root_cause || "Pending"} />
-        <div style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
-          <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>Confidence</span>
-          <ConfidenceBar value={incident.confidence ?? audit?.top_confidence} />
+      <div style={{ display: "flex", gap: "1.6rem", alignItems: "center", flexWrap: "wrap" }}>
+        <ProgressRing value={incident.confidence ?? audit?.top_confidence} size={92} sublabel="Confidence" />
+        <div className="aeam-grid-auto" style={{ flex: 1, minWidth: 260 }}>
+          <Field label="Root Cause" value={incident.root_cause || "Pending"} />
+          <Field label="Affected Metric" value={incident.metric || "—"} mono />
+          <Field label="Business Impact"
+            value={deviationPct != null
+              ? `${deviationPct.toFixed(1)}% deviation from baseline (${incident.severity || "unknown"} severity)`
+              : "Not quantifiable from persisted data"} />
         </div>
-        <Field label="Affected Metric" value={incident.metric || "—"} mono />
-        <Field label="Business Impact"
-          value={deviationPct != null
-            ? `${deviationPct.toFixed(1)}% deviation from baseline (${incident.severity || "unknown"} severity)`
-            : "Not quantifiable from persisted data"} />
       </div>
     </Card>
   );
@@ -308,18 +344,19 @@ export function IncidentPicker({ incidents, selectedId, onSelect, search, onSear
           return (
             <button key={inc.incident_id} onClick={() => onSelect(inc.incident_id)} style={{
               textAlign: "left", background: active ? "var(--accent-dim)" : "var(--surface)",
-              borderTop: `1px solid ${active ? "rgba(0,255,163,0.4)" : "var(--border)"}`,
-              borderRight: `1px solid ${active ? "rgba(0,255,163,0.4)" : "var(--border)"}`,
-              borderBottom: `1px solid ${active ? "rgba(0,255,163,0.4)" : "var(--border)"}`,
-              borderLeft: `3px solid ${sev.color}`, borderRadius: 8, padding: "0.6rem 0.75rem", cursor: "pointer",
+              borderTop: `1px solid ${active ? "var(--accent-border)" : "var(--border)"}`,
+              borderRight: `1px solid ${active ? "var(--accent-border)" : "var(--border)"}`,
+              borderBottom: `1px solid ${active ? "var(--accent-border)" : "var(--border)"}`,
+              borderLeft: `3px solid ${sev.color}`, borderRadius: "var(--r-md)", padding: "0.6rem 0.75rem", cursor: "pointer",
+              transition: "background var(--t-fast), border-color var(--t-fast), transform var(--t-fast)",
             }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: "0.5rem" }}>
-                <span style={{ fontSize: "0.76rem", fontWeight: 600, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                <span style={{ fontSize: "var(--fs-xs)", fontWeight: 600, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                   {inc.event_type || "—"}
                 </span>
                 <Badge label={inc.severity || "—"} color={sev.color} />
               </div>
-              <div style={{ fontSize: "0.68rem", color: "var(--muted)", marginTop: "0.2rem" }}>
+              <div style={{ fontSize: "var(--fs-2xs)", color: "var(--muted)", marginTop: "0.2rem" }}>
                 {inc.metric || "—"} · {fmtRelative(inc.timestamp)}
               </div>
             </button>
@@ -332,11 +369,20 @@ export function IncidentPicker({ incidents, selectedId, onSelect, search, onSear
 
 // ─── Page ───────────────────────────────────────────────────────────────────
 
+const INTEL_TABS = [
+  { key: "overview", label: "Overview", icon: "target" },
+  { key: "evidence", label: "Evidence", icon: "database" },
+  { key: "signals", label: "Signals", icon: "activity" },
+  { key: "plan", label: "Plan & Why", icon: "zap" },
+  { key: "quality", label: "Quality", icon: "check" },
+];
+
 export default function Investigation() {
   const [incidents, setIncidents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [search, setSearch] = useState("");
+  const [tab, setTab] = useState("overview");
   const [searchParams, setSearchParams] = useSearchParams();
 
   const load = useCallback(async () => {
@@ -393,57 +439,105 @@ export default function Investigation() {
               <div style={{ display: "flex", flexDirection: "column", gap: "1.2rem" }}>
                 <InvestigationSummary incident={selected} />
 
+                {/* The Animated Intelligence Pipeline — every stage state is
+                    derived from the same persisted findings the panels read.
+                    Clicking a stage jumps to the tab that details it. */}
+                <Panel title="Intelligence Pipeline" icon="branch">
+                  <PipelineStepper incident={selected} onStageClick={setTab} />
+                </Panel>
+
                 <div className="aeam-grid-metrics">
-                  <MetricCard label="Current Stage" value={status.label} icon="branch" />
                   <MetricCard label="Status" value={status.label} icon="activity" accent={status.color} />
                   <MetricCard label="Investigation Depth" value={selected.investigation_depth ?? "—"} icon="layers" />
+                  <MetricCard label="Retrieved Evidence" value={`${getRetrievedCount(selected)} chunks`} icon="database" />
                   <MetricCard label="Processing Duration" value="not tracked / incident" icon="clock"
                     sub="see investigation_duration (Prometheus)" />
                 </div>
 
-                <SplitLayout
-                  ratio="1.5fr 1fr"
-                  left={
-                    <div style={{ display: "flex", flexDirection: "column", gap: "1.2rem" }}>
-                      <Panel title="Causal Chain" icon="branch">
-                        <TimelineContainer>
-                          <Timeline incident={selected} />
-                        </TimelineContainer>
-                      </Panel>
-                      <Panel title="Metric Trend — Current vs Expected" icon="target">
-                        <MetricComparisonChart current={selected.current_value} expected={selected.expected_value} />
-                      </Panel>
-                      <Panel title="Incident Metadata" icon="code">
-                        <div className="aeam-grid-auto">
-                          <Field label="Incident ID" value={selected.incident_id} mono title={selected.incident_id} />
-                          <Field label="Event ID" value={selected.event_id} mono title={selected.event_id} />
-                          <Field label="Created" value={fmtTime(selected.timestamp)} title={selected.timestamp} />
-                          <Field label="Detection Methods" value={
-                            (() => {
-                              const dm = parseMaybeJSON(selected.detection_methods);
-                              const list = Array.isArray(dm) ? dm : (Array.isArray(selected.detection_methods) ? selected.detection_methods : []);
-                              return list.join(", ") || "—";
-                            })()
-                          } />
+                <Tabs tabs={INTEL_TABS} active={tab} onChange={setTab} ariaLabel="Investigation detail sections" />
+
+                {tab === "overview" && (
+                  <div className="aeam-tabpanel">
+                    <SplitLayout
+                      ratio="1.5fr 1fr"
+                      left={
+                        <div style={{ display: "flex", flexDirection: "column", gap: "1.2rem" }}>
+                          <Panel title="Causal Chain" icon="branch">
+                            <TimelineContainer>
+                              <Timeline incident={selected} />
+                            </TimelineContainer>
+                          </Panel>
+                          <Panel title="Metric Trend — Current vs Expected" icon="target">
+                            <MetricComparisonChart current={selected.current_value} expected={selected.expected_value} />
+                          </Panel>
                         </div>
-                      </Panel>
-                    </div>
-                  }
-                  right={
+                      }
+                      right={
+                        <div style={{ display: "flex", flexDirection: "column", gap: "1.2rem" }}>
+                          <Panel title="Reasoning" icon="code"><ReasoningPanel incident={selected} /></Panel>
+                          <Panel title="Actions" icon="zap"><ActionsPanel incident={selected} /></Panel>
+                          <Panel title="Incident Metadata" icon="code">
+                            <div style={{ display: "flex", flexDirection: "column", gap: "0.8rem" }}>
+                              <Field label="Incident ID" value={selected.incident_id} mono title={selected.incident_id} />
+                              <Field label="Event ID" value={selected.event_id} mono title={selected.event_id} />
+                              <Field label="Created" value={fmtTime(selected.timestamp)} title={selected.timestamp} />
+                              <Field label="Detection Methods" value={
+                                (() => {
+                                  const dm = parseMaybeJSON(selected.detection_methods);
+                                  const list = Array.isArray(dm) ? dm : (Array.isArray(selected.detection_methods) ? selected.detection_methods : []);
+                                  return list.join(", ") || "—";
+                                })()
+                              } />
+                            </div>
+                          </Panel>
+                        </div>
+                      }
+                    />
+                  </div>
+                )}
+
+                {tab === "evidence" && (
+                  <div className="aeam-tabpanel aeam-grid-2" style={{ alignItems: "start" }}>
+                    <Panel title="Evidence — Retrieved Documents" icon="database"><EvidencePanel incident={selected} /></Panel>
                     <div style={{ display: "flex", flexDirection: "column", gap: "1.2rem" }}>
-                      <Panel title="Evidence" icon="database"><EvidencePanel incident={selected} /></Panel>
-                      <Panel title="Enterprise Memory" icon="layers"><MemoryPanel incident={selected} /></Panel>
+                      <Panel title="Enterprise Memory — Similar Past Incidents" icon="layers"><MemoryPanel incident={selected} /></Panel>
                       <Panel title="Matched Enterprise Policies" icon="shield"><PolicyMatchPanel incident={selected} /></Panel>
-                      <Panel title="Cross-Dataset Analysis" icon="branch"><CrossDatasetPanel incident={selected} /></Panel>
-                      <Panel title="Adaptive Detection" icon="activity"><AdaptiveDetectionPanel incident={selected} /></Panel>
-                      <Panel title="Execution Plan" icon="zap"><ExecutionPlanPanel incident={selected} /></Panel>
-                      <Panel title="Explainability" icon="branch"><ExplainabilityPanel incident={selected} /></Panel>
-                      <Panel title="AI Evaluation" icon="activity"><AIEvaluationPanel incident={selected} /></Panel>
-                      <Panel title="Reasoning" icon="code"><ReasoningPanel incident={selected} /></Panel>
-                      <Panel title="Actions" icon="zap"><ActionsPanel incident={selected} /></Panel>
                     </div>
-                  }
-                />
+                  </div>
+                )}
+
+                {tab === "signals" && (
+                  <div className="aeam-tabpanel aeam-grid-2" style={{ alignItems: "start" }}>
+                    <Panel title="Cross-Dataset Analysis" icon="branch"><CrossDatasetPanel incident={selected} /></Panel>
+                    <Panel title="Adaptive Detection" icon="activity"><AdaptiveDetectionPanel incident={selected} /></Panel>
+                  </div>
+                )}
+
+                {tab === "plan" && (
+                  <div className="aeam-tabpanel" style={{ display: "flex", flexDirection: "column", gap: "1.2rem" }}>
+                    {(() => {
+                      const g = buildEvidenceGraph(selected);
+                      return g && (
+                        <Panel title="Evidence Graph — every source feeding this decision" icon="sparkle" pad={false}
+                          right={<span style={{ fontSize: "var(--fs-2xs)", color: "var(--faint)", fontFamily: "var(--font-mono)" }}>hover a node for its real evidence item</span>}>
+                          <Suspense fallback={<div style={{ height: 300, background: "radial-gradient(circle at 50% 45%, rgba(244,114,182,.1), transparent 60%)" }} />}>
+                            <NodeGraph height={300} layout="orbit" nodes={g.nodes} edges={g.edges} />
+                          </Suspense>
+                        </Panel>
+                      );
+                    })()}
+                    <div className="aeam-grid-2" style={{ alignItems: "start" }}>
+                      <Panel title="Execution Plan" icon="zap"><ExecutionPlanPanel incident={selected} /></Panel>
+                      <Panel title="Explainability — Why These Recommendations" icon="sparkle"><ExplainabilityPanel incident={selected} /></Panel>
+                    </div>
+                  </div>
+                )}
+
+                {tab === "quality" && (
+                  <div className="aeam-tabpanel">
+                    <Panel title="AI Evaluation — Investigation Quality" icon="check"><AIEvaluationPanel incident={selected} /></Panel>
+                  </div>
+                )}
               </div>
             ) : (
               <EmptyState icon="branch" title="Select an incident" description="Choose an incident from the list to investigate." />

@@ -24,7 +24,7 @@ export const NAV_GROUPS = [
       { to: "/human-review",  label: "Human Review",       icon: "shield", status: "live" },
       { to: "/retrieval",     label: "Retrieval Explorer", icon: "search", status: "live" },
       { to: "/replay",        label: "Replay",             icon: "play",   status: "live" },
-      { to: "/memory",        label: "Memory",             icon: "layers", status: "soon", phase: "C" },
+      { to: "/memory",        label: "Memory",             icon: "layers", status: "live" },
     ],
   },
   {

@@ -37,13 +37,13 @@ const COMPONENT_LABELS = {
 function scoreColor(score, inverse) {
   if (score == null) return "var(--muted)";
   const v = inverse ? 1 - score : score;
-  return v >= 0.7 ? "#00ffa3" : v >= 0.4 ? "#ffb800" : "#ff5f57";
+  return v >= 0.7 ? "var(--ok)" : v >= 0.4 ? "var(--warn)" : "var(--err)";
 }
 
 function SectionLabel({ icon, children }) {
   return (
     <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
-      <Icon name={icon} size={13} color="#00b4ff" />
+      <Icon name={icon} size={13} color="var(--info)" />
       <span style={{ fontSize: "0.68rem", textTransform: "uppercase", letterSpacing: "0.1em", color: "var(--muted)", fontWeight: 700 }}>
         {children}
       </span>

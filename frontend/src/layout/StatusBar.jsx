@@ -8,7 +8,6 @@ import { useHealth } from "./HealthProvider";
  * and LLM show honest "n/a" until a backend probe exposes them (Phase A3).
  * ────────────────────────────────────────────────────────────────────────── */
 
-const APP_VERSION = "v0.7.5"; // matches the backend tag line (git v0.7.4 + retrieval explainability)
 
 function Dep({ label, state }) {
   const shown = state === "unknown" ? "n/a" : state;
@@ -35,7 +34,7 @@ export default function StatusBar() {
       <Dep label="LLM"      state={deps.llm} />
       <span className="ver">
         {updatedAt ? `synced ${updatedAt.toLocaleTimeString()}` : (reachable ? "syncing…" : "offline")}
-        {"  ·  AEAM "}{APP_VERSION}
+        {"  ·  AEAM Console"}
       </span>
     </footer>
   );

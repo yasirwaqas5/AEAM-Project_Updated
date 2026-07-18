@@ -19,14 +19,14 @@ import { Badge, Icon, getMemoryData, getMemoryMatches, fmtPct, fmtRelative } fro
  * ────────────────────────────────────────────────────────────────────────── */
 
 function scoreColor(pct) {
-  return pct >= 80 ? "#00ffa3" : pct >= 50 ? "#ffb800" : "#ff5f57";
+  return pct >= 80 ? "var(--ok)" : pct >= 50 ? "var(--warn)" : "var(--err)";
 }
 
 const RESOLUTION_COLOR = {
-  RESOLVED: "#00ffa3",
-  COMPLETE: "#5a5f72",
-  ESCALATED: "#ff5f57",
-  FAILED: "#ff5f57",
+  RESOLVED: "var(--ok)",
+  COMPLETE: "var(--faint)",
+  ESCALATED: "var(--err)",
+  FAILED: "var(--err)",
 };
 
 function MemoryCard({ match }) {

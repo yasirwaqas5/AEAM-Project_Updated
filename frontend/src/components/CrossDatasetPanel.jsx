@@ -26,7 +26,7 @@ import { Badge, Icon, getCrossDatasetData } from "./ui";
  * ────────────────────────────────────────────────────────────────────────── */
 
 function DatasetEntryRow({ entry, kind }) {
-  const color = kind === "supporting" ? "#00ffa3" : kind === "contradicting" ? "#ffb800" : "#00b4ff";
+  const color = kind === "supporting" ? "var(--ok)" : kind === "contradicting" ? "var(--warn)" : "var(--info)";
   return (
     <div style={{
       display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.75rem",
@@ -114,9 +114,9 @@ export default function CrossDatasetPanel({ incident }) {
         </div>
       )}
 
-      <Section title="Supporting" icon="check" color="#00ffa3" entries={supporting} kind="supporting" />
-      <Section title="Contradicting" icon="x" color="#ffb800" entries={contradicting} kind="contradicting" />
-      <Section title="Strong Correlations" icon="branch" color="#00b4ff" entries={strongCorrelations} kind="correlation" />
+      <Section title="Supporting" icon="check" color="var(--ok)" entries={supporting} kind="supporting" />
+      <Section title="Contradicting" icon="x" color="var(--warn)" entries={contradicting} kind="contradicting" />
+      <Section title="Strong Correlations" icon="branch" color="var(--info)" entries={strongCorrelations} kind="correlation" />
       <Section title="Missing Signals" icon="alert" color="var(--muted)" entries={missingSignals} kind="missing" />
     </div>
   );

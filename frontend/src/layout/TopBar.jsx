@@ -18,17 +18,7 @@ const ENV_COLOR = ENV === "PROD"
   ? { color: "var(--err)", border: "rgba(255,95,87,.35)", bg: "rgba(255,95,87,.08)" }
   : { color: "var(--warn)", border: "rgba(255,184,0,.35)", bg: "rgba(255,184,0,.08)" };
 
-function BellIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9" />
-      <path d="M13.73 21a2 2 0 0 1-3.46 0" />
-    </svg>
-  );
-}
-
-export default function TopBar({ onHamburger }) {
+export default function TopBar({ onHamburger, onSearch }) {
   const { pathname } = useLocation();
   const active = matchNav(pathname);
   const { overall, agentsActive } = useHealth();
@@ -51,35 +41,24 @@ export default function TopBar({ onHamburger }) {
         <span className="sep">/</span><span className="cur">{crumbPage}</span>
       </nav>
 
-      {/* Global search — UI only */}
-      <label className="aeam-search">
+      {/* Global search — opens the command palette (Ctrl+K). */}
+      <button type="button" className="aeam-search" onClick={onSearch} aria-label="Open command palette"
+        style={{ cursor: "pointer", textAlign: "left" }}>
         <Icon name="search" size={14} />
-        <input placeholder="Search incidents, knowledge, actions…" aria-label="Global search"
-          onKeyDown={(e) => { if (e.key === "Enter") e.preventDefault(); }} />
-        <kbd>/</kbd>
-      </label>
+        <span style={{ flex: 1, fontSize: "var(--fs-sm)", color: "var(--faint)" }}>Jump to page or incident…</span>
+        <kbd>ctrl K</kbd>
+      </button>
 
       <div className="aeam-topbar-right">
-        {/* Current workspace */}
-        <span className="aeam-sys-pill" title="Current workspace">
-          <Icon name="layers" size={12} /><span className="txt">Production</span>
-        </span>
-
-        {/* System status */}
+        {/* System status — real signal from /health + /system/status */}
         <span className="aeam-sys-pill" title={`System ${sysLabel}`}>
           <StatusDot state={overall === "ok" ? "ok" : overall} pulse={overall === "ok"} />
           <span className="txt">{sysLabel}{agentsActive != null ? ` · ${agentsActive} agents` : ""}</span>
         </span>
 
-        {/* Environment badge */}
+        {/* Environment badge — real Vite build mode */}
         <span className="aeam-env" style={{ color: ENV_COLOR.color, borderColor: ENV_COLOR.border, background: ENV_COLOR.bg }}
           title="Frontend build environment">{ENV}</span>
-
-        {/* Notifications */}
-        <button className="aeam-icon-btn" aria-label="Notifications" title="Notifications">
-          <BellIcon />
-          <span className="badge">0</span>
-        </button>
 
         {/* Current user */}
         <span className="aeam-user" title="Signed-in operator">

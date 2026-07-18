@@ -49,9 +49,16 @@ export default function Trigger() {
         <div style={{ display: "grid", gap: "1.1rem" }}>
           {FIELDS.map((f) => (
             <label key={f.name} style={{ display: "flex", flexDirection: "column", gap: "0.4rem" }}>
-              <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>{f.label}</span>
-              <input name={f.name} type={f.type} value={form[f.name]} onChange={handleChange}
-                placeholder={f.placeholder} style={inputStyle} />
+              <span style={{ fontSize: "var(--fs-2xs)", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>{f.label}</span>
+              {f.name === "severity" ? (
+                <select name="severity" value={form.severity} onChange={handleChange} style={inputStyle}>
+                  <option value="">Select severity…</option>
+                  {["CRITICAL", "HIGH", "MEDIUM", "LOW"].map((s) => <option key={s} value={s}>{s}</option>)}
+                </select>
+              ) : (
+                <input name={f.name} type={f.type} value={form[f.name]} onChange={handleChange}
+                  placeholder={f.placeholder} style={inputStyle} />
+              )}
             </label>
           ))}
 
