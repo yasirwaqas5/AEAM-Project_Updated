@@ -404,6 +404,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     enterprise_memory = EnterpriseMemoryEngine(
         ingestion_pipeline=memory_ingestion_pipeline,
         retrieval_pipeline=memory_retrieval_pipeline,
+        similarity_threshold=settings.MEMORY_SIMILARITY_THRESHOLD,
     )
     container.enterprise_memory = enterprise_memory
     logger.info(
@@ -542,7 +543,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     if settings.RAG_ADVANCED_RETRIEVAL_ENABLED:
         try:
             entity_extractor = IncidentEntityExtractor()
-            relevance_scorer = BusinessRelevanceScorer()
+            # Phase D4 Enterprise Configuration Engine: only override
+            # recency_window_days when explicitly configured, so the
+            # scorer's own module-default kwarg value is preserved
+            # otherwise (that param, unlike the other four, is not itself
+            # Optional -- pre-existing signature from Phase C6).
+            _relevance_scorer_kwargs = {
+                "entity_bonus_per_match": settings.RETRIEVAL_ENTITY_BONUS_PER_MATCH,
+                "max_entity_bonus": settings.RETRIEVAL_MAX_ENTITY_BONUS,
+                "doc_type_bonus": settings.RETRIEVAL_DOC_TYPE_BONUS,
+                "recency_bonus": settings.RETRIEVAL_RECENCY_BONUS,
+            }
+            if settings.RETRIEVAL_RECENCY_WINDOW_DAYS is not None:
+                _relevance_scorer_kwargs["recency_window_days"] = settings.RETRIEVAL_RECENCY_WINDOW_DAYS
+            relevance_scorer = BusinessRelevanceScorer(**_relevance_scorer_kwargs)
             rag_retrieval = AdvancedRetrievalPipeline(
                 inner_pipeline=rag_retrieval,
                 relevance_scorer=relevance_scorer,
@@ -762,6 +776,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         policy_repository=PolicyRepository(container.db),
         rule_engine=RuleEngine(),
         embedding_service=embedding_service,
+        semantic_threshold=settings.POLICY_SIMILARITY_THRESHOLD,
     )
 
     # --- Cross-Dataset Intelligence (Phase C4) ---
@@ -772,10 +787,16 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # is constructed fresh inside CrossDatasetAnalyzer with the SAME
     # window_size=7 MonitorAgent itself uses (same class, not a second
     # detector implementation).
+    # Phase D4: correlation_threshold's own signature default (0.7, set in
+    # Phase C4) is not Optional -- only override when explicitly configured.
+    _cross_dataset_kwargs = {}
+    if settings.CROSS_DATASET_CORRELATION_THRESHOLD is not None:
+        _cross_dataset_kwargs["correlation_threshold"] = settings.CROSS_DATASET_CORRELATION_THRESHOLD
     cross_dataset_analyzer = CrossDatasetAnalyzer(
         dataset_activation=dataset_activation,
         intelligence=dataset_intelligence,
         kpi_source=dataset_kpi_source,
+        **_cross_dataset_kwargs,
     )
 
     # --- Adaptive Detection Engine (Phase C5) ---
@@ -787,6 +808,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # instance -- a second perspective, not a second implementation).
     adaptive_detection_engine = AdaptiveDetectionEngine(
         long_term_memory=long_term_memory,
+        min_baseline_points=settings.ADAPTIVE_MIN_BASELINE_POINTS,
+        min_seasonality_points=settings.ADAPTIVE_MIN_SEASONALITY_POINTS,
+        seasonality_strength_threshold=settings.ADAPTIVE_SEASONALITY_STRENGTH_THRESHOLD,
+        adaptive_window=settings.ADAPTIVE_WINDOW_SIZE,
     )
 
     # --- Enterprise Action Planning Engine (Phase C7) ---
@@ -796,7 +821,16 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # (mirrors the C1/C3/C4/C5 "always on if wired" precedent -- these
     # phases have no dedicated settings flag either, since they add no new
     # infrastructure dependency that could fail to initialize).
-    execution_planning_engine = ExecutionPlanningEngine()
+    _approval_quality_levels = (
+        tuple(s.strip() for s in settings.HUMAN_APPROVAL_QUALITY_LEVELS.split(",") if s.strip())
+        if settings.HUMAN_APPROVAL_QUALITY_LEVELS
+        else None
+    )
+    execution_planning_engine = ExecutionPlanningEngine(
+        ambiguous_cause_gap=settings.EXECUTION_PLAN_AMBIGUOUS_CAUSE_GAP,
+        conflict_confidence_cap=settings.EXECUTION_PLAN_CONFLICT_CONFIDENCE_CAP,
+        approval_required_quality_levels=_approval_quality_levels,
+    )
 
     # --- Enterprise Explainability Engine (Phase D1) ---
     # Zero external dependencies -- pure synthesis over findings AND the
@@ -810,7 +844,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # findings, execution_plan, and explainability, never changing any of
     # them. No new retrieval, no new detector, no LLM call, no second
     # planner. Always constructed (same "always on if wired" precedent).
-    ai_evaluation_engine = AIEvaluationEngine()
+    ai_evaluation_engine = AIEvaluationEngine(
+        strength_threshold=settings.AI_EVAL_STRENGTH_THRESHOLD,
+        weakness_threshold=settings.AI_EVAL_WEAKNESS_THRESHOLD,
+        conflict_penalty_weight=settings.AI_EVAL_CONFLICT_PENALTY_WEIGHT,
+        memory_mixed_outcome_penalty=settings.AI_EVAL_MEMORY_MIXED_OUTCOME_PENALTY,
+    )
 
     # --- Orchestrator ---
     orchestrator = Orchestrator(

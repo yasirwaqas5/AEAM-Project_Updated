@@ -76,14 +76,29 @@ _HEALTH_SCORE_TERMS: tuple[str, ...] = (
     "investigation_success_rate",
 )
 
+# Cap on "recent_values" trend payloads -- a display convenience only;
+# `average`/`direction` are always computed from the FULL series regardless.
+_TREND_WINDOW: int = 20
+
 
 class ObservabilityEngine:
     """
     Summarizes AEAM's own operating quality across every completed
     investigation. Stateless and dependency-free -- every input is passed
     explicitly to :meth:`summarize`; no database handle, no LLM, no
-    retrieval pipeline.
+    retrieval pipeline. The constructor is entirely OPTIONAL -- every
+    existing zero-arg ``ObservabilityEngine()`` call site keeps working
+    unchanged.
+
+    Args:
+        trend_window: Overrides ``_TREND_WINDOW`` (Phase D4 Enterprise
+                      Configuration Engine) -- the display cap
+                      ``recent_values`` entries. ``None`` (the default)
+                      preserves the module default (20).
     """
+
+    def __init__(self, trend_window: int | None = None) -> None:
+        self._trend_window = trend_window if trend_window is not None else _TREND_WINDOW
 
     def summarize(self, incidents: list[dict[str, Any]]) -> dict[str, Any]:
         """
@@ -135,8 +150,12 @@ class ObservabilityEngine:
             lambda data: not data.get("adaptive_baseline_insufficient") or not data.get("seasonality_insufficient"),
         )
 
-        plan_confidence_trend = _numeric_trend(incidents, "execution_plan", lambda data: data.get("confidence"))
-        ai_eval_trend = _numeric_trend(incidents, "ai_evaluation", lambda data: data.get("overall_score"))
+        plan_confidence_trend = _numeric_trend(
+            incidents, "execution_plan", lambda data: data.get("confidence"), self._trend_window,
+        )
+        ai_eval_trend = _numeric_trend(
+            incidents, "ai_evaluation", lambda data: data.get("overall_score"), self._trend_window,
+        )
 
         success_rate = _investigation_success_rate(incidents)
 
@@ -232,7 +251,12 @@ def _consulted_and_hit_rate(
     }
 
 
-def _numeric_trend(incidents: list[dict[str, Any]], finding_type: str, extract: Any) -> dict[str, Any]:
+def _numeric_trend(
+    incidents: list[dict[str, Any]],
+    finding_type: str,
+    extract: Any,
+    trend_window: int = _TREND_WINDOW,
+) -> dict[str, Any]:
     """
     Chronological (as persisted -- ``incidents`` already arrives newest-first
     from the API, so this reverses to oldest-first) series of a real numeric
@@ -276,10 +300,11 @@ def _numeric_trend(incidents: list[dict[str, Any]], finding_type: str, extract: 
         "direction": direction,
         "delta": delta,
         "sample_count": len(values),
-        # Capped to the most recent 20 points so the payload stays small;
-        # this is a display convenience, not a filtering/selection bias --
-        # `average`/`direction` above are computed from the FULL series.
-        "recent_values": [round(v, 4) for v in values[-20:]],
+        # Capped to the most recent `trend_window` points so the payload
+        # stays small; this is a display convenience, not a filtering/
+        # selection bias -- `average`/`direction` above are computed from
+        # the FULL series.
+        "recent_values": [round(v, 4) for v in values[-trend_window:]],
     }
 
 

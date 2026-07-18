@@ -336,6 +336,168 @@ class Settings(BaseSettings):
         description="Jira issue type name or ID (e.g., '10004' for Task)"
     )
 
+    # --- Enterprise Configuration Engine (Phase D4) ---
+    #
+    # Centralizes tunable thresholds/weights/limits for the intelligence
+    # engines (C1/C3/C4/C5/C6/C7/D1/D2/D3) that previously only lived as
+    # hardcoded module constants. Every field here is Optional and defaults
+    # to None -- "unconfigured" -- so the literal default value is NEVER
+    # duplicated here; it continues to live exactly once, in the owning
+    # engine's own module, and is used whenever the corresponding Settings
+    # field is None (no env var set). Setting the env var overrides it.
+    # Historical, already-persisted incident findings are plain JSON and are
+    # never touched by any of these values -- they are only ever read at
+    # engine construction/call time for NEW investigations.
+
+    MEMORY_SIMILARITY_THRESHOLD: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Phase D4: additional similarity floor EnterpriseMemoryEngine "
+            "applies on top of whatever RetrievalPipeline.search() already "
+            "returns, when recalling similar resolved incidents. None = no "
+            "extra filtering (current behavior -- unchanged)."
+        ),
+    )
+
+    POLICY_SIMILARITY_THRESHOLD: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        description="Phase D4: overrides PolicyRegistry's semantic-match threshold (default 0.4).",
+    )
+
+    CROSS_DATASET_CORRELATION_THRESHOLD: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        description="Phase D4: overrides CrossDatasetAnalyzer's correlation threshold (default 0.7).",
+    )
+
+    ADAPTIVE_MIN_BASELINE_POINTS: int | None = Field(
+        default=None,
+        ge=1,
+        description="Phase D4: overrides AdaptiveDetectionEngine's minimum baseline history points (default 10).",
+    )
+
+    ADAPTIVE_MIN_SEASONALITY_POINTS: int | None = Field(
+        default=None,
+        ge=1,
+        description="Phase D4: overrides AdaptiveDetectionEngine's minimum seasonality history points (default 14).",
+    )
+
+    ADAPTIVE_SEASONALITY_STRENGTH_THRESHOLD: float | None = Field(
+        default=None,
+        gt=0.0,
+        description="Phase D4: overrides AdaptiveDetectionEngine's seasonality strength ratio (default 0.5).",
+    )
+
+    ADAPTIVE_WINDOW_SIZE: int | None = Field(
+        default=None,
+        ge=1,
+        description="Phase D4: overrides AdaptiveDetectionEngine's longer-horizon window size (default 30).",
+    )
+
+    RETRIEVAL_ENTITY_BONUS_PER_MATCH: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Phase D4: overrides BusinessRelevanceScorer's per-entity-match bonus (default 0.15).",
+    )
+
+    RETRIEVAL_MAX_ENTITY_BONUS: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Phase D4: overrides BusinessRelevanceScorer's cap on total entity bonus (default 0.45).",
+    )
+
+    RETRIEVAL_DOC_TYPE_BONUS: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Phase D4: overrides BusinessRelevanceScorer's actionable-doc-type bonus (default 0.05).",
+    )
+
+    RETRIEVAL_RECENCY_BONUS: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Phase D4: overrides BusinessRelevanceScorer's recency bonus (default 0.05).",
+    )
+
+    RETRIEVAL_RECENCY_WINDOW_DAYS: int | None = Field(
+        default=None,
+        ge=1,
+        description="Phase D4: overrides BusinessRelevanceScorer's recency window in days (default 30).",
+    )
+
+    EXECUTION_PLAN_AMBIGUOUS_CAUSE_GAP: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Phase D4: overrides ExecutionPlanningEngine's ambiguous-cause confidence gap (default 0.15).",
+    )
+
+    EXECUTION_PLAN_CONFLICT_CONFIDENCE_CAP: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        description="Phase D4: overrides ExecutionPlanningEngine's confidence cap applied when evidence conflicts (default 0.5).",
+    )
+
+    HUMAN_APPROVAL_QUALITY_LEVELS: str | None = Field(
+        default=None,
+        description=(
+            "Phase D4: comma-separated evidence_quality levels that force "
+            "human_approval_required=True in ExecutionPlanningEngine (default "
+            "'insufficient,low'). Same comma-separated-string convention as "
+            "ACTIVATED_DATASET_IDS."
+        ),
+    )
+
+    AI_EVAL_STRENGTH_THRESHOLD: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        description="Phase D4: overrides AIEvaluationEngine's strength-signal threshold (default 0.7).",
+    )
+
+    AI_EVAL_WEAKNESS_THRESHOLD: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        description="Phase D4: overrides AIEvaluationEngine's weakness-signal threshold (default 0.4).",
+    )
+
+    AI_EVAL_CONFLICT_PENALTY_WEIGHT: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Phase D4: overrides AIEvaluationEngine's evidence-conflict penalty weight (default 0.2).",
+    )
+
+    AI_EVAL_MEMORY_MIXED_OUTCOME_PENALTY: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Phase D4: overrides AIEvaluationEngine's mixed-outcomes memory-quality penalty (default 0.15).",
+    )
+
+    OBSERVABILITY_TREND_WINDOW: int | None = Field(
+        default=None,
+        ge=1,
+        description="Phase D4: overrides ObservabilityEngine's recent-values trend cap (default 20).",
+    )
+
+    OBSERVABILITY_RETENTION_LIMIT: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Phase D4: caps how many most-recent incidents "
+            "GET /api/v1/observability/ considers when building its summary. "
+            "A read-time windowing cap only -- never deletes or alters any "
+            "persisted incident row. None = unbounded (current behavior)."
+        ),
+    )
+
     # --- Validators ---
 
     @field_validator("ENVIRONMENT")

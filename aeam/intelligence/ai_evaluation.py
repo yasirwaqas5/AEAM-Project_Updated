@@ -40,6 +40,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from aeam.intelligence.execution_planning import _SOURCE_PRIORITY as _SOURCES
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -52,6 +54,10 @@ _WEAKNESS_THRESHOLD: float = 0.4
 # here (and in the returned ``overall_score_formula`` string) -- never a
 # hidden coefficient.
 _CONFLICT_PENALTY_WEIGHT: float = 0.2
+
+# Penalty subtracted from Memory Quality's average-similarity score when
+# past similar incidents recorded inconsistent (mixed) outcomes.
+_MEMORY_MIXED_OUTCOME_PENALTY: float = 0.15
 
 _COMPONENT_LABELS: dict[str, str] = {
     "evidence_coverage": "Evidence Coverage",
@@ -66,16 +72,45 @@ _COMPONENT_LABELS: dict[str, str] = {
     "investigation_completeness": "Investigation Completeness",
 }
 
-_SOURCES: tuple[str, ...] = ("policy", "memory", "cross_dataset", "adaptive", "retrieval")
-
 
 class AIEvaluationEngine:
     """
     Scores investigation quality -- never recomputes or alters what it scores.
 
     Stateless and dependency-free, exactly like ExecutionPlanningEngine and
-    ExplainabilityEngine.
+    ExplainabilityEngine. The constructor is entirely OPTIONAL -- every
+    existing zero-arg ``AIEvaluationEngine()`` call site keeps working
+    unchanged.
+
+    Args:
+        strength_threshold, weakness_threshold, conflict_penalty_weight,
+        memory_mixed_outcome_penalty: Override the corresponding module
+                             constants (Phase D4 Enterprise Configuration
+                             Engine). Each ``None`` (the default) preserves
+                             the module default unchanged.
     """
+
+    def __init__(
+        self,
+        strength_threshold: float | None = None,
+        weakness_threshold: float | None = None,
+        conflict_penalty_weight: float | None = None,
+        memory_mixed_outcome_penalty: float | None = None,
+    ) -> None:
+        self._strength_threshold = (
+            strength_threshold if strength_threshold is not None else _STRENGTH_THRESHOLD
+        )
+        self._weakness_threshold = (
+            weakness_threshold if weakness_threshold is not None else _WEAKNESS_THRESHOLD
+        )
+        self._conflict_penalty_weight = (
+            conflict_penalty_weight if conflict_penalty_weight is not None else _CONFLICT_PENALTY_WEIGHT
+        )
+        self._memory_mixed_outcome_penalty = (
+            memory_mixed_outcome_penalty
+            if memory_mixed_outcome_penalty is not None
+            else _MEMORY_MIXED_OUTCOME_PENALTY
+        )
 
     def assess(
         self,
@@ -130,7 +165,9 @@ class AIEvaluationEngine:
         components: dict[str, dict[str, Any]] = {
             "evidence_coverage": _score_evidence_coverage(sources_consulted, sources_with_signal),
             "retrieval_quality": _score_retrieval_quality(rag_data),
-            "memory_quality": _score_memory_quality(memory_data, evidence_conflicts),
+            "memory_quality": _score_memory_quality(
+                memory_data, evidence_conflicts, self._memory_mixed_outcome_penalty,
+            ),
             "policy_coverage": _score_policy_coverage(policy_data),
             "cross_dataset_coverage": _score_cross_dataset_coverage(cross_dataset_data),
             "adaptive_detection_coverage": _score_adaptive_coverage(adaptive_data),
@@ -142,8 +179,10 @@ class AIEvaluationEngine:
             ),
         }
 
-        overall_score, overall_formula = _compute_overall_score(components)
-        strengths, weaknesses = _derive_strengths_weaknesses(components)
+        overall_score, overall_formula = _compute_overall_score(components, self._conflict_penalty_weight)
+        strengths, weaknesses = _derive_strengths_weaknesses(
+            components, self._strength_threshold, self._weakness_threshold,
+        )
         missing_evidence = _derive_missing_evidence(explainability, sources_consulted, sources_with_signal)
         improvement_opportunities = _derive_improvement_opportunities(components, evidence_conflicts)
         quality_summary = _build_quality_summary(overall_score, strengths, weaknesses, evidence_conflicts)
@@ -210,7 +249,11 @@ def _score_retrieval_quality(rag_data: dict[str, Any] | None) -> dict[str, Any]:
     )
 
 
-def _score_memory_quality(memory_data: dict[str, Any] | None, evidence_conflicts: list[dict[str, Any]]) -> dict[str, Any]:
+def _score_memory_quality(
+    memory_data: dict[str, Any] | None,
+    evidence_conflicts: list[dict[str, Any]],
+    mixed_outcome_penalty: float = _MEMORY_MIXED_OUTCOME_PENALTY,
+) -> dict[str, Any]:
     if memory_data is None:
         return _component(None, "Enterprise Memory was not consulted for this investigation.")
     matches = memory_data.get("matches") or []
@@ -219,7 +262,7 @@ def _score_memory_quality(memory_data: dict[str, Any] | None, evidence_conflicts
     sims = [m.get("similarity") for m in matches if isinstance(m.get("similarity"), (int, float))]
     base = (sum(sims) / len(sims)) if sims else 0.0
     mixed_outcomes = any("inconsistent outcomes" in (c.get("description") or "") for c in evidence_conflicts)
-    score = max(0.0, base - 0.15) if mixed_outcomes else base
+    score = max(0.0, base - mixed_outcome_penalty) if mixed_outcomes else base
     reason = f"{len(matches)} similar past incident(s), average similarity {round(base, 4) if sims else 'unavailable'}."
     if mixed_outcomes:
         reason += " Penalised for inconsistent historical outcomes (see contradictions)."
@@ -334,24 +377,31 @@ def _score_completeness(
     )
 
 
-def _compute_overall_score(components: dict[str, dict[str, Any]]) -> tuple[float | None, str]:
+def _compute_overall_score(
+    components: dict[str, dict[str, Any]],
+    conflict_penalty_weight: float = _CONFLICT_PENALTY_WEIGHT,
+) -> tuple[float | None, str]:
     quality_keys = [k for k in components if k != "conflict_severity"]
     available = [components[k]["score"] for k in quality_keys if components[k]["score"] is not None]
     conflict_score = components["conflict_severity"]["score"] or 0.0
 
     formula = (
         f"mean of {len(available)}/{len(quality_keys)} computable quality components, "
-        f"minus (conflict_severity * {_CONFLICT_PENALTY_WEIGHT}), clamped to [0, 1]."
+        f"minus (conflict_severity * {conflict_penalty_weight}), clamped to [0, 1]."
     )
     if not available:
         return None, formula + " No components were computable."
 
     mean_quality = sum(available) / len(available)
-    overall = max(0.0, min(1.0, mean_quality - conflict_score * _CONFLICT_PENALTY_WEIGHT))
+    overall = max(0.0, min(1.0, mean_quality - conflict_score * conflict_penalty_weight))
     return round(overall, 4), formula
 
 
-def _derive_strengths_weaknesses(components: dict[str, dict[str, Any]]) -> tuple[list[str], list[str]]:
+def _derive_strengths_weaknesses(
+    components: dict[str, dict[str, Any]],
+    strength_threshold: float = _STRENGTH_THRESHOLD,
+    weakness_threshold: float = _WEAKNESS_THRESHOLD,
+) -> tuple[list[str], list[str]]:
     strengths: list[str] = []
     weaknesses: list[str] = []
     for key, comp in components.items():
@@ -360,14 +410,14 @@ def _derive_strengths_weaknesses(components: dict[str, dict[str, Any]]) -> tuple
             continue
         label = _COMPONENT_LABELS.get(key, key)
         if key == "conflict_severity":
-            if score >= _STRENGTH_THRESHOLD:
+            if score >= strength_threshold:
                 weaknesses.append(f"{label} is high ({score}) -- significant evidence conflicts detected.")
             elif score == 0.0:
                 strengths.append(f"{label} is zero -- no evidence conflicts detected.")
             continue
-        if score >= _STRENGTH_THRESHOLD:
+        if score >= strength_threshold:
             strengths.append(f"{label} is strong ({score}).")
-        elif score < _WEAKNESS_THRESHOLD:
+        elif score < weakness_threshold:
             weaknesses.append(f"{label} is weak ({score}) -- {comp['reason']}")
     return strengths, weaknesses
 

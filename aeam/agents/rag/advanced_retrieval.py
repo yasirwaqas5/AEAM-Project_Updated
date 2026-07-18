@@ -200,15 +200,30 @@ class BusinessRelevanceScorer:
                               material.
         recency_window_days:  Documents dated within this many days of "now"
                               receive the recency bonus.
+        entity_bonus_per_match, max_entity_bonus, doc_type_bonus,
+        recency_bonus:         Override the corresponding module bonus
+                              constants (Phase D4 Enterprise Configuration
+                              Engine). Each ``None`` (the default) preserves
+                              the module default unchanged.
     """
 
     def __init__(
         self,
         actionable_doc_types: frozenset[str] = DEFAULT_ACTIONABLE_DOC_TYPES,
         recency_window_days: int = _RECENCY_WINDOW_DAYS,
+        entity_bonus_per_match: float | None = None,
+        max_entity_bonus: float | None = None,
+        doc_type_bonus: float | None = None,
+        recency_bonus: float | None = None,
     ) -> None:
         self._actionable_doc_types = actionable_doc_types
         self._recency_window_days = max(1, int(recency_window_days))
+        self._entity_bonus_per_match = (
+            entity_bonus_per_match if entity_bonus_per_match is not None else _ENTITY_BONUS_PER_MATCH
+        )
+        self._max_entity_bonus = max_entity_bonus if max_entity_bonus is not None else _MAX_ENTITY_BONUS
+        self._doc_type_bonus = doc_type_bonus if doc_type_bonus is not None else _DOC_TYPE_BONUS
+        self._recency_bonus = recency_bonus if recency_bonus is not None else _RECENCY_BONUS
 
     def score(
         self,
@@ -251,11 +266,11 @@ class BusinessRelevanceScorer:
 
         doc_type = metadata.get("doc_type")
         if isinstance(doc_type, str) and doc_type.strip().lower() in self._actionable_doc_types:
-            bonus += _DOC_TYPE_BONUS
+            bonus += self._doc_type_bonus
             reasons.append(f"authoritative source (doc_type={doc_type})")
 
         if self._is_recent(metadata.get("date")):
-            bonus += _RECENCY_BONUS
+            bonus += self._recency_bonus
             reasons.append(f"recent document (within {self._recency_window_days} days)")
 
         diversity_reason = chunk.get("diversity_kept_reason")
@@ -275,8 +290,8 @@ class BusinessRelevanceScorer:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
     def _entity_overlap(
+        self,
         metadata: dict[str, Any],
         filter_criteria: dict[str, str] | None,
     ) -> tuple[float, list[str]]:
@@ -291,7 +306,7 @@ class BusinessRelevanceScorer:
             if str(candidate).strip().lower() == str(value).strip().lower():
                 matched += 1
                 reasons.append(f"matches incident entity {label}={value}")
-        bonus = min(_MAX_ENTITY_BONUS, matched * _ENTITY_BONUS_PER_MATCH)
+        bonus = min(self._max_entity_bonus, matched * self._entity_bonus_per_match)
         return bonus, reasons
 
     def _is_recent(self, raw_date: Any) -> bool:

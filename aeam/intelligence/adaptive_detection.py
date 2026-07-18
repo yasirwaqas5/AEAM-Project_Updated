@@ -92,6 +92,12 @@ class AdaptiveDetectionEngine:
                            (e.g. for tests). Defaults to a fresh instance
                            with ``window_size=DEFAULT_ADAPTIVE_WINDOW``.
         history_limit:     Max historical rows fetched per analysis.
+        min_baseline_points, min_seasonality_points,
+        seasonality_strength_threshold, adaptive_window: Override the
+                           corresponding module constants (Phase D4
+                           Enterprise Configuration Engine). Each ``None``
+                           (the default) preserves the module default
+                           unchanged.
 
     Raises:
         ValueError: If ``long_term_memory`` is ``None``.
@@ -102,12 +108,28 @@ class AdaptiveDetectionEngine:
         long_term_memory: Any,
         statistical_detector: StatisticalDetector | None = None,
         history_limit: int = 200,
+        min_baseline_points: int | None = None,
+        min_seasonality_points: int | None = None,
+        seasonality_strength_threshold: float | None = None,
+        adaptive_window: int | None = None,
     ) -> None:
         if long_term_memory is None:
             raise ValueError("long_term_memory must not be None.")
         self._ltm = long_term_memory
-        self._detector = statistical_detector or StatisticalDetector(window_size=DEFAULT_ADAPTIVE_WINDOW)
+        window = adaptive_window if adaptive_window is not None else DEFAULT_ADAPTIVE_WINDOW
+        self._detector = statistical_detector or StatisticalDetector(window_size=window)
         self._history_limit = max(1, int(history_limit))
+        self._min_baseline_points = (
+            min_baseline_points if min_baseline_points is not None else MIN_BASELINE_POINTS
+        )
+        self._min_seasonality_points = (
+            min_seasonality_points if min_seasonality_points is not None else MIN_SEASONALITY_POINTS
+        )
+        self._seasonality_strength_threshold = (
+            seasonality_strength_threshold
+            if seasonality_strength_threshold is not None
+            else SEASONALITY_STRENGTH_THRESHOLD
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -158,10 +180,10 @@ class AdaptiveDetectionEngine:
         # --- Adaptive (longer-horizon) baseline, via the SAME StatisticalDetector class ---
         adaptive_baseline: dict[str, Any] | None = None
         baseline_insufficient: str | None = None
-        if len(values) < MIN_BASELINE_POINTS:
+        if len(values) < self._min_baseline_points:
             baseline_insufficient = (
                 f"Only {len(values)} historical point(s) available for '{metric}'; "
-                f"at least {MIN_BASELINE_POINTS} are required for an adaptive baseline."
+                f"at least {self._min_baseline_points} are required for an adaptive baseline."
             )
         else:
             adaptive_baseline = self._detector.detect(current=current_value, history=values)
@@ -170,10 +192,10 @@ class AdaptiveDetectionEngine:
         seasonality: dict[str, Any] | None = None
         seasonality_insufficient: str | None = None
         distinct_weekdays = len({d.weekday() for d, _ in dated_values})
-        if len(dated_values) < MIN_SEASONALITY_POINTS or distinct_weekdays < MIN_SEASONALITY_WEEKDAYS:
+        if len(dated_values) < self._min_seasonality_points or distinct_weekdays < MIN_SEASONALITY_WEEKDAYS:
             seasonality_insufficient = (
                 f"Only {len(dated_values)} dated historical point(s) across {distinct_weekdays} "
-                f"distinct weekday(s) for '{metric}'; at least {MIN_SEASONALITY_POINTS} points "
+                f"distinct weekday(s) for '{metric}'; at least {self._min_seasonality_points} points "
                 f"across {MIN_SEASONALITY_WEEKDAYS}+ weekdays are required for a seasonality judgement."
             )
         else:
@@ -228,7 +250,7 @@ class AdaptiveDetectionEngine:
         strength = spread_of_means / overall_stdev
 
         result: dict[str, Any] = {
-            "detected": strength >= SEASONALITY_STRENGTH_THRESHOLD,
+            "detected": strength >= self._seasonality_strength_threshold,
             "strength": round(strength, 4),
             "weekday_means": {_WEEKDAY_NAMES[wd]: round(m, 4) for wd, m in sorted(weekday_means.items())},
         }
@@ -238,7 +260,7 @@ class AdaptiveDetectionEngine:
             result["highest_weekday"] = _WEEKDAY_NAMES[highest_wd]
             result["lowest_weekday"] = _WEEKDAY_NAMES[lowest_wd]
         else:
-            result["reason"] = f"Weekday-mean spread ({strength:.2f}) below the {SEASONALITY_STRENGTH_THRESHOLD} significance threshold."
+            result["reason"] = f"Weekday-mean spread ({strength:.2f}) below the {self._seasonality_strength_threshold} significance threshold."
         return result
 
     @staticmethod

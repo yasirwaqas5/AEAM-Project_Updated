@@ -63,6 +63,12 @@ _CLASSIFICATION_INFO = "informational_only"
 # one (both confidences are real values already produced by RAGAgent's LLM).
 _AMBIGUOUS_CAUSE_GAP: float = 0.15
 
+# Confidence ceiling applied to the plan's overall confidence whenever any
+# evidence_conflicts were recorded -- conflicting evidence should never let
+# a plan present itself as highly confident, regardless of individual
+# source confidences.
+_CONFLICT_CONFIDENCE_CAP: float = 0.5
+
 _QUALITY_INSUFFICIENT = "insufficient"
 _QUALITY_LOW = "low"
 _QUALITY_MEDIUM = "medium"
@@ -73,10 +79,44 @@ class ExecutionPlanningEngine:
     """
     Synthesizes investigation findings into one explainable execution plan.
 
-    Stateless and dependency-free -- every input is passed explicitly to
-    :meth:`plan`. No retrieval pipeline, no LLM service, no database handle;
-    this engine only reads dicts the Orchestrator already computed.
+    Stateless and dependency-free -- every input needed to synthesize a plan
+    is passed explicitly to :meth:`plan`. No retrieval pipeline, no LLM
+    service, no database handle; this engine only reads dicts the
+    Orchestrator already computed. The constructor is entirely OPTIONAL --
+    every existing zero-arg ``ExecutionPlanningEngine()`` call site keeps
+    working unchanged.
+
+    Args:
+        ambiguous_cause_gap: Overrides ``_AMBIGUOUS_CAUSE_GAP`` (Phase D4
+                             Enterprise Configuration Engine). ``None`` (the
+                             default) preserves the module default (0.15).
+        conflict_confidence_cap: Overrides the confidence ceiling applied
+                             when evidence conflicts exist. ``None`` (the
+                             default) preserves the module default (0.5).
+        approval_required_quality_levels: Overrides which
+                             ``evidence_quality`` levels force
+                             ``human_approval_required=True``. ``None`` (the
+                             default) preserves the module default
+                             (``insufficient``, ``low``).
     """
+
+    def __init__(
+        self,
+        ambiguous_cause_gap: float | None = None,
+        conflict_confidence_cap: float | None = None,
+        approval_required_quality_levels: tuple[str, ...] | None = None,
+    ) -> None:
+        self._ambiguous_cause_gap = (
+            ambiguous_cause_gap if ambiguous_cause_gap is not None else _AMBIGUOUS_CAUSE_GAP
+        )
+        self._conflict_confidence_cap = (
+            conflict_confidence_cap if conflict_confidence_cap is not None else _CONFLICT_CONFIDENCE_CAP
+        )
+        self._approval_required_quality_levels = (
+            approval_required_quality_levels
+            if approval_required_quality_levels is not None
+            else (_QUALITY_INSUFFICIENT, _QUALITY_LOW)
+        )
 
     def plan(
         self,
@@ -274,7 +314,7 @@ class ExecutionPlanningEngine:
             })
             if len(ranked) >= 2:
                 gap = float(ranked[0].get("confidence", 0.0) or 0.0) - float(ranked[1].get("confidence", 0.0) or 0.0)
-                if gap < _AMBIGUOUS_CAUSE_GAP:
+                if gap < self._ambiguous_cause_gap:
                     evidence_conflicts.append({
                         "between": ["retrieval", "retrieval"],
                         "description": (
@@ -332,14 +372,14 @@ class ExecutionPlanningEngine:
         if insufficient_evidence:
             plan_confidence = 0.0
         elif evidence_conflicts:
-            plan_confidence = min(base_confidence, 0.5)
+            plan_confidence = min(base_confidence, self._conflict_confidence_cap)
         else:
             plan_confidence = base_confidence
 
         human_approval_required = bool(
             requires_human
             or evidence_conflicts
-            or evidence_quality in (_QUALITY_INSUFFICIENT, _QUALITY_LOW)
+            or evidence_quality in self._approval_required_quality_levels
             or any(a["classification"] == _CLASSIFICATION_APPROVAL for a in recommended_actions)
         )
 

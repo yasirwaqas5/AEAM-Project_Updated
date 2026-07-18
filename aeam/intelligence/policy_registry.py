@@ -88,6 +88,9 @@ class PolicyRegistry:
         embedding_service: The shared :class:`EmbeddingService` instance
                            (same one RAG/Enterprise Memory already use).
         top_k:             Default number of matches returned per call.
+        semantic_threshold: Overrides ``_SEMANTIC_THRESHOLD`` (Phase D4
+                           Enterprise Configuration Engine). ``None`` (the
+                           default) preserves the module default unchanged.
 
     Raises:
         ValueError: If any dependency is ``None``.
@@ -99,6 +102,7 @@ class PolicyRegistry:
         rule_engine: RuleEngine,
         embedding_service: EmbeddingService,
         top_k: int = DEFAULT_TOP_K,
+        semantic_threshold: float | None = None,
     ) -> None:
         if policy_repository is None:
             raise ValueError("policy_repository must not be None.")
@@ -110,6 +114,9 @@ class PolicyRegistry:
         self._rules = rule_engine
         self._embed = embedding_service
         self._top_k = max(1, int(top_k))
+        self._semantic_threshold = (
+            semantic_threshold if semantic_threshold is not None else _SEMANTIC_THRESHOLD
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -188,7 +195,7 @@ class PolicyRegistry:
                 logger.warning("PolicyRegistry | policy embedding failed | policy_id=%s | error=%s", p.policy_id, exc)
                 continue
             sim = _cosine_similarity(query_vector, policy_vector)
-            if sim >= _SEMANTIC_THRESHOLD:
+            if sim >= self._semantic_threshold:
                 scored.append((sim, p))
 
         scored.sort(key=lambda pair: pair[0], reverse=True)

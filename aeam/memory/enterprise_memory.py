@@ -66,6 +66,16 @@ class EnterpriseMemoryEngine:
                             new searcher.
         top_k:              Default number of similar incidents to return
                             when the caller doesn't override it.
+        similarity_threshold: Optional additional similarity floor (Phase
+                            D4 Enterprise Configuration Engine), applied ON
+                            TOP OF whatever ``retrieval_pipeline.search()``
+                            already returns -- it never reaches into or
+                            modifies the injected ``RetrievalPipeline``
+                            instance itself (which may be shared with
+                            document RAG retrieval), so this only ever
+                            makes Enterprise Memory recall STRICTER, never
+                            looser, and never affects document retrieval.
+                            ``None`` (the default) applies no extra filter.
 
     Raises:
         ValueError: If either pipeline is ``None``.
@@ -76,6 +86,7 @@ class EnterpriseMemoryEngine:
         ingestion_pipeline: IngestionPipeline,
         retrieval_pipeline: RetrievalPipeline,
         top_k: int = DEFAULT_TOP_K,
+        similarity_threshold: float | None = None,
     ) -> None:
         if ingestion_pipeline is None:
             raise ValueError("ingestion_pipeline must not be None.")
@@ -85,6 +96,7 @@ class EnterpriseMemoryEngine:
         self._ingest: IngestionPipeline = ingestion_pipeline
         self._retrieve: RetrievalPipeline = retrieval_pipeline
         self._top_k: int = max(1, int(top_k))
+        self._similarity_threshold: float | None = similarity_threshold
 
     # ------------------------------------------------------------------
     # Write path — called from Orchestrator.finalize_incident()
@@ -254,6 +266,9 @@ class EnterpriseMemoryEngine:
         except Exception as exc:  # noqa: BLE001
             logger.error("recall_similar_incidents | search failed | error=%s", exc)
             return []
+
+        if self._similarity_threshold is not None:
+            hits = [h for h in hits if (h.get("similarity") or 0.0) >= self._similarity_threshold]
 
         matches: list[dict[str, Any]] = []
         for hit in hits:

@@ -62,7 +62,16 @@ def get_observability_summary(request: Request) -> JSONResponse:
         ``ObservabilityEngine.summarize`` for the full field list).
         ``500`` — Unexpected failure (DB error or summarization error).
     """
-    db = request.app.state.container.db
+    container = request.app.state.container
+    db = container.db
+    # Phase D4 Enterprise Configuration Engine: read-only override lookup.
+    # `settings` may be absent (e.g. a minimal test app) -- falls back to
+    # the module-level, all-defaults engine/unbounded read exactly as
+    # before this phase.
+    settings = getattr(container, "settings", None)
+    trend_window = getattr(settings, "OBSERVABILITY_TREND_WINDOW", None) if settings else None
+    retention_limit = getattr(settings, "OBSERVABILITY_RETENTION_LIMIT", None) if settings else None
+    engine = ObservabilityEngine(trend_window=trend_window) if trend_window is not None else _engine
 
     try:
         rows: list[dict[str, Any]] = _fetch_all(db, _SELECT_ALL_INCIDENTS)
@@ -72,6 +81,12 @@ def get_observability_summary(request: Request) -> JSONResponse:
             status_code=500,
             detail="Failed to retrieve incidents from the database.",
         ) from exc
+
+    # Read-time windowing cap only -- rows arrive newest-first (same order
+    # GET /api/v1/incidents/ returns), so this keeps the N most recent
+    # incidents. Never deletes or alters any persisted incident row.
+    if retention_limit is not None:
+        rows = rows[:retention_limit]
 
     incidents: list[dict[str, Any]] = []
     for row in rows:
@@ -85,7 +100,7 @@ def get_observability_summary(request: Request) -> JSONResponse:
         incidents.append(incident)
 
     try:
-        summary = _engine.summarize(incidents)
+        summary = engine.summarize(incidents)
     except Exception as exc:  # noqa: BLE001
         logger.error("get_observability_summary | summarization failed: %s", exc)
         raise HTTPException(
