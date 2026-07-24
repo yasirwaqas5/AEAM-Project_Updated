@@ -4,6 +4,12 @@
 #
 # Triggers: push to main, pull requests
 # Stages:   test → build → deploy (main only)
+#
+# Phase E1: the test job is a REAL gate — no `|| true`.
+# Service containers provide Postgres and Redis so tests that
+# need them (data-center, action-agent idempotency) can run.
+# Tests that self-skip when a service is absent (Qdrant) still
+# skip cleanly; all others must pass for the pipeline to green.
 # ============================================================
 
 name: AEAM CI/CD
@@ -23,6 +29,31 @@ jobs:
     name: Run Tests
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -40,13 +71,14 @@ jobs:
           pip install pytest pytest-cov
 
       - name: Run tests
-        run: python -m pytest || true
+        run: python -m pytest --tb=short -q
         env:
           DATABASE_URL: "postgresql://postgres:password@localhost:5432/postgres"
           REDIS_URL: "redis://localhost:6379/0"
           VECTOR_DB_URL: "http://localhost:6333"
           ENVIRONMENT: "test"
           LLM_ENABLED: "false"
+          HF_HOME: "${{ runner.temp }}/hf_cache"
 
   # ────────────────────────────────────────────────────────
   # Stage 2: Build Docker image

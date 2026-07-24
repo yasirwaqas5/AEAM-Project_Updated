@@ -16,8 +16,11 @@ Infrastructure: SQLite on a temp path only — no live services required
 
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
+
+import pytest
 
 from aeam.integrations.database import DatabaseClient
 
@@ -96,3 +99,17 @@ def test_fetch_metric_history_filters_by_metric(tmp_path):
         assert all(isinstance(r["value"], float) for r in rows)
     finally:
         client.dispose()
+
+
+# ---------------------------------------------------------------------------
+# CI gate canary (E1, CODE-1)
+# ---------------------------------------------------------------------------
+
+def test_ci_gate_is_real():
+    """Red-canary: set AEAM_CI_RED_CANARY=1 to make this test FAIL on
+    purpose, proving that `|| true` has been removed and the CI pipeline
+    actually gates on test failures. Under normal runs this always passes."""
+    assert os.environ.get("AEAM_CI_RED_CANARY") != "1", (
+        "Red-canary tripped — this failure is intentional. "
+        "If CI still shows green, the gate is broken."
+    )
