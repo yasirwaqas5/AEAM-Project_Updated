@@ -16,3 +16,5 @@ frontend/dist/
 
 # Local tool configs (not project source)
 .abacusai/
+# Accidental PowerShell redirect artifact — never track
+$null
