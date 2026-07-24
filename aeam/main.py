@@ -83,8 +83,10 @@ from qdrant_client import QdrantClient
 from aeam.agents.orchestrator.orchestrator import Orchestrator
 from aeam.agents.orchestrator.decision_engine import DecisionEngine
 from aeam.agents.orchestrator.evaluation_engine import EvaluationEngine
-from aeam.agents.orchestrator.state_machine import IncidentStateMachine
-from aeam.memory.short_term import ShortTermMemory
+# Phase E2 (ARCH-8): the Orchestrator allocates its own per-incident
+# ShortTermMemory and IncidentStateMachine inside handle_event(), so this
+# module no longer constructs shared singletons for them. See
+# aeam.agents.orchestrator.incident_context for the isolation contract.
 from aeam.memory.long_term import LongTermMemory
 
 # Phase 8 Security imports
@@ -335,7 +337,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Ensure compatibility with DecisionEngine's protocol
     decision_engine = DecisionEngine(settings=settings, llm_service=llm_service)
     evaluation_engine = EvaluationEngine(settings=settings)
-    short_term_memory = ShortTermMemory()
+    # Phase E2 (ARCH-8): no shared ShortTermMemory singleton — the
+    # Orchestrator allocates a fresh one per incident inside handle_event().
     class _NoOpVectorClient:
         def upsert(self, *args, **kwargs):
             pass
@@ -352,7 +355,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         database_client=container.db,
         vector_client=vector_client,
     )
-    state_machine = IncidentStateMachine()
+    # Phase E2 (ARCH-8): no shared IncidentStateMachine singleton — the
+    # Orchestrator allocates a fresh one per incident inside handle_event().
 
     # --- Forecast Agent (Phase 5) ---
     forecast_agent = ForecastAgent(
@@ -842,13 +846,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     # --- Orchestrator ---
+    # Phase E2 (ARCH-8): STM and FSM are per-incident inside the Orchestrator;
+    # this call no longer passes shared singletons for them (see the design
+    # note above and aeam/agents/orchestrator/incident_context.py).
     orchestrator = Orchestrator(
         event_bus=container.event_bus,
         decision_engine=decision_engine,
         evaluation_engine=evaluation_engine,
-        short_term_memory=short_term_memory,
         long_term_memory=long_term_memory,
-        state_machine=state_machine,
         settings=settings,
         rag_agent=rag_agent,
         action_agent=action_agent,
