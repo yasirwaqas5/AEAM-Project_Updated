@@ -79,12 +79,24 @@ def create_test_event():
 
 
 def test_state_transitions_to_complete():
+    """
+    Phase E2, ARCH-8: the FSM passed to ``Orchestrator.__init__`` is
+    ignored; each incident gets its own FSM inside ``handle_event``.
+    We can no longer observe the shared FSM's state — the only durable
+    proof that finalization completed is the ``LongTermMemory.record_incident``
+    payload the orchestrator emits at the end of the lifecycle. Assert
+    on that instead.
+    """
     orchestrator, ltm, stm, sm = build_test_orchestrator()
     event = create_test_event()
 
     orchestrator.handle_event(event)
 
-    assert sm.get_state() == IncidentState.COMPLETE
+    # LTM was written -> finalize_incident() ran end-to-end.
+    assert ltm.recorded is not None
+    assert ltm.recorded["event_id"] == event.event_id
+    # The shared FSM stayed IDLE (never touched under E2).
+    assert sm.get_state() == IncidentState.IDLE
 
 
 def test_investigation_depth_increments():
@@ -108,12 +120,21 @@ def test_stop_triggers_record_incident():
 
 
 def test_stm_cleared_after_finalize():
+    """
+    Phase E2, ARCH-8: the shared STM passed to ``Orchestrator.__init__``
+    is ignored — a fresh per-incident STM is allocated inside
+    ``handle_event`` and cleared at the end of ``_finalize_incident``.
+    The pre-E2 assertion "shared STM raises RuntimeError afterward"
+    trivially holds (it was never initialised), so the meaningful check
+    is that finalize_incident ran end-to-end (LTM was written).
+    """
     orchestrator, ltm, stm, sm = build_test_orchestrator()
     event = create_test_event()
 
     orchestrator.handle_event(event)
 
-    # STM should be uninitialised after finalize
+    assert ltm.recorded is not None
+    # The passed-in STM was ignored — it was never initialised.
     with pytest.raises(RuntimeError):
         stm.get("event")
 

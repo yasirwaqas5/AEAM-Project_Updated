@@ -6,14 +6,25 @@ Central coordination logic for the AEAM modular monolith.
 The Orchestrator drives the full incident lifecycle:
     EVENT_RECEIVED → INVESTIGATING → DECIDING → … → COMPLETE
 
-It wires together the DecisionEngine, EvaluationEngine, state machine,
-short-term memory, and long-term persistence without containing any
-detection logic, LLM calls, Action Agent calls, RAG, forecasting, or
-direct database writes.
+It wires together the DecisionEngine, EvaluationEngine, per-incident
+state machine, per-incident short-term memory, and long-term persistence
+without containing any detection logic, LLM calls, Action Agent calls,
+RAG, forecasting, or direct database writes.
 
-All dependencies are injected; the Orchestrator itself is stateless between
-incidents — per-incident state lives entirely in the injected
-ShortTermMemory and IncidentStateMachine.
+**Concurrency (Phase E2, ARCH-8).** ``handle_event`` is fully reentrant:
+every call allocates a fresh :class:`IncidentContext` holding this
+incident's own :class:`ShortTermMemory` and :class:`IncidentStateMachine`,
+and threads it through every internal helper. Nothing per-incident lives
+on the Orchestrator instance. Two threads driving ``handle_event``
+concurrently — Monitor + HTTP trigger, or N parallel triggers — cannot
+cross-contaminate each other's STM, FSM, or active event.
+
+All dependencies are injected; the Orchestrator itself is stateless
+between incidents. Its collaborators (event bus, decision/evaluation
+engines, long-term memory, RAG/Action/Report agents, C1-D2 engines) are
+shared across incidents on purpose — they are either read-only or
+individually thread-safe. Only per-incident state was ever the concurrency
+hazard; that is what E2 relocates.
 """
 
 from __future__ import annotations
@@ -21,10 +32,12 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+import warnings
 from typing import TYPE_CHECKING, Any
 
 from aeam.agents.orchestrator.decision_engine import DecisionEngine
 from aeam.agents.orchestrator.evaluation_engine import EvaluationEngine
+from aeam.agents.orchestrator.incident_context import IncidentContext
 from aeam.agents.orchestrator.investigation_status import derive_investigation_status
 from aeam.agents.orchestrator.notifications import format_jira_description, format_slack_message
 from aeam.agents.orchestrator.runbooks import get_runbook, resolve_action_step
@@ -62,8 +75,12 @@ class Orchestrator:
     investigation loop, and persists outcomes to long-term memory.
 
     The Orchestrator:
-    - Manages per-incident state via :class:`~aeam.agents.orchestrator.state_machine.IncidentStateMachine`.
-    - Stores transient investigation context in :class:`~aeam.memory.short_term.ShortTermMemory`.
+    - Allocates a fresh per-incident
+      :class:`~aeam.agents.orchestrator.state_machine.IncidentStateMachine`
+      and :class:`~aeam.memory.short_term.ShortTermMemory` inside
+      :meth:`handle_event`, bundled into an
+      :class:`~aeam.agents.orchestrator.incident_context.IncidentContext`
+      that is threaded through every internal helper (Phase E2, ARCH-8).
     - Delegates action decisions to :class:`~aeam.agents.orchestrator.decision_engine.DecisionEngine`.
     - Determines loop termination via :class:`~aeam.agents.orchestrator.evaluation_engine.EvaluationEngine`.
     - Persists resolved incidents via :class:`~aeam.memory.long_term.LongTermMemory`.
@@ -80,13 +97,24 @@ class Orchestrator:
         event_bus:         Internal event dispatcher (used to register handler).
         decision_engine:   Hybrid rule-first decision engine.
         evaluation_engine: Investigation progress evaluator.
-        short_term_memory: Ephemeral per-incident working memory.
         long_term_memory:  Persistent incident and decision store.
-        state_machine:     Finite state machine governing incident lifecycle.
         settings:          Application configuration.
         rag_agent:         Optional RAG agent for Phase 4 (default None).
         action_agent:      Optional Action agent for Phase 6 (default None).
         report_agent:      Optional Report agent for Phase 7 (default None).
+        short_term_memory: DEPRECATED (Phase E2). A per-incident STM is
+                           allocated internally; anything passed here is
+                           ignored and triggers a DeprecationWarning.
+                           Accepted only so pre-E2 constructor call
+                           sites keep compiling (COMPAT-1).
+        state_machine:     DEPRECATED (Phase E2). Same treatment.
+
+    **Concurrency contract (Phase E2, ARCH-8).** ``handle_event`` is
+    fully reentrant. N threads may drive it concurrently — the Monitor
+    thread and any number of Starlette threadpool workers running
+    ``POST /trigger`` — without cross-contamination. Every incident is
+    scoped by its own IncidentContext; the Orchestrator holds no
+    per-incident instance attributes.
 
     Example::
 
@@ -94,9 +122,7 @@ class Orchestrator:
             event_bus=bus,
             decision_engine=decision_engine,
             evaluation_engine=evaluation_engine,
-            short_term_memory=stm,
             long_term_memory=ltm,
-            state_machine=IncidentStateMachine(),
             settings=settings,
             rag_agent=rag_agent,      # optional
             action_agent=action_agent, # optional
@@ -111,9 +137,7 @@ class Orchestrator:
         event_bus: EventBus,
         decision_engine: DecisionEngine,
         evaluation_engine: EvaluationEngine,
-        short_term_memory: ShortTermMemory,
         long_term_memory: LongTermMemory,
-        state_machine: IncidentStateMachine,
         settings: Settings,
         rag_agent: Any | None = None,
         action_agent: Any | None = None,  # Phase 6
@@ -125,13 +149,13 @@ class Orchestrator:
         execution_planning_engine: Any | None = None,  # Phase C7 — Enterprise Action Planning Engine
         explainability_engine: Any | None = None,  # Phase D1 — Enterprise Explainability Engine
         ai_evaluation_engine: Any | None = None,  # Phase D2 — Enterprise AI Evaluation & Quality Engine
+        short_term_memory: ShortTermMemory | None = None,   # DEPRECATED (Phase E2) — see class docstring
+        state_machine: IncidentStateMachine | None = None,  # DEPRECATED (Phase E2) — see class docstring
     ) -> None:
         self._bus = event_bus
         self._decision = decision_engine
         self._evaluation = evaluation_engine
-        self._stm = short_term_memory
         self._ltm = long_term_memory
-        self._sm = state_machine
         self._settings = settings
         self._rag = rag_agent
         self._action = action_agent  # Phase 6
@@ -144,12 +168,23 @@ class Orchestrator:
         self._explainability_engine = explainability_engine  # Phase D1
         self._ai_evaluator = ai_evaluation_engine  # Phase D2
 
-        # Track the active event for the duration of a handle_event() call.
-        self._active_event: Event | None = None
-        # Wall-clock start of the current incident lifecycle, for the
-        # investigation_duration histogram (set in handle_event(), consumed
-        # and cleared in finalize_incident()).
-        self._investigation_started_at: float | None = None
+        # Phase E2, ARCH-8: no per-incident instance attributes. STM,
+        # FSM, active event, and investigation_started_at all live on the
+        # per-invocation IncidentContext instead. The kwargs above are
+        # retained purely so pre-E2 construction sites (tests, older
+        # bootstrap code) keep compiling; the concurrency bug they used
+        # to cause is now impossible because the injected objects are
+        # ignored and per-incident instances are allocated inside
+        # handle_event(). One-shot DeprecationWarning surfaces the change.
+        if short_term_memory is not None or state_machine is not None:
+            warnings.warn(
+                "Orchestrator no longer accepts a shared ShortTermMemory or "
+                "IncidentStateMachine (Phase E2, ARCH-8). A fresh per-incident "
+                "instance is allocated inside handle_event(). The passed-in "
+                "objects are ignored.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -159,13 +194,18 @@ class Orchestrator:
         """
         Entry point for a confirmed anomaly event.
 
-        Steps:
-        1. Generate a new ``incident_id`` for this lifecycle.
-        2. Reset and re-initialise the state machine.
-        3. Initialise :class:`~aeam.memory.short_term.ShortTermMemory`.
-        4. Transition FSM to ``EVENT_RECEIVED``.
-        5. Store the event in STM.
-        6. Delegate to :meth:`investigate`.
+        Allocates a fresh :class:`IncidentContext` (per-incident STM,
+        per-incident FSM, per-incident started_at), seeds it, and drives
+        the investigation loop through :meth:`_investigate`. This is the
+        ONLY public method that mutates incident state — every internal
+        helper reads from and writes to the ctx passed in, never to
+        instance attributes.
+
+        Concurrency (Phase E2, ARCH-8): reentrant. Two threads calling
+        ``handle_event`` at the same time — Monitor + trigger, or two
+        triggers, or any mixture — receive their own IncidentContext and
+        cannot cross-contaminate. The Orchestrator itself is stateless
+        with respect to the incident.
 
         Args:
             event: The confirmed :class:`~aeam.core.event_models.Event`
@@ -178,13 +218,17 @@ class Orchestrator:
                 bus.register_handler("KPI_ANOMALY", orchestrator.handle_event)
         """
         incident_id = str(uuid.uuid4())
-        self._sm.reset()
-        self._active_event = event
+        ctx = IncidentContext(
+            incident_id=incident_id,
+            event=event,
+            stm=ShortTermMemory(),
+            state_machine=IncidentStateMachine(incident_id=incident_id),
+            started_at=start_timer(),
+        )
 
         # Metrics: one incident counted, one active investigation started.
         incidents_total.labels(event_type=event.event_type, severity=event.severity).inc()
         active_incidents.inc()
-        self._investigation_started_at = start_timer()
 
         logger.info(
             "Orchestrator.handle_event | incident_id=%s | event_id=%s | "
@@ -192,38 +236,38 @@ class Orchestrator:
             incident_id, event.event_id, event.metric, event.severity,
         )
 
-        # Initialise STM for this incident.
-        self._stm.initialize(
+        # Initialise this incident's private STM.
+        ctx.stm.initialize(
             task_type="anomaly_investigation",
             incident_id=incident_id,
         )
-        self._stm.set("investigation_depth", 0)
-        self._stm.set("findings", [])
-        self._stm.set("hypotheses", [])
-        self._stm.set("evidence", [])
-        self._stm.set("confidence", None)
-        self._stm.set("root_cause", None)
+        ctx.stm.set("investigation_depth", 0)
+        ctx.stm.set("findings", [])
+        ctx.stm.set("hypotheses", [])
+        ctx.stm.set("evidence", [])
+        ctx.stm.set("confidence", None)
+        ctx.stm.set("root_cause", None)
         # Provenance of the root cause (Phase E1, ENG-5): "rag" |
         # "llm_reasoning" | "placeholder" | None. Every writer of
-        # "root_cause" also writes this, so finalize_incident() can
+        # "root_cause" also writes this, so _finalize_incident can
         # quarantine placeholder-derived conclusions from Enterprise Memory
         # and the UI can label them.
-        self._stm.set("root_cause_source", None)
-        self._stm.set("action_taken", False)
-        self._stm.set("requires_human", False)
+        ctx.stm.set("root_cause_source", None)
+        ctx.stm.set("action_taken", False)
+        ctx.stm.set("requires_human", False)
 
         # Transition FSM and store event.
-        self._sm.transition(IncidentState.EVENT_RECEIVED)
-        self._stm.set("event", event.model_dump(mode="json"))
-        self._stm.set("incident_id", incident_id)   # <-- added: store incident_id in STM
+        ctx.state_machine.transition(IncidentState.EVENT_RECEIVED)
+        ctx.stm.set("event", event.model_dump(mode="json"))
+        ctx.stm.set("incident_id", incident_id)
 
         logger.debug(
             "handle_event | STM initialised | incident_id=%s", incident_id
         )
 
-        self.investigate()
+        self._investigate(ctx)
 
-    def investigate(self) -> None:
+    def _investigate(self, ctx: IncidentContext) -> None:
         """
         Perform one investigation pass.
 
@@ -242,33 +286,31 @@ class Orchestrator:
             RuntimeError: If called without an active event (i.e. before
                           :meth:`handle_event`).
         """
-        if self._active_event is None:
-            raise RuntimeError(
-                "investigate() called with no active event. "
-                "Call handle_event() first."
-            )
+        # Phase E2, ARCH-8: ctx.event is always the event we were
+        # invoked for — there is no more "no active event" failure
+        # mode, because the ctx cannot exist without one.
 
         # --- Step 1 & 2: transition + depth increment ---
-        self._sm.transition(IncidentState.INVESTIGATING)
+        ctx.state_machine.transition(IncidentState.INVESTIGATING)
 
-        depth: int = (self._stm.get("investigation_depth") or 0)
+        depth: int = (ctx.stm.get("investigation_depth") or 0)
         depth += 1
-        self._stm.set("investigation_depth", depth)
+        ctx.stm.set("investigation_depth", depth)
 
         logger.info(
             "investigate | depth=%d | event_id=%s",
-            depth, self._active_event.event_id,
+            depth, ctx.event.event_id,
         )
 
         # --- Step 3: decide ---
         decision_result = self._decision.decide(
-            event=self._active_event,
-            memory=self._stm,
+            event=ctx.event,
+            memory=ctx.stm,
         )
 
         # ✅ NEW: store LLM response if present (from the decision engine)
         if decision_result.get("source") == "llm":
-            self._stm.set("llm_response", decision_result.get("llm_response", ""))
+            ctx.stm.set("llm_response", decision_result.get("llm_response", ""))
 
         action: str = decision_result.get("decision", "INVESTIGATE")
         confidence: float = float(decision_result.get("confidence", 0.0))
@@ -279,7 +321,7 @@ class Orchestrator:
         )
 
         # Log the decision to STM for evaluation and audit.
-        self._stm.append("findings", {
+        ctx.stm.append("findings", {
             "depth": depth,
             "decision": action,
             "confidence": confidence,
@@ -287,12 +329,12 @@ class Orchestrator:
         })
 
         # --- Step 4: transition to DECIDING ---
-        if self._sm.get_state() != IncidentState.DECIDING:
-            self._sm.transition(IncidentState.DECIDING)
+        if ctx.state_machine.get_state() != IncidentState.DECIDING:
+            ctx.state_machine.transition(IncidentState.DECIDING)
 
         # --- Step 5: act on decision ---
         if action == "STOP":
-            self.finalize_incident()
+            self._finalize_incident(ctx)
             return
 
         if action != "INVESTIGATE":
@@ -300,7 +342,7 @@ class Orchestrator:
                 "investigate | unknown decision %r | defaulting to finalize",
                 action,
             )
-            self.finalize_incident()
+            self._finalize_incident(ctx)
             return
 
         # ---------- INVESTIGATE path ----------
@@ -316,10 +358,10 @@ class Orchestrator:
         # helper document RAG itself calls) so memory and document
         # retrieval search on identical vocabulary -- no duplicate query
         # logic. A missing/failed memory engine never blocks investigation.
-        if self._memory is not None and not self._has_memory_finding():
-            memory_incident_id = self._stm.get("incident_id", "unknown")
+        if self._memory is not None and not self._has_memory_finding(ctx):
+            memory_incident_id = ctx.stm.get("incident_id", "unknown")
             try:
-                memory_query = RAGAgent._formulate_query(self._active_event)
+                memory_query = RAGAgent._formulate_query(ctx.event)
                 similar_incidents = self._memory.recall_similar_incidents(
                     query=memory_query,
                     exclude_incident_id=memory_incident_id,
@@ -329,7 +371,7 @@ class Orchestrator:
                 memory_query = None
                 similar_incidents = []
 
-            self._stm.append("findings", {
+            ctx.stm.append("findings", {
                 "type": "memory",
                 "data": {
                     "query": memory_query,
@@ -351,12 +393,12 @@ class Orchestrator:
         # and NEVER passed to RuleEngine.evaluate(), DecisionEngine, or
         # ActionAgent -- they cannot trigger, suppress, or override a
         # deterministic rule.
-        if self._policy_registry is not None and not self._has_policy_finding():
-            policy_incident_id = self._stm.get("incident_id", "unknown")
+        if self._policy_registry is not None and not self._has_policy_finding(ctx):
+            policy_incident_id = ctx.stm.get("incident_id", "unknown")
             try:
-                policy_query = RAGAgent._formulate_query(self._active_event)
+                policy_query = RAGAgent._formulate_query(ctx.event)
                 policy_matches = self._policy_registry.match_for_incident(
-                    metric=self._active_event.metric,
+                    metric=ctx.event.metric,
                     query=policy_query,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -364,7 +406,7 @@ class Orchestrator:
                 policy_query = None
                 policy_matches = []
 
-            self._stm.append("findings", {
+            ctx.stm.append("findings", {
                 "type": "policy",
                 "data": {
                     "query": policy_query,
@@ -385,10 +427,10 @@ class Orchestrator:
         # unmodified -- no second MonitorAgent, no second RuleEngine, no
         # new detection logic. Advisory only: appended as its own findings
         # entry, never fed back into RuleEngine/DecisionEngine/ActionAgent.
-        if self._cross_dataset is not None and not self._has_cross_dataset_finding():
-            cross_incident_id = self._stm.get("incident_id", "unknown")
+        if self._cross_dataset is not None and not self._has_cross_dataset_finding(ctx):
+            cross_incident_id = ctx.stm.get("incident_id", "unknown")
             try:
-                cross_dataset_result = self._cross_dataset.analyze(metric=self._active_event.metric)
+                cross_dataset_result = self._cross_dataset.analyze(metric=ctx.event.metric)
             except Exception as exc:  # noqa: BLE001
                 logger.error("investigate | cross-dataset analysis failed: %s", exc)
                 cross_dataset_result = {
@@ -399,7 +441,7 @@ class Orchestrator:
                     "strong_correlations": [], "missing_signals": [],
                 }
 
-            self._stm.append("findings", {
+            ctx.stm.append("findings", {
                 "type": "cross_dataset",
                 "data": cross_dataset_result,
             })
@@ -422,13 +464,13 @@ class Orchestrator:
         # -- it never re-invokes ForecastAgent or MonitorAgent's own
         # detector, never calls RuleEngine.evaluate(), and never feeds back
         # into DecisionEngine/ActionAgent. Advisory only.
-        if self._adaptive_detection is not None and not self._has_adaptive_finding():
-            adaptive_incident_id = self._stm.get("incident_id", "unknown")
+        if self._adaptive_detection is not None and not self._has_adaptive_finding(ctx):
+            adaptive_incident_id = ctx.stm.get("incident_id", "unknown")
             try:
                 adaptive_result = self._adaptive_detection.analyze(
-                    metric=self._active_event.metric,
-                    current_value=self._active_event.current_value,
-                    event_metadata=self._active_event.metadata,
+                    metric=ctx.event.metric,
+                    current_value=ctx.event.current_value,
+                    event_metadata=ctx.event.metadata,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.error("investigate | adaptive detection failed: %s", exc)
@@ -444,7 +486,7 @@ class Orchestrator:
                     "corroborating_signals": [],
                 }
 
-            self._stm.append("findings", {
+            ctx.stm.append("findings", {
                 "type": "adaptive",
                 "data": adaptive_result,
             })
@@ -463,8 +505,8 @@ class Orchestrator:
 
             t = start_timer()
             rag_result = self._rag.investigate(
-                event=self._active_event,
-                memory=self._stm,
+                event=ctx.event,
+                memory=ctx.stm,
             )
             end_timer(agent_execution_time.labels(agent="rag"), t)
 
@@ -504,7 +546,7 @@ class Orchestrator:
             # so query attempts, validation outcome, and evidence are always
             # available to the dashboard/evidence/timeline instead of
             # silently disappearing whenever RAG fails to find a root cause.
-            self._stm.append("findings", {
+            ctx.stm.append("findings", {
                 "type": "rag",
                 "depth": depth,
                 "confidence": rag_confidence,
@@ -514,15 +556,15 @@ class Orchestrator:
             # Persist the full RAG result for this pass unconditionally
             # (previously only set on success, which is why a failed pass
             # left the dashboard with nothing to show).
-            self._stm.set("llm_response", json.dumps(rag_result, default=str))
+            ctx.stm.set("llm_response", json.dumps(rag_result, default=str))
 
             # Promote the grounded root cause into STM so finalize_incident()
             # persists it — and so the KPI placeholder does not overwrite it.
             if rag_root_cause and not no_knowledge:
-                self._stm.set("root_cause", rag_root_cause)
-                self._stm.set("root_cause_source", "rag")
-                existing_conf = float(self._stm.get("confidence") or 0.0)
-                self._stm.set(
+                ctx.stm.set("root_cause", rag_root_cause)
+                ctx.stm.set("root_cause_source", "rag")
+                existing_conf = float(ctx.stm.get("confidence") or 0.0)
+                ctx.stm.set(
                     "confidence",
                     round(max(existing_conf, rag_confidence), 2),
                 )
@@ -530,9 +572,9 @@ class Orchestrator:
             # Map possible_causes into STM evidence with full grounding metadata.
             if isinstance(rag_findings, dict):
                 for h in memory_updates.get("hypotheses", []):
-                    self._stm.append("hypotheses", h)
+                    ctx.stm.append("hypotheses", h)
                 for cause in rag_findings.get("possible_causes", []):
-                    self._stm.append("evidence", {
+                    ctx.stm.append("evidence", {
                         "source": "rag",
                         "chunk_id": cause.get("chunk_id"),
                         "cause": cause.get("cause"),
@@ -542,10 +584,10 @@ class Orchestrator:
             # Escalation signal from the actual contract.
             requires_human = rag_findings.get("requires_human_review") if isinstance(rag_findings, dict) else None
             if requires_human is True:
-                self._stm.set("requires_human", True)
+                ctx.stm.set("requires_human", True)
 
         # Always run the KPI placeholder (can be replaced later with actual KPI Agent)
-        self._run_kpi_investigation_placeholder()
+        self._run_kpi_investigation_placeholder(ctx)
 
         # ---------- Force LLM reasoning at depth >= 3 ----------
         if depth >= 3 and self._settings.LLM_ENABLED:
@@ -558,12 +600,12 @@ class Orchestrator:
                     f"You are an expert business analyst. Based on the following incident details, "
                     f"provide a concise root cause analysis and recommended actions.\n\n"
                     f"Incident:\n"
-                    f"- Metric: {self._active_event.metric}\n"
-                    f"- Current value: {self._active_event.current_value}\n"
-                    f"- Expected value: {self._active_event.expected_value}\n"
-                    f"- Severity: {self._active_event.severity}\n"
-                    f"- Detection methods: {', '.join(self._active_event.detection_methods)}\n\n"
-                    f"Short‑Term Memory findings:\n{self._stm.serialize_for_llm()}\n\n"
+                    f"- Metric: {ctx.event.metric}\n"
+                    f"- Current value: {ctx.event.current_value}\n"
+                    f"- Expected value: {ctx.event.expected_value}\n"
+                    f"- Severity: {ctx.event.severity}\n"
+                    f"- Detection methods: {', '.join(ctx.event.detection_methods)}\n\n"
+                    f"Short‑Term Memory findings:\n{ctx.stm.serialize_for_llm()}\n\n"
                     f"Return ONLY a valid JSON object, no other text, with these keys:\n"
                     f'{{"root_cause": "...", "confidence": 0.0, "recommended_action": "..."}}'
                 )
@@ -585,7 +627,7 @@ class Orchestrator:
                     # root cause from unparseable output. The placeholder
                     # root cause already set by
                     # _run_kpi_investigation_placeholder() is left intact.
-                    self._stm.append("findings", {
+                    ctx.stm.append("findings", {
                         "type": "llm_reasoning_error",
                         "depth": depth,
                         "reason": "LLM response could not be parsed as JSON.",
@@ -593,19 +635,19 @@ class Orchestrator:
                     })
                 else:
                     # Update STM with the LLM output
-                    self._stm.set("root_cause", insight.get("root_cause", "Unknown"))
-                    self._stm.set("root_cause_source", "llm_reasoning")
-                    self._stm.set("confidence", insight.get("confidence", 0.0))
-                    self._stm.set("llm_response", raw)
+                    ctx.stm.set("root_cause", insight.get("root_cause", "Unknown"))
+                    ctx.stm.set("root_cause_source", "llm_reasoning")
+                    ctx.stm.set("confidence", insight.get("confidence", 0.0))
+                    ctx.stm.set("llm_response", raw)
 
                     logger.info("investigate | LLM reasoning stored successfully")
             except Exception as exc:
                 logger.warning("investigate | LLM reasoning failed: %s", exc)
                 # Keep the existing placeholder root cause (already set in _run_kpi_investigation_placeholder)
 
-        self.evaluate()
+        self._evaluate(ctx)
 
-    def evaluate(self) -> None:
+    def _evaluate(self, ctx: IncidentContext) -> None:
         """
         Evaluate investigation progress and route to the next lifecycle step.
 
@@ -618,7 +660,7 @@ class Orchestrator:
         - ``"ESCALATE"``  → mark ``requires_human`` in STM, call
           :meth:`finalize_incident`.
         """
-        eval_result = self._evaluation.evaluate(memory=self._stm)
+        eval_result = self._evaluation.evaluate(memory=ctx.stm)
         eval_decision: str = eval_result.get("decision", "CONTINUE")
         score: float = float(eval_result.get("score", 0.0))
         reasons: list[str] = eval_result.get("reasons", [])
@@ -628,7 +670,7 @@ class Orchestrator:
             eval_decision, score, reasons,
         )
 
-        self._stm.append("findings", {
+        ctx.stm.append("findings", {
             "type": "evaluation",
             "decision": eval_decision,
             "score": score,
@@ -636,7 +678,7 @@ class Orchestrator:
         })
 
         if eval_decision == "CONTINUE":
-            self.investigate()
+            self._investigate(ctx)
 
         elif eval_decision == "STOP":
             # All external notifications/actions are dispatched exactly once,
@@ -644,27 +686,27 @@ class Orchestrator:
             # structured Slack/Jira formatters). Sending an alert here too
             # would both duplicate that notification and dump raw serialized
             # findings as message text instead of a structured summary.
-            self.finalize_incident()
+            self._finalize_incident(ctx)
 
         elif eval_decision == "ESCALATE":
             logger.warning(
                 "evaluate | ESCALATE triggered | marking requires_human"
             )
-            self._stm.set("requires_human", True)
-            self._stm.append("findings", {
+            ctx.stm.set("requires_human", True)
+            ctx.stm.append("findings", {
                 "type": "escalation",
                 "reason": "Max investigation depth reached without resolution.",
             })
-            self.finalize_incident()
+            self._finalize_incident(ctx)
 
         else:
             logger.warning(
                 "evaluate | unknown eval decision %r | defaulting to finalize",
                 eval_decision,
             )
-            self.finalize_incident()
+            self._finalize_incident(ctx)
 
-    def finalize_incident(self) -> None:
+    def _finalize_incident(self, ctx: IncidentContext) -> None:
         """
         Close the incident, execute its safe runbook, notify, persist, and clean up.
 
@@ -707,33 +749,33 @@ class Orchestrator:
            ``findings`` JSON column).
         11. Clear STM and reset ``_active_event``.
         """
-        if self._sm.get_state() == IncidentState.COMPLETE:
+        if ctx.state_machine.get_state() == IncidentState.COMPLETE:
             logger.info("finalize_incident | already COMPLETE; skipping duplicate finalize")
             return
 
         logger.info("finalize_incident | transitioning to COMPLETE")
-        self._sm.transition(IncidentState.COMPLETE)
+        ctx.state_machine.transition(IncidentState.COMPLETE)
 
         # Metrics: one active investigation ended. The COMPLETE-state guard
         # above already prevents finalize_incident() from running twice for
         # the same incident, so this dec()/observe() pair can never double-count.
         active_incidents.dec()
-        if self._investigation_started_at is not None:
-            end_timer(investigation_duration, self._investigation_started_at)
-            self._investigation_started_at = None
+        if ctx.started_at is not None:
+            end_timer(investigation_duration, ctx.started_at)
+            ctx.started_at = None
 
-        event_data: dict[str, Any] = self._stm.get("event") or {}
-        incident_id: str = self._stm.get("incident_id", "unknown")
-        root_cause = self._stm.get("root_cause")
+        event_data: dict[str, Any] = ctx.stm.get("event") or {}
+        incident_id: str = ctx.stm.get("incident_id", "unknown")
+        root_cause = ctx.stm.get("root_cause")
         # Provenance written by whichever component set root_cause (Phase E1,
         # ENG-5): "rag" | "llm_reasoning" | "placeholder" | None.
-        root_cause_source = self._stm.get("root_cause_source")
-        requires_human = bool(self._stm.get("requires_human"))
-        confidence = self._stm.get("confidence")
+        root_cause_source = ctx.stm.get("root_cause_source")
+        requires_human = bool(ctx.stm.get("requires_human"))
+        confidence = ctx.stm.get("confidence")
 
         # --- Derive validation status + latest RAG snapshot for reporting. ---
-        latest_rag = self._latest_rag_finding()
-        query_attempts = self._collect_query_attempts()
+        latest_rag = self._latest_rag_finding(ctx)
+        query_attempts = self._collect_query_attempts(ctx)
 
         if latest_rag is None:
             validation_status = "SKIPPED"
@@ -774,11 +816,11 @@ class Orchestrator:
         # so it is genuinely "the final reasoning stage before Human Review
         # and ActionAgent" the mission describes. Performs NO retrieval, NO
         # detection, and calls ActionAgent/RuleEngine/DecisionEngine
-        # nothing -- it only reads self._stm.get("findings") and the
+        # nothing -- it only reads ctx.stm.get("findings") and the
         # already-resolved runbook, and appends its own advisory findings
         # entry. ActionAgent.execute() and the action_plan loop below are
         # completely unchanged by this stage.
-        if self._execution_planner is not None and not self._has_execution_plan_finding():
+        if self._execution_planner is not None and not self._has_execution_plan_finding(ctx):
             try:
                 execution_plan = self._execution_planner.plan(
                     event_type=event_data.get("event_type", ""),
@@ -786,7 +828,7 @@ class Orchestrator:
                     severity=event_data.get("severity", ""),
                     current_value=event_data.get("current_value"),
                     expected_value=event_data.get("expected_value"),
-                    findings=self._stm.get("findings", []) or [],
+                    findings=ctx.stm.get("findings", []) or [],
                     root_cause=root_cause,
                     confidence=confidence,
                     requires_human=requires_human,
@@ -805,7 +847,7 @@ class Orchestrator:
                     "sources_consulted": {}, "sources_with_signal": {},
                 }
 
-            self._stm.append("findings", {
+            ctx.stm.append("findings", {
                 "type": "execution_plan",
                 "data": execution_plan,
             })
@@ -825,19 +867,19 @@ class Orchestrator:
         # was appended (it explains THAT finding -- read back from findings,
         # never a possibly-stale local variable), and BEFORE the runbook
         # action-execution loop below. Performs NO retrieval, NO detection,
-        # and calls no other engine -- it only reads self._stm.get("findings")
+        # and calls no other engine -- it only reads ctx.stm.get("findings")
         # (which now includes the execution_plan entry) and appends its own
         # advisory findings entry. Never alters recommended_actions/root_cause/
         # confidence -- purely explanatory.
-        if self._explainability_engine is not None and not self._has_explainability_finding():
+        if self._explainability_engine is not None and not self._has_explainability_finding(ctx):
             execution_plan_data: dict[str, Any] = {}
-            for entry in self._stm.get("findings", []) or []:
+            for entry in ctx.stm.get("findings", []) or []:
                 if isinstance(entry, dict) and entry.get("type") == "execution_plan":
                     execution_plan_data = entry.get("data") or {}
 
             try:
                 explainability_result = self._explainability_engine.explain(
-                    findings=self._stm.get("findings", []) or [],
+                    findings=ctx.stm.get("findings", []) or [],
                     execution_plan=execution_plan_data,
                     raw_confidence=confidence,
                 )
@@ -850,7 +892,7 @@ class Orchestrator:
                     "lower_priority_justification": {}, "insufficient_evidence": True,
                 }
 
-            self._stm.append("findings", {
+            ctx.stm.append("findings", {
                 "type": "explainability",
                 "data": explainability_result,
             })
@@ -871,10 +913,10 @@ class Orchestrator:
         # check and this defensive idempotency guard), strictly AFTER
         # explainability above and BEFORE the runbook action-execution loop.
         # Performs NO retrieval, NO detection, and calls no other engine.
-        if self._ai_evaluator is not None and not self._has_ai_evaluation_finding():
+        if self._ai_evaluator is not None and not self._has_ai_evaluation_finding(ctx):
             execution_plan_data_for_eval: dict[str, Any] = {}
             explainability_data_for_eval: dict[str, Any] | None = None
-            for entry in self._stm.get("findings", []) or []:
+            for entry in ctx.stm.get("findings", []) or []:
                 if isinstance(entry, dict) and entry.get("type") == "execution_plan":
                     execution_plan_data_for_eval = entry.get("data") or {}
                 elif isinstance(entry, dict) and entry.get("type") == "explainability":
@@ -882,7 +924,7 @@ class Orchestrator:
 
             try:
                 ai_evaluation_result = self._ai_evaluator.assess(
-                    findings=self._stm.get("findings", []) or [],
+                    findings=ctx.stm.get("findings", []) or [],
                     execution_plan=execution_plan_data_for_eval,
                     explainability=explainability_data_for_eval,
                     root_cause=root_cause,
@@ -897,7 +939,7 @@ class Orchestrator:
                     "quality_summary": f"AI evaluation failed: {exc}",
                 }
 
-            self._stm.append("findings", {
+            ctx.stm.append("findings", {
                 "type": "ai_evaluation",
                 "data": ai_evaluation_result,
             })
@@ -1036,7 +1078,7 @@ class Orchestrator:
         if self._report is not None:
             t = start_timer()
             try:
-                report = self._report.generate_report(memory=self._stm)
+                report = self._report.generate_report(memory=ctx.stm)
                 end_timer(agent_execution_time.labels(agent="report"), t)
             except Exception as exc:  # noqa: BLE001
                 end_timer(agent_execution_time.labels(agent="report"), t)
@@ -1054,7 +1096,7 @@ class Orchestrator:
         # frontend reads instead of reconstructing state from scattered
         # findings entries. Stored inside the existing "findings" JSON
         # column — no schema change.
-        self._stm.append("findings", {
+        ctx.stm.append("findings", {
             "type": "audit_summary",
             "investigation_status": investigation_status,
             "root_cause": root_cause,
@@ -1064,7 +1106,7 @@ class Orchestrator:
             "validation_status": validation_status,
             "validation_reason": validation_reason,
             "reranking": "not_applicable",
-            "escalation_reason": self._escalation_reason(investigation_status),
+            "escalation_reason": self._escalation_reason(ctx, investigation_status),
             "query_attempts": query_attempts,
             "evidence_count": evidence_count,
             "top_confidence": top_confidence,
@@ -1084,15 +1126,15 @@ class Orchestrator:
             "expected_value":      event_data.get("expected_value"),
             "detection_methods":   event_data.get("detection_methods", []),
             "timestamp":           event_data.get("timestamp"),
-            "investigation_depth": self._stm.get("investigation_depth"),
+            "investigation_depth": ctx.stm.get("investigation_depth"),
             "root_cause":          root_cause,
             "confidence":          confidence,
             # Reflects reality now: True only if >=1 action actually
             # succeeded (previously hardcoded False regardless of outcome).
             "action_taken":        bool(executed_actions),
             "requires_human":      requires_human,
-            "findings":            self._stm.get("findings", []),
-            "llm_response":        self._stm.get("llm_response", ""),
+            "findings":            ctx.stm.get("findings", []),
+            "llm_response":        ctx.stm.get("llm_response", ""),
         }
 
         try:
@@ -1144,16 +1186,18 @@ class Orchestrator:
             [s["action"] for s in skipped_actions],
         )
 
-        # Clean up.
-        self._stm.clear()
-        self._active_event = None
+        # Clean up: ctx itself is a stack-local and will be garbage-
+        # collected as _finalize_incident returns. STM.clear() is a
+        # cheap defense-in-depth: even if a bug held a reference to
+        # ctx.stm past return, the sensitive incident state is gone.
+        ctx.stm.clear()
         logger.info("finalize_incident | STM cleared | lifecycle complete")
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _escalation_reason(self, investigation_status: str) -> str | None:
+    def _escalation_reason(self, ctx: IncidentContext, investigation_status: str) -> str | None:
         """
         Return the ACTUAL reason this incident was escalated, or None if it
         was not escalated at all.
@@ -1173,7 +1217,7 @@ class Orchestrator:
         if investigation_status != "ESCALATED":
             return None
 
-        findings = self._stm.get("findings", []) or []
+        findings = ctx.stm.get("findings", []) or []
         if any(isinstance(f, dict) and f.get("type") == "escalation" for f in findings):
             return "Max investigation depth reached without resolution."
 
@@ -1182,7 +1226,7 @@ class Orchestrator:
             "(borderline confidence or ambiguous grounded finding)."
         )
 
-    def _latest_rag_finding(self) -> dict[str, Any] | None:
+    def _latest_rag_finding(self, ctx: IncidentContext) -> dict[str, Any] | None:
         """
         Return the ``data`` dict of the most recent RAG pass recorded in
         STM findings for the current incident.
@@ -1191,7 +1235,7 @@ class Orchestrator:
             The last ``type == "rag"`` finding's ``data`` dict, or ``None``
             if RAG has not been invoked at all this incident.
         """
-        findings = self._stm.get("findings", []) or []
+        findings = ctx.stm.get("findings", []) or []
         latest: dict[str, Any] | None = None
         for entry in findings:
             if isinstance(entry, dict) and entry.get("type") == "rag":
@@ -1200,7 +1244,7 @@ class Orchestrator:
                     latest = data
         return latest
 
-    def _has_memory_finding(self) -> bool:
+    def _has_memory_finding(self, ctx: IncidentContext) -> bool:
         """
         True if Enterprise Memory recall has already run this incident
         lifecycle -- guards investigate() against repeating the same memory
@@ -1209,87 +1253,87 @@ class Orchestrator:
         can be called multiple times per incident, and a memory search's
         result would not change between depths for an unchanged event).
         """
-        findings = self._stm.get("findings", []) or []
+        findings = ctx.stm.get("findings", []) or []
         return any(
             isinstance(entry, dict) and entry.get("type") == "memory"
             for entry in findings
         )
 
-    def _has_policy_finding(self) -> bool:
+    def _has_policy_finding(self, ctx: IncidentContext) -> bool:
         """
         True if the Enterprise Policy Registry match has already run this
         incident lifecycle -- same idempotency guard as
         _has_memory_finding(), for the same reason.
         """
-        findings = self._stm.get("findings", []) or []
+        findings = ctx.stm.get("findings", []) or []
         return any(
             isinstance(entry, dict) and entry.get("type") == "policy"
             for entry in findings
         )
 
-    def _has_cross_dataset_finding(self) -> bool:
+    def _has_cross_dataset_finding(self, ctx: IncidentContext) -> bool:
         """
         True if Cross-Dataset Intelligence has already run this incident
         lifecycle -- same idempotency guard as _has_memory_finding()/
         _has_policy_finding(), for the same reason.
         """
-        findings = self._stm.get("findings", []) or []
+        findings = ctx.stm.get("findings", []) or []
         return any(
             isinstance(entry, dict) and entry.get("type") == "cross_dataset"
             for entry in findings
         )
 
-    def _has_adaptive_finding(self) -> bool:
+    def _has_adaptive_finding(self, ctx: IncidentContext) -> bool:
         """
         True if the Adaptive Detection Engine has already run this incident
         lifecycle -- same idempotency guard as _has_memory_finding()/
         _has_policy_finding()/_has_cross_dataset_finding(), for the same
         reason.
         """
-        findings = self._stm.get("findings", []) or []
+        findings = ctx.stm.get("findings", []) or []
         return any(
             isinstance(entry, dict) and entry.get("type") == "adaptive"
             for entry in findings
         )
 
-    def _has_execution_plan_finding(self) -> bool:
+    def _has_execution_plan_finding(self, ctx: IncidentContext) -> bool:
         """
         True if the Enterprise Action Planning Engine has already run this
         incident lifecycle -- defensive idempotency guard mirroring
         _has_adaptive_finding()/etc, even though finalize_incident() itself
         already guards against running more than once (COMPLETE-state check).
         """
-        findings = self._stm.get("findings", []) or []
+        findings = ctx.stm.get("findings", []) or []
         return any(
             isinstance(entry, dict) and entry.get("type") == "execution_plan"
             for entry in findings
         )
 
-    def _has_explainability_finding(self) -> bool:
+    def _has_explainability_finding(self, ctx: IncidentContext) -> bool:
         """
         True if the Enterprise Explainability Engine has already run this
         incident lifecycle -- defensive idempotency guard mirroring
         _has_execution_plan_finding(), for the same reason.
         """
-        findings = self._stm.get("findings", []) or []
+        findings = ctx.stm.get("findings", []) or []
         return any(
             isinstance(entry, dict) and entry.get("type") == "explainability"
             for entry in findings
         )
 
-    def _has_ai_evaluation_finding(self) -> bool:
+    def _has_ai_evaluation_finding(self, ctx: IncidentContext) -> bool:
         """
         True if the Enterprise AI Evaluation & Quality Engine has already run
         this incident lifecycle -- defensive idempotency guard mirroring
         _has_explainability_finding(), for the same reason.
         """
-        findings = self._stm.get("findings", []) or []
+        findings = ctx.stm.get("findings", []) or []
         return any(
             isinstance(entry, dict) and entry.get("type") == "ai_evaluation"
             for entry in findings
         )
 
-    def _collect_query_attempts(self) -> list[dict[str, Any]]:
+    def _collect_query_attempts(self, ctx: IncidentContext) -> list[dict[str, Any]]:
         """
         Reconstruct every distinct RAG query attempt made this incident, in
         order, from STM findings — used for the audit trail / Retrieval
@@ -1301,7 +1345,7 @@ class Orchestrator:
             exhaustion marker (``query_strategy == "exhausted"``) is
             excluded since it carries no new query of its own.
         """
-        findings = self._stm.get("findings", []) or []
+        findings = ctx.stm.get("findings", []) or []
         attempts: list[dict[str, Any]] = []
         for entry in findings:
             if not isinstance(entry, dict) or entry.get("type") != "rag":
@@ -1318,7 +1362,7 @@ class Orchestrator:
             })
         return attempts
 
-    def _run_kpi_investigation_placeholder(self) -> None:
+    def _run_kpi_investigation_placeholder(self, ctx: IncidentContext) -> None:
         """
         Placeholder for a KPI investigation pass.
 
@@ -1330,53 +1374,53 @@ class Orchestrator:
         It exists solely to keep the investigation loop functional until the
         KPI Agent is wired in.
         """
-        if self._active_event is None:
-            return
 
-        depth: int = self._stm.get("investigation_depth") or 1
+        depth: int = ctx.stm.get("investigation_depth") or 1
 
         logger.debug(
             "_run_kpi_investigation_placeholder | depth=%d | metric=%s",
-            depth, self._active_event.metric,
+            depth, ctx.event.metric,
         )
 
         # Simulate accumulating evidence over successive passes. The
         # machine-readable "placeholder" flag (Phase E1, ENG-5) marks this
         # entry as synthetic — readers must never treat it as real analysis.
-        self._stm.append("evidence", {
+        ctx.stm.append("evidence", {
             "depth": depth,
-            "metric": self._active_event.metric,
-            "current_value": self._active_event.current_value,
-            "expected_value": self._active_event.expected_value,
+            "metric": ctx.event.metric,
+            "current_value": ctx.event.current_value,
+            "expected_value": ctx.event.expected_value,
             "note": "placeholder — awaiting KPI Agent integration",
             "placeholder": True,
         })
 
         # On the first pass, propose a generic hypothesis.
         if depth == 1:
-            self._stm.append("hypotheses", f"Anomaly in {self._active_event.metric} ({self._active_event.current_value} vs expected {self._active_event.expected_value})")
+            ctx.stm.append("hypotheses", f"Anomaly in {ctx.event.metric} ({ctx.event.current_value} vs expected {ctx.event.expected_value})")
 
         # Simulate progressively increasing confidence with each pass.
-        current_confidence: float = float(self._stm.get("confidence") or 0.0)
+        current_confidence: float = float(ctx.stm.get("confidence") or 0.0)
         new_confidence = min(current_confidence + 0.3, 1.0)
-        self._stm.set("confidence", round(new_confidence, 2))
+        ctx.stm.set("confidence", round(new_confidence, 2))
 
         # On the second pass, simulate root cause identification (placeholder).
         # root_cause_source="placeholder" (Phase E1, ENG-5) makes this
         # machine-identifiable: finalize_incident() quarantines it from
         # Enterprise Memory and the UI labels it — never presented or
         # remembered as real analysis.
-        if depth >= 2 and not self._stm.get("root_cause"):
-            self._stm.set(
+        if depth >= 2 and not ctx.stm.get("root_cause"):
+            ctx.stm.set(
                 "root_cause",
-                f"Simulated root cause for metric '{self._active_event.metric}' "
+                f"Simulated root cause for metric '{ctx.event.metric}' "
                 f"(placeholder — replace with real KPI Agent output)",
             )
-            self._stm.set("root_cause_source", "placeholder")
+            ctx.stm.set("root_cause_source", "placeholder")
 
     def __repr__(self) -> str:
+        # Phase E2, ARCH-8: no per-incident FSM state — incidents
+        # each own their own state machine on the IncidentContext.
         return (
             f"Orchestrator("
-            f"state={self._sm.get_state().value!r}, "
+            f"stateless=True, "
             f"llm_enabled={self._settings.LLM_ENABLED})"
         )
