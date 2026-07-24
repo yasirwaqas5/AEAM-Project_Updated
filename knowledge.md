@@ -31,6 +31,7 @@ docker-compose up
 - End-to-end demo: `python run_simulation.py`
 - Frontend build / preview: `npm run build` / `npm run preview`
 - No linter or type-checker is configured in this repo.
+- Utility scripts (`check_qdrant.py`, `debug_query.py`, `ingest_runbook.py`) are in `scripts/`.
 
 ## Environment
 
@@ -96,7 +97,7 @@ Central coordinator of the incident lifecycle: `EVENT_RECEIVED → INVESTIGATING
 
 ### Monitor — `aeam/agents/monitor/monitor_agent.py`
 Deterministic KPI detection + event creation; runs a continuous polling loop in a background thread (`start()`).
-- `process_kpi()` cleans history, then applies RuleEngine + StatisticalDetector + ForecastAgent; ANY signal (≥1) creates an immutable `Event`, dedups, queues, and publishes on the EventBus.
+- `process_kpi()` cleans history, then applies RuleEngine + StatisticalDetector + ForecastAgent; ANY signal (≥1) creates an immutable `Event`, dedups, and publishes on the EventBus.
 - Severity from signal count: ≥2 → HIGH, 1 → MEDIUM, 0 → LOW.
 - `_run_cycle()` pulls rows from the injected `KPIRowSource` (a `CompositeKPISource`: Sheets + activated datasets) for every `rule_engine.loaded_domains` metric; persists observations to LTM so ForecastAgent has training history. No-op tick when no source is wired.
 - Constraints: no LLM, no orchestrator logic, no direct DB access, no external APIs.
@@ -138,16 +139,17 @@ Content-generation only; reads ShortTermMemory (never mutates it), fills templat
 - **401 on `/api` in dev is expected:** `SecurityMiddleware` bypasses ALL JWT/RBAC/
   rate-limit checks when `ENVIRONMENT=development`. Never make the bypass unconditional
   (no `or True`) — that would disable auth in production too. Never deploy with `ENVIRONMENT=development`.
-- **Scheduler is disabled:** `scheduler.add_job` / `scheduler.start` are commented out
-  in `main.py`. The "24/7 autonomous" loop does not run; events enter only via
-  `POST /api/v1/trigger` or `run_simulation.py`. Don't rely on the scheduler in e2e tests.
+- **No scheduler:** the APScheduler stub was removed in Phase E1; events enter only via
+  `POST /api/v1/trigger` or `run_simulation.py`. Autonomous polling is deferred to E7.
 - **No DB migration tool:** apply schema changes by hand. Confirm columns with
   `\d incidents` before editing SQL in `incidents.py`, e.g.
   `docker exec -it aeam-postgres psql -U postgres -c "ALTER TABLE incidents ADD COLUMN IF NOT EXISTS llm_response TEXT;"`
 - **Qdrant has no fallback:** if RAG retrieval returns nothing, confirm Qdrant is
   reachable at `VECTOR_DB_URL`. `test_phase4_rag.py` hits a *real* Qdrant (not mocked).
-- **Placeholders are not ground truth:** `_run_kpi_investigation_placeholder` in
-  `orchestrator.py` ("Simulated root cause") and `expected_value = value * 2` in
-  `trigger.py` are placeholders — never reuse them in real detection paths.
+- **Placeholder root causes are machine-tagged:** `_run_kpi_investigation_placeholder`
+  sets `root_cause_source="placeholder"` and `placeholder: True` on evidence (Phase E1,
+  ENG-5). `finalize_incident()` quarantines these from Enterprise Memory; the frontend
+  displays a "Placeholder" badge. `expected_value = value * 2` in `trigger.py` is also
+  a placeholder — never reuse either in real detection paths.
 - **Case-sensitive imports:** file/import casing matters on Linux/Docker (not Windows);
   e.g. a blank Agents page usually means an `AgentLogCard.jsx` import-casing mismatch.

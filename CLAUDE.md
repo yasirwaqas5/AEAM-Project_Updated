@@ -31,8 +31,8 @@ Optional: `SLACK_BOT_TOKEN`, `JIRA_URL`, `JIRA_API_TOKEN`, `LLM_PROVIDER`, `LLM_
 
 ## Known Issues & Quick Fixes
 - **401 on /api in dev** → expected: `SecurityMiddleware` bypasses auth entirely when `ENVIRONMENT=development`. To test authenticated flows locally, issue a real JWT. Never make the bypass unconditional (e.g. `or True`) — that disables auth in every environment, including production.
-- **Scheduler not firing** → `scheduler.add_job` / `scheduler.start` are commented out in `main.py`. The "24/7 autonomous" loop is currently disabled; events only enter the pipeline via `POST /api/v1/trigger` or `run_simulation.py`. Re-enable only after load-testing `MonitorAgent`.
-- **Hardcoded values in alerts** → `_run_kpi_investigation_placeholder` in `orchestrator.py` must read from `self._active_event`, never hardcode metric/value data. It's an explicit placeholder ("Simulated root cause") pending a real KPI Agent — don't treat its output as ground truth.
+- **No scheduler** → the APScheduler stub was removed in Phase E1; events enter only via `POST /api/v1/trigger` or `run_simulation.py`. Autonomous polling is deferred to Phase E7.
+- **Placeholder root causes are machine-tagged** → `_run_kpi_investigation_placeholder` in `orchestrator.py` sets `root_cause_source="placeholder"` and `placeholder: True` on evidence entries. `finalize_incident()` quarantines these from Enterprise Memory (ENG-5). The frontend displays a "Placeholder" badge. Don't treat placeholder output as ground truth.
 - **Blank Agents page** → check `frontend/src/components/AgentLogCard.jsx` exists and the import in `Agents.jsx` matches exactly (case-sensitive on Linux/Docker, unlike Windows).
 - **Missing DB column** → there is no migration tool in this repo; run `\d incidents` to confirm the actual missing column, then apply by hand, e.g.:
   `docker exec -it aeam-postgres psql -U postgres -c "ALTER TABLE incidents ADD COLUMN IF NOT EXISTS llm_response TEXT;"`
@@ -57,4 +57,5 @@ Trigger → EventBus → Orchestrator → DecisionEngine → EvaluationEngine �
 - `python run_simulation.py` for end-to-end demo
 - Manual trigger: `curl -X POST http://localhost:8080/api/v1/trigger/ ...`
 - RAG tests (`test_phase4_rag.py`) hit a real Qdrant instance at `VECTOR_DB_URL` — not mocked. Ensure it's running before running that suite.
-- The scheduler is disabled (see Known Issues) — don't rely on it in end-to-end tests. Drive events via `/api/v1/trigger` or `run_simulation.py` instead.
+- The scheduler was removed (Phase E1) — drive events via `/api/v1/trigger` or `run_simulation.py`.
+- Utility scripts (`check_qdrant.py`, `debug_query.py`, `ingest_runbook.py`) live in `scripts/`, not the project root.
