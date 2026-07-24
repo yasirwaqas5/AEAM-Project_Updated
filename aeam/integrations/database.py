@@ -426,6 +426,17 @@ class DatabaseClient:
         Returns a list of dicts ordered ascending by timestamp, each containing
         ``timestamp`` (datetime or ISO‑8601 string) and ``value`` (float).
 
+        When ``limit`` is set, the MOST RECENT ``limit`` rows are returned
+        (still ascending). Fixed in Phase E1 (MOD-4): the previous
+        implementation applied ``LIMIT`` to the ascending scan and therefore
+        returned the OLDEST N rows, contradicting this contract and feeding
+        consumers (AdaptiveDetectionEngine's 200-row window) stale baselines
+        once history outgrew the limit.
+
+        Ordering note: ``timestamp`` is a TEXT column holding ISO-8601
+        strings, so ordering is lexicographic — correct while all writers
+        use the same UTC ISO format (they do; see MonitorAgent/LTM).
+
         Args:
             metric_name: Name of the metric to retrieve history for.
             limit:       Maximum number of rows to return (most recent).
@@ -442,16 +453,29 @@ class DatabaseClient:
         if not metric_name or not metric_name.strip():
             raise ValueError("metric_name must be a non-empty string.")
 
-        query = """
-            SELECT timestamp, value
-            FROM metrics
-            WHERE metric = :metric_name
-            ORDER BY timestamp ASC
-        """
-        params = {"metric_name": metric_name}
+        params: dict[str, Any] = {"metric_name": metric_name}
 
-        if limit is not None:
-            query += " LIMIT :limit"
+        if limit is None:
+            query = """
+                SELECT timestamp, value
+                FROM metrics
+                WHERE metric = :metric_name
+                ORDER BY timestamp ASC
+            """
+        else:
+            # Newest N first, then re-ordered ascending for consumers.
+            # Portable across PostgreSQL and SQLite (subquery alias required
+            # by PostgreSQL).
+            query = """
+                SELECT timestamp, value FROM (
+                    SELECT timestamp, value
+                    FROM metrics
+                    WHERE metric = :metric_name
+                    ORDER BY timestamp DESC
+                    LIMIT :limit
+                ) recent
+                ORDER BY timestamp ASC
+            """
             params["limit"] = limit
 
         try:
