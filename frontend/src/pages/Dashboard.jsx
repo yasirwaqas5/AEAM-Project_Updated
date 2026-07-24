@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import {
   PageHeader, Card, CardTitle, Field, Badge, ConfidenceBar,
   Skeleton, Icon, Button, stateColor, deriveStatus, getRetrievedCount, getRecommendedAction,
-  fmtTime, fmtRelative, buildMeshLive,
+  fmtTime, fmtRelative, buildMeshLive, getRootCauseSource,
 } from "../components/ui";
 import { PageContainer } from "../components/library";
 import { CountUp, Sparkline, ProgressRing } from "../components/charts";
@@ -223,7 +223,12 @@ export default function Dashboard() {
             <div style={{ color: "var(--muted)", fontSize: "var(--fs-sm)", padding: "0.5rem 0" }}>No incidents yet.</div>
           ) : (
             <div className="aeam-grid-auto" style={{ gap: "1.1rem" }}>
-              <Field label="Root Cause" value={latest.root_cause || "Pending"} />
+              <div>
+                <Field label="Root Cause" value={latest.root_cause || "Pending"} />
+                {getRootCauseSource(latest) === "placeholder" && (
+                  <Badge label="Placeholder" color="var(--warn)" style={{ marginTop: "0.4rem" }} />
+                )}
+              </div>
               <div style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
                 <span style={{ fontSize: "var(--fs-2xs)", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>Confidence</span>
                 <ConfidenceBar value={latest.confidence} />

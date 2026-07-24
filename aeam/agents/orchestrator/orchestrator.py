@@ -203,6 +203,12 @@ class Orchestrator:
         self._stm.set("evidence", [])
         self._stm.set("confidence", None)
         self._stm.set("root_cause", None)
+        # Provenance of the root cause (Phase E1, ENG-5): "rag" |
+        # "llm_reasoning" | "placeholder" | None. Every writer of
+        # "root_cause" also writes this, so finalize_incident() can
+        # quarantine placeholder-derived conclusions from Enterprise Memory
+        # and the UI can label them.
+        self._stm.set("root_cause_source", None)
         self._stm.set("action_taken", False)
         self._stm.set("requires_human", False)
 
@@ -514,6 +520,7 @@ class Orchestrator:
             # persists it — and so the KPI placeholder does not overwrite it.
             if rag_root_cause and not no_knowledge:
                 self._stm.set("root_cause", rag_root_cause)
+                self._stm.set("root_cause_source", "rag")
                 existing_conf = float(self._stm.get("confidence") or 0.0)
                 self._stm.set(
                     "confidence",
@@ -587,6 +594,7 @@ class Orchestrator:
                 else:
                     # Update STM with the LLM output
                     self._stm.set("root_cause", insight.get("root_cause", "Unknown"))
+                    self._stm.set("root_cause_source", "llm_reasoning")
                     self._stm.set("confidence", insight.get("confidence", 0.0))
                     self._stm.set("llm_response", raw)
 
@@ -717,6 +725,9 @@ class Orchestrator:
         event_data: dict[str, Any] = self._stm.get("event") or {}
         incident_id: str = self._stm.get("incident_id", "unknown")
         root_cause = self._stm.get("root_cause")
+        # Provenance written by whichever component set root_cause (Phase E1,
+        # ENG-5): "rag" | "llm_reasoning" | "placeholder" | None.
+        root_cause_source = self._stm.get("root_cause_source")
         requires_human = bool(self._stm.get("requires_human"))
         confidence = self._stm.get("confidence")
 
@@ -1047,6 +1058,9 @@ class Orchestrator:
             "type": "audit_summary",
             "investigation_status": investigation_status,
             "root_cause": root_cause,
+            # Additive (Phase E1, ENG-5/COMPAT-1): absent on incidents that
+            # predate provenance tracking — readers must tolerate absence.
+            "root_cause_source": root_cause_source,
             "validation_status": validation_status,
             "validation_reason": validation_reason,
             "reranking": "not_applicable",
@@ -1095,7 +1109,18 @@ class Orchestrator:
         # computed above; nothing here is invented. A memory-write failure
         # must never block incident finalization (same resilience contract
         # as the LTM persist above).
-        if self._memory is not None:
+        #
+        # ENG-5 quarantine (Phase E1): the ONE exception is a
+        # placeholder-derived root cause — synthetic KPI-stub output is not
+        # organizational knowledge, and remembering it would poison future
+        # recalls with fabricated precedent. Skipped loudly, never silently.
+        if self._memory is not None and root_cause_source == "placeholder":
+            logger.warning(
+                "finalize_incident | Enterprise Memory write SKIPPED — root cause is "
+                "placeholder-derived, not real analysis (ENG-5 quarantine) | incident_id=%s",
+                incident_id,
+            )
+        elif self._memory is not None:
             try:
                 self._memory.remember_incident({
                     "incident_id": incident_id,
@@ -1315,13 +1340,16 @@ class Orchestrator:
             depth, self._active_event.metric,
         )
 
-        # Simulate accumulating evidence over successive passes.
+        # Simulate accumulating evidence over successive passes. The
+        # machine-readable "placeholder" flag (Phase E1, ENG-5) marks this
+        # entry as synthetic — readers must never treat it as real analysis.
         self._stm.append("evidence", {
             "depth": depth,
             "metric": self._active_event.metric,
             "current_value": self._active_event.current_value,
             "expected_value": self._active_event.expected_value,
             "note": "placeholder — awaiting KPI Agent integration",
+            "placeholder": True,
         })
 
         # On the first pass, propose a generic hypothesis.
@@ -1334,12 +1362,17 @@ class Orchestrator:
         self._stm.set("confidence", round(new_confidence, 2))
 
         # On the second pass, simulate root cause identification (placeholder).
+        # root_cause_source="placeholder" (Phase E1, ENG-5) makes this
+        # machine-identifiable: finalize_incident() quarantines it from
+        # Enterprise Memory and the UI labels it — never presented or
+        # remembered as real analysis.
         if depth >= 2 and not self._stm.get("root_cause"):
             self._stm.set(
                 "root_cause",
                 f"Simulated root cause for metric '{self._active_event.metric}' "
                 f"(placeholder — replace with real KPI Agent output)",
             )
+            self._stm.set("root_cause_source", "placeholder")
 
     def __repr__(self) -> str:
         return (

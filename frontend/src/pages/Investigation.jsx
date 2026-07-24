@@ -4,7 +4,7 @@ import {
   PageHeader, Card, Badge, SeverityBadge, ConfidenceBar, Field, Button, Icon, Tabs,
   fmtTime, fmtRelative, severityOf, deriveStatus,
   getAuditSummary, getRetrievedCount, getRecommendedActions, getActionOutcome,
-  actionLabel, getValidationStatus, getEvidence, parseMaybeJSON,
+  actionLabel, getValidationStatus, getEvidence, parseMaybeJSON, getRootCauseSource,
 } from "../components/ui";
 import {
   PageContainer, SplitLayout, Panel, EmptyState, LoadingState, ErrorState,
@@ -189,7 +189,12 @@ function InvestigationSummary({ incident }) {
       <div style={{ display: "flex", gap: "1.6rem", alignItems: "center", flexWrap: "wrap" }}>
         <ProgressRing value={incident.confidence ?? audit?.top_confidence} size={92} sublabel="Confidence" />
         <div className="aeam-grid-auto" style={{ flex: 1, minWidth: 260 }}>
-          <Field label="Root Cause" value={incident.root_cause || "Pending"} />
+          <div>
+            <Field label="Root Cause" value={incident.root_cause || "Pending"} />
+            {getRootCauseSource(incident) === "placeholder" && (
+              <Badge label="Placeholder" color="var(--warn)" style={{ marginTop: "0.4rem" }} />
+            )}
+          </div>
           <Field label="Affected Metric" value={incident.metric || "—"} mono />
           <Field label="Business Impact"
             value={deviationPct != null
@@ -215,7 +220,12 @@ function ReasoningPanel({ incident }) {
           LLM Explanation
         </div>
         {incident.root_cause ? (
-          <p style={{ fontSize: "0.82rem", color: "var(--text)", lineHeight: 1.6, margin: 0 }}>{incident.root_cause}</p>
+          <div>
+            <p style={{ fontSize: "0.82rem", color: "var(--text)", lineHeight: 1.6, margin: 0 }}>{incident.root_cause}</p>
+            {getRootCauseSource(incident) === "placeholder" && (
+              <Badge label="Placeholder — not real analysis" color="var(--warn)" style={{ marginTop: "0.5rem" }} />
+            )}
+          </div>
         ) : (
           <div style={{ fontSize: "0.78rem", color: "var(--muted)" }}>
             {validation.status === "SKIPPED" ? "RAG was not invoked for this investigation." : "No reasoning was produced."}

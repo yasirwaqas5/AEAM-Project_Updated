@@ -322,6 +322,16 @@ export function getAIEvaluationData(incident) {
   return latest;
 }
 
+/**
+ * The root_cause_source provenance tag from audit_summary (Phase E1, ENG-5):
+ * "rag" | "llm_reasoning" | "placeholder" | null. null means either pre-E1
+ * incident or no root cause was set.
+ */
+export function getRootCauseSource(incident) {
+  const audit = getAuditSummary(incident);
+  return audit?.root_cause_source ?? null;
+}
+
 /** Count of retrieved evidence chunks recorded for the incident. */
 export function getRetrievedCount(incident) {
   const audit = getAuditSummary(incident);

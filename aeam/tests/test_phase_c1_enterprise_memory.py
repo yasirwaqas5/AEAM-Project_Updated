@@ -284,7 +284,33 @@ class FakeMemoryEngine:
         return {"collection": "aeam_incident_memories", "chunks_upserted": 1}
 
 
-def _build_orchestrator(memory_engine=None):
+class FakeRAGAgent:
+    """
+    Returns one grounded, meaningful cause so the orchestrator promotes a
+    GENUINE root cause (root_cause_source="rag"). Needed since Phase E1:
+    the KPI placeholder's simulated root cause is quarantined from
+    Enterprise Memory (ENG-5), so wiring tests must resolve honestly.
+    """
+
+    def investigate(self, event, memory):
+        findings = {
+            "possible_causes": [
+                {"cause": "replication lag on read replica", "chunk_id": "c-1", "confidence": 0.9},
+            ],
+            "overall_confidence": 0.9,
+            "requires_human_review": False,
+            "retrieved_count": 1,
+            "validation_passed": True,
+            "raw_llm_response": "{}",
+        }
+        return {
+            "findings": findings,
+            "confidence": 0.9,
+            "memory_updates": {"rag_findings": findings, "hypotheses": [], "confidence": 0.9},
+        }
+
+
+def _build_orchestrator(memory_engine=None, rag_agent=None):
     settings = Settings(
         DATABASE_URL="sqlite:///:memory:",
         REDIS_URL="redis://localhost:6379/0",
@@ -307,6 +333,7 @@ def _build_orchestrator(memory_engine=None):
         long_term_memory=ltm,
         state_machine=sm,
         settings=settings,
+        rag_agent=rag_agent,
         memory_engine=memory_engine,
     )
     return orchestrator, ltm, stm
@@ -343,7 +370,9 @@ def test_orchestrator_appends_memory_finding_when_engine_present():
 
 def test_orchestrator_calls_remember_incident_on_finalize():
     memory = FakeMemoryEngine()
-    orchestrator, ltm, stm = _build_orchestrator(memory_engine=memory)
+    orchestrator, ltm, stm = _build_orchestrator(
+        memory_engine=memory, rag_agent=FakeRAGAgent(),
+    )
 
     orchestrator.handle_event(_event())
 
@@ -354,6 +383,20 @@ def test_orchestrator_calls_remember_incident_on_finalize():
     assert remembered["severity"] == "HIGH"
     assert "incident_id" in remembered
     assert "investigation_status" in remembered
+
+
+def test_placeholder_root_cause_quarantined_from_enterprise_memory():
+    """ENG-5: placeholder-derived root causes must never be persisted into
+    Enterprise Memory — they would poison future recalls with fabricated
+    precedent. With no RAG agent wired, the orchestrator falls through to the
+    KPI placeholder, producing root_cause_source="placeholder"."""
+    memory = FakeMemoryEngine()
+    orchestrator, ltm, stm = _build_orchestrator(memory_engine=memory)
+
+    orchestrator.handle_event(_event())
+
+    assert ltm.recorded is not None
+    assert memory.remembered == []
 
 
 def test_memory_engine_failure_does_not_break_investigation():
