@@ -218,6 +218,12 @@ def _build_container(settings: Settings) -> AppContainer:
     logger.info("Initialising EventBus …")
     event_bus = EventBus()
 
+    # EventPriorityQueue disposition (Phase E1, ENG-8): a correct, tested
+    # primitive with no production consumer yet — MonitorAgent's push-only
+    # write was removed (unbounded, never drained). It stays wired here
+    # because /health and /system/status report its size (COMPAT-4: the
+    # response field must not disappear) and a real consumer is expected
+    # with the Roadmap E2+ concurrency work.
     logger.info("Initialising EventPriorityQueue …")
     queue = EventPriorityQueue()
 

@@ -5,8 +5,14 @@ Monitor Agent — deterministic KPI detection and event creation for AEAM.
 
 The MonitorAgent runs a continuous polling loop, applying deterministic
 detection (rule-based and statistical) to KPI observations. When any signals
-are detected (1 or more), an immutable Event is created, deduplicated, pushed
-to the priority queue, and published via the EventBus.
+are detected (1 or more), an immutable Event is created, deduplicated, and
+published via the EventBus.
+
+Queue disposition (Phase E1, ENG-8): events were previously ALSO pushed to
+the injected EventPriorityQueue, but nothing ever consumed it — an unbounded
+push-only structure. The push was removed; the ``queue`` constructor
+parameter is retained so no call site changes (COMPAT-2) and the primitive
+stays available for a real consumer (Roadmap E2+).
 
 Constraints:
 - No LLM calls.
@@ -99,15 +105,17 @@ class MonitorAgent:
     4. (Phase 5) Apply forecast deviation detection via injected ForecastAgent.
     5. If any signals fire (1 or more), create an immutable :class:`~aeam.core.event_models.Event`.
     6. Deduplicate via :class:`~aeam.core.deduplication.EventDeduplicator`.
-    7. Push to :class:`~aeam.core.priority_queue.EventPriorityQueue`.
-    8. Publish via :class:`~aeam.core.event_bus.EventBus`.
+    7. Publish via :class:`~aeam.core.event_bus.EventBus`.
 
     The agent contains no LLM calls, no forecasting logic of its own, no
     orchestrator logic, no database writes, and no external API calls.
 
     Args:
         event_bus:            Internal event dispatcher.
-        queue:                Priority queue for confirmed events.
+        queue:                Injected priority queue. Retained for
+                              constructor compatibility (COMPAT-2) and read
+                              only by ``__repr__``; not written since Phase
+                              E1 (see "Queue disposition" above).
         deduplicator:         Window-based duplicate filter.
         rule_engine:          Threshold-based rule evaluator.
         statistical_detector: Statistical anomaly detector.
@@ -227,7 +235,7 @@ class MonitorAgent:
         5. Collect triggered signals.
         6. If any signals fire (1 or more) → anomaly detected → create event.
         7. Check deduplication; discard if duplicate.
-        8. Push to priority queue and publish via EventBus.
+        8. Publish via EventBus.
 
         Args:
             metric_name: Metric domain identifier (e.g. ``"sales"``).
@@ -321,11 +329,12 @@ class MonitorAgent:
             )
             return None
 
-        # Step 9: push and publish.
-        self._queue.push(event)
+        # Step 9: publish. (The former push to the injected priority queue
+        # was removed in Phase E1 — nothing ever consumed it; see class
+        # docstring "Queue disposition".)
         logger.info(
-            "Event queued | event_id=%s | severity=%s | queue_depth=%d",
-            event.event_id, event.severity, self._queue.size(),
+            "Event publishing | event_id=%s | severity=%s",
+            event.event_id, event.severity,
         )
 
         try:
