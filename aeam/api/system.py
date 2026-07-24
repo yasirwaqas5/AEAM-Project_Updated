@@ -30,11 +30,6 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/system", tags=["System"])
 
-# Number of registered agent types in this system build.
-# Static constant — reflects the known agent roster (Monitor, RAG,
-# Forecast, Action, Report) without requiring runtime introspection.
-_AGENTS_ACTIVE: int = 5
-
 
 @router.get(
     "/status",
@@ -54,7 +49,10 @@ def get_status(request: Request) -> JSONResponse:
       ``finalize_incident()`` has already decremented it) it is never
       observably non-zero to a dashboard poll. See
       :func:`_count_unresolved_incidents`.
-    - ``agents_active`` — static count of registered agent types (5).
+    - ``agents_active`` / ``agents`` — the roster of agents the lifespan
+      ACTUALLY constructed this startup (``container.agent_roster``, Phase
+      E1) — monitor and action are conditional on configuration, so this
+      figure varies honestly by environment instead of being hardcoded.
     - ``last_event_time`` — taken from the container's priority queue size
       as a proxy; falls back to the current UTC timestamp when the queue
       is empty (no events pending).
@@ -71,7 +69,8 @@ def get_status(request: Request) -> JSONResponse:
             {
                 "status":           "healthy" | "degraded",
                 "active_incidents": int,
-                "agents_active":    int,
+                "agents_active":    int,        # len(agents)
+                "agents":           list[str],  # constructed-agent names (additive, Phase E1)
                 "last_event_time":  str
             }
 
@@ -101,10 +100,16 @@ def get_status(request: Request) -> JSONResponse:
         # timestamp still reflects system liveness.
         last_event_time: str = _derive_last_event_time(container)
 
+        # Roster of agents the lifespan actually constructed (Phase E1).
+        # Empty-list fallback keeps minimal test apps (no roster attached)
+        # working while still reporting an honest zero, never a made-up count.
+        roster: list[str] = list(getattr(container, "agent_roster", []) or [])
+
         payload: dict[str, Any] = {
             "status":           status,
             "active_incidents": incident_count,
-            "agents_active":    _AGENTS_ACTIVE,
+            "agents_active":    len(roster),
+            "agents":           roster,
             "last_event_time":  last_event_time,
         }
 

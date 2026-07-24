@@ -3,10 +3,15 @@ aeam/api/logs.py
 
 Agent execution logs API for the AEAM system.
 
-Exposes a read-only GET endpoint that returns agent execution log entries.
-No persistent log storage exists yet — this module uses an in-memory list
-seeded with deterministic mock data to satisfy the API contract until a
-real log store is wired in.
+Exposes a read-only GET endpoint over the real, DB-backed ``action_logs``
+table that :class:`~aeam.agents.action.action_agent.ActionAgent` writes on
+every execution (the 50 most recent rows, with the execution metadata —
+duration, retry count, failure reason, validation result — surfaced from
+the JSON ``result`` column).
+
+History note (Phase E1, DOC-2/ENG-8): this module originally served an
+in-memory mock seeded at import time; the mock generator was dead code
+after the endpoint became DB-backed and has been removed.
 
 Rules enforced:
 - No agent triggering.
@@ -19,7 +24,6 @@ Rules enforced:
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -27,118 +31,6 @@ from fastapi import APIRouter, HTTPException, Request
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/logs", tags=["Logs"])
-
-
-# ---------------------------------------------------------------------------
-# In-memory log store
-# Seeded with mock data at module load time.
-# Replace _LOG_STORE with a real DB-backed query when log persistence
-# is implemented (aeam/integrations/database.py insert to action_logs table).
-# ---------------------------------------------------------------------------
-
-def _generate_mock_logs() -> list[dict[str, Any]]:
-    """
-    Generate a deterministic set of mock agent execution log entries.
-
-    Produces one entry per agent type across two simulated incidents,
-    providing realistic sample data for development and integration
-    testing without requiring a live log store.
-
-    Returns:
-        List of log entry dicts, ordered newest first. Each entry contains:
-
-        - ``agent``              — agent name string.
-        - ``incident_id``        — simulated incident UUID string.
-        - ``status``             — ``"SUCCESS"`` or ``"FAILED"``.
-        - ``execution_time_ms``  — simulated execution duration in milliseconds.
-        - ``timestamp``          — UTC ISO 8601 string.
-    """
-    now = datetime.now(tz=timezone.utc)
-
-    # Simulated incident IDs.
-    inc_1 = "inc-mock-0001"
-    inc_2 = "inc-mock-0002"
-
-    entries: list[dict[str, Any]] = [
-        # --- Incident 2 (most recent) ---
-        {
-            "agent":             "monitor",
-            "incident_id":       inc_2,
-            "status":            "SUCCESS",
-            "execution_time_ms": 42,
-            "timestamp":         (now - timedelta(minutes=5)).isoformat(),
-        },
-        {
-            "agent":             "rag",
-            "incident_id":       inc_2,
-            "status":            "SUCCESS",
-            "execution_time_ms": 1340,
-            "timestamp":         (now - timedelta(minutes=4, seconds=50)).isoformat(),
-        },
-        {
-            "agent":             "forecast",
-            "incident_id":       inc_2,
-            "status":            "SUCCESS",
-            "execution_time_ms": 870,
-            "timestamp":         (now - timedelta(minutes=4, seconds=30)).isoformat(),
-        },
-        {
-            "agent":             "report",
-            "incident_id":       inc_2,
-            "status":            "SUCCESS",
-            "execution_time_ms": 210,
-            "timestamp":         (now - timedelta(minutes=4)).isoformat(),
-        },
-        {
-            "agent":             "action",
-            "incident_id":       inc_2,
-            "status":            "SUCCESS",
-            "execution_time_ms": 530,
-            "timestamp":         (now - timedelta(minutes=3, seconds=45)).isoformat(),
-        },
-        # --- Incident 1 (older) ---
-        {
-            "agent":             "monitor",
-            "incident_id":       inc_1,
-            "status":            "SUCCESS",
-            "execution_time_ms": 38,
-            "timestamp":         (now - timedelta(hours=1)).isoformat(),
-        },
-        {
-            "agent":             "rag",
-            "incident_id":       inc_1,
-            "status":            "FAILED",
-            "execution_time_ms": 5001,
-            "timestamp":         (now - timedelta(minutes=59, seconds=50)).isoformat(),
-        },
-        {
-            "agent":             "forecast",
-            "incident_id":       inc_1,
-            "status":            "SUCCESS",
-            "execution_time_ms": 910,
-            "timestamp":         (now - timedelta(minutes=59, seconds=30)).isoformat(),
-        },
-        {
-            "agent":             "report",
-            "incident_id":       inc_1,
-            "status":            "SUCCESS",
-            "execution_time_ms": 195,
-            "timestamp":         (now - timedelta(minutes=59)).isoformat(),
-        },
-        {
-            "agent":             "action",
-            "incident_id":       inc_1,
-            "status":            "SUCCESS",
-            "execution_time_ms": 480,
-            "timestamp":         (now - timedelta(minutes=58, seconds=30)).isoformat(),
-        },
-    ]
-
-    return entries
-
-
-# Module-level in-memory store — seeded once at import time.
-_LOG_STORE: list[dict[str, Any]] = _generate_mock_logs()
 
 
 # ---------------------------------------------------------------------------

@@ -107,12 +107,6 @@ from aeam.core.idempotency import IdempotencyManager
 from prometheus_client import generate_latest
 from aeam.monitoring.logging_config import get_logger
 
-# APScheduler for 24/7 autonomous scheduling
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import uuid
-import datetime
-from aeam.core.event_models import Event
-
 # API routers
 from aeam.api.incidents import router as incidents_router
 from aeam.api.system import router as system_router
@@ -309,19 +303,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         - Build and attach the :class:`AppContainer` to ``app.state``.
         - Wire and register the Orchestrator.
         - Verify Redis connectivity via ping.
-        - Start the 24/7 autonomous scheduler.
 
     Shutdown:
         - Dispose of the database connection pool.
         - Close the Redis connection pool.
-        - Shut down the scheduler.
+
+    Autonomy note (Phase E1, ENG-8): there is no scheduler. Autonomous
+    detection is MonitorAgent's polling loop below; its production
+    enablement is Roadmap Phase E7. Events otherwise enter only via
+    ``POST /api/v1/trigger`` or ``run_simulation.py``.
     """
     # --- Startup ---
     logger.info("AEAM starting up …")
 
     settings = Settings()  # pyright: ignore[reportCallIssue]
-    print(f"=== ENVIRONMENT = {settings.ENVIRONMENT!r} ===")  # temporary debug
-
     logger.info("Settings loaded | environment=%r", settings.ENVIRONMENT)
 
     container = _build_container(settings)
@@ -361,30 +356,22 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     # --- RAG and Report Agents (Phases 4 and 7) ---
-    print("=== BEFORE EmbeddingService ===")
     embedding_service = EmbeddingService()
-    print("=== AFTER EmbeddingService ===")
 
-    print("=== BEFORE Qdrant ===")
     qdrant_client = QdrantClient(url=settings.VECTOR_DB_URL)
     container.qdrant_client = qdrant_client
-    print("=== AFTER Qdrant ===")
 
-    print("=== BEFORE IngestionPipeline ===")
     ingestion_pipeline = IngestionPipeline(
         embedding_service=embedding_service,
         qdrant_client=qdrant_client,
     )
     container.ingestion_pipeline = ingestion_pipeline
     _ingest_startup_documents(ingestion_pipeline)
-    print("=== AFTER IngestionPipeline ===")
 
-    print("=== BEFORE RetrievalPipeline ===")
     retrieval_pipeline = RetrievalPipeline(
         embedding_service=embedding_service,
         qdrant_client=qdrant_client,
     )
-    print("=== AFTER RetrievalPipeline ===")
 
     # --- Enterprise Memory Engine (Phase C1) ---
     # Reuses the SAME EmbeddingService + QdrantClient + IngestionPipeline/
@@ -593,7 +580,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     logger.info("Retrieval debug tracer initialised.")
 
-    print("=== BEFORE RAGAgent ===")
     validator = RAGResponseValidator()
     rag_agent = RAGAgent(
         retrieval_pipeline=rag_retrieval,
@@ -601,11 +587,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         llm_service=llm_service,
         entity_extractor=entity_extractor,
     )
-    print("=== AFTER RAGAgent ===")
 
-    print("=== BEFORE ReportAgent ===")
     report_agent = ReportAgent(settings=settings)
-    print("=== AFTER ReportAgent ===")
 
     # --- Action Agent (Phase 6) ---
     action_agent = None
@@ -876,6 +859,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Register wildcard handler
     container.event_bus.register_handler("ALL", orchestrator.handle_event)
 
+    # Agent roster (Phase E1, DOC-2): the agents ACTUALLY constructed this
+    # startup — monitor and action are conditional on configuration. Read by
+    # GET /api/v1/system/status instead of a hardcoded count, so the figure
+    # can never drift from the wiring above.
+    container.agent_roster = sorted(
+        ["orchestrator", "rag", "forecast", "report"]
+        + (["monitor"] if monitor_agent is not None else [])
+        + (["action"] if action_agent is not None else [])
+    )
+    logger.info("Agent roster | %s", container.agent_roster)
+
     logger.info("Orchestrator registered with EventBus (ALL wildcard).")
     logger.info("Infrastructure container ready | %r", container)
 
@@ -886,37 +880,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.warning("Redis connectivity: DEGRADED — ping failed.")
 
-    # ---------- 24/7 Autonomous Scheduler ----------
-    scheduler = AsyncIOScheduler()
-
-    async def periodic_event():
-        event = Event(
-            event_id=str(uuid.uuid4()),
-            event_type="SALES_DROP",
-            metric="sales",
-            current_value=100.0,
-            expected_value=200.0,
-            drop_percent=50.0,
-            detection_methods=["rule"],
-            severity="HIGH",
-            timestamp=datetime.datetime.utcnow().isoformat() + "Z",
-        )
-        container.event_bus.publish(event)
-
-    # scheduler.add_job(
-    #     periodic_event,
-    #     'interval',
-    #     seconds=settings.MONITOR_INTERVAL_SECONDS,   # default 300 (5 minutes)
-    # )
-    # scheduler.start()
-    logger.info("APScheduler configured (disabled for frontend testing).")
+    # Scheduler disposition (Phase E1, ENG-8): the APScheduler stub that
+    # previously lived here (constructed, never started, publishing a
+    # SYNTHETIC hardcoded SALES_DROP event) was removed. Autonomous
+    # detection is MonitorAgent's polling loop above — enabling it in the
+    # production posture is Roadmap Phase E7. A synthetic-event generator
+    # would violate PHIL-1 (honesty over capability) if ever re-enabled.
 
     logger.info("AEAM startup complete.")
     yield
 
     # --- Shutdown ---
     logger.info("AEAM shutting down …")
-    # scheduler.shutdown()
     if monitor_agent:
         # If MonitorAgent has a stop() method, call it; otherwise, we rely on daemon thread.
         # Here we just log.
@@ -1105,13 +1080,3 @@ Use this for direct ASGI server invocation::
 
     uvicorn aeam.main:app --host 0.0.0.0 --port 8000
 """
-
-# ---------------------------------------------------------------------------
-# Note: EventBus modification required to support "ALL" wildcard.
-# In aeam/core/event_bus.py, modify the publish() method to:
-#
-#   handlers = self._handlers.get(event.event_type, [])
-#   wildcard_handlers = self._handlers.get("ALL", [])
-#   for handler in handlers + wildcard_handlers:
-#       handler(event)
-# ---------------------------------------------------------------------------
