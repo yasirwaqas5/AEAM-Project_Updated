@@ -88,12 +88,13 @@ are injected (no globals). Each has a strict responsibility boundary noted below
 
 ### Orchestrator — `aeam/agents/orchestrator/orchestrator.py`
 Central coordinator of the incident lifecycle: `EVENT_RECEIVED → INVESTIGATING → DECIDING → COMPLETE`.
-- Registered as the `"ALL"` wildcard EventBus handler; `handle_event()` is the entry point.
-- `investigate()` runs one pass: DecisionEngine decides, then (idempotently, once per incident) gathers advisory findings from Enterprise Memory (C1), Policy Registry (C3), Cross-Dataset Intelligence (C4), Adaptive Detection (C5), and RAG (Phase 4); forces LLM reasoning at depth ≥ 3.
-- `evaluate()` routes on EvaluationEngine result: CONTINUE (recurse) / STOP / ESCALATE.
-- `finalize_incident()` executes the event's safe runbook via ActionAgent, sends structured Slack/Jira/email notifications, writes a consolidated `audit_summary`, persists via LongTermMemory, and remembers the incident.
+- Registered as the `"ALL"` wildcard EventBus handler; `handle_event()` is the ONLY public entry point.
+- **Reentrant (Phase E2, ARCH-8).** Every call to `handle_event()` allocates a fresh `IncidentContext` (`aeam/agents/orchestrator/incident_context.py`) holding that incident's own `ShortTermMemory` and `IncidentStateMachine`, and threads it through every internal helper. Nothing per-incident lives on the Orchestrator instance. N threads can drive `handle_event()` concurrently — Monitor + trigger, or N parallel triggers — without cross-contamination.
+- `_investigate(ctx)` runs one pass: DecisionEngine decides, then (idempotently, once per incident) gathers advisory findings from Enterprise Memory (C1), Policy Registry (C3), Cross-Dataset Intelligence (C4), Adaptive Detection (C5), and RAG (Phase 4); forces LLM reasoning at depth ≥ 3.
+- `_evaluate(ctx)` routes on EvaluationEngine result: CONTINUE (recurse) / STOP / ESCALATE.
+- `_finalize_incident(ctx)` executes the event's safe runbook via ActionAgent, sends structured Slack/Jira/email notifications, writes a consolidated `audit_summary`, persists via LongTermMemory, and remembers the incident.
 - Constraints: no detection logic, no direct DB writes (delegates to LTM), no external API calls (delegates to ActionAgent). Advisory findings NEVER feed back into RuleEngine/DecisionEngine/ActionAgent.
-- Key collaborators: `decision_engine`, `evaluation_engine`, `state_machine`, `investigation_status`, `notifications`, `runbooks`, `cause_quality`.
+- Key collaborators: `decision_engine`, `evaluation_engine`, `incident_context`, `state_machine`, `investigation_status`, `notifications`, `runbooks`, `cause_quality`.
 
 ### Monitor — `aeam/agents/monitor/monitor_agent.py`
 Deterministic KPI detection + event creation; runs a continuous polling loop in a background thread (`start()`).
