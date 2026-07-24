@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import {
   PageHeader, Card, CardTitle, Field, Badge, ConfidenceBar,
   Skeleton, Icon, Button, stateColor, deriveStatus, getRetrievedCount, getRecommendedAction,
-  fmtTime, fmtRelative,
+  fmtTime, fmtRelative, buildMeshLive,
 } from "../components/ui";
 import { PageContainer } from "../components/library";
 import { CountUp, Sparkline, ProgressRing } from "../components/charts";
@@ -122,6 +122,10 @@ export default function Dashboard() {
       && deriveStatus(i).label !== "Resolved").length,
     [incidents],
   );
+  // Real per-agent activity for the mesh — derived from persisted incidents
+  // + observability; never fabricated.
+  const meshLive = useMemo(() => buildMeshLive(incidents, observability), [incidents, observability]);
+  const investigating = (status?.active_incidents ?? 0) > 0;
 
   return (
     <PageContainer max={1280}>
@@ -139,7 +143,7 @@ export default function Dashboard() {
 
         {/* ── Hero: live agent mesh + platform vitals ─────────────────── */}
         <Card style={{ marginBottom: "1rem", padding: 0, overflow: "hidden" }} accent="var(--accent)">
-          <div style={{ display: "grid", gridTemplateColumns: "minmax(300px, 1.15fr) minmax(260px, 1fr)", alignItems: "stretch" }}
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(290px, 1fr) minmax(340px, 1.35fr)", alignItems: "stretch" }}
             className="aeam-hero-grid">
             <div style={{ padding: "1.5rem 1.7rem", display: "flex", flexDirection: "column", gap: "1.1rem", justifyContent: "center" }}>
               <div>
@@ -168,10 +172,20 @@ export default function Dashboard() {
               </div>
             </div>
 
-            <div style={{ position: "relative", minHeight: 250, borderLeft: "1px solid var(--border)" }}>
+            <div style={{
+              position: "relative", minHeight: 400, borderLeft: "1px solid var(--border)",
+              background: "radial-gradient(700px 380px at 60% 42%, rgba(56,120,220,.09), transparent 65%)",
+            }}>
               <Suspense fallback={<div style={{ height: "100%", background: "radial-gradient(circle at 50% 45%, rgba(91,157,255,.15), transparent 60%)" }} />}>
-                <AgentMesh variant="dashboard" health={aiHealthScore} height="100%" />
+                <AgentMesh variant="dashboard" health={aiHealthScore} height="100%"
+                  live={meshLive} investigating={investigating} />
               </Suspense>
+              <span style={{
+                position: "absolute", bottom: 10, right: 14, fontSize: "var(--fs-2xs)",
+                color: "var(--faint)", fontFamily: "var(--font-mono)", pointerEvents: "none",
+              }}>
+                live architecture · hover an agent
+              </span>
             </div>
           </div>
         </Card>

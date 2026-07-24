@@ -1,7 +1,7 @@
-import { useState, useEffect, lazy, Suspense } from "react";
+import { useState, useEffect, useMemo, lazy, Suspense } from "react";
 import { useNavigate } from "react-router-dom";
-import { motion } from "framer-motion";
-import { UIStyles, Icon } from "../components/ui";
+import { motion, AnimatePresence } from "framer-motion";
+import { UIStyles, Icon, buildMeshLive } from "../components/ui";
 import { ShellStyles } from "../components/library";
 import { CountUp } from "../components/charts";
 import { ENGINES } from "../components/three/AgentMesh";
@@ -20,34 +20,97 @@ const AgentMesh = lazy(() => import("../components/three/AgentMesh"));
  * backend is unreachable the page says so honestly instead of faking data.
  * ────────────────────────────────────────────────────────────────────────── */
 
-const ENGINE_DESCRIPTIONS = {
-  memory:    "Recalls similar resolved incidents from organizational memory and reuses their outcomes as evidence.",
-  policy:    "Matches live incidents against extracted enterprise policies — deterministic metric tier plus semantic tier.",
-  cross:     "Correlates the incident metric against other activated datasets to find supporting business signals.",
-  adaptive:  "Longer-horizon adaptive baselines and day-of-week seasonality checks on the incident's metric.",
-  retrieval: "Hybrid dense + lexical retrieval with reranking, diversity filtering and business-relevance ranking.",
-  plan:      "Synthesizes every evidence source into one explainable, priority-ordered execution plan.",
-  explain:   "Explains WHY each recommendation exists — evidence chains, confidence breakdown, missing evidence.",
-  eval:      "Scores investigation quality across ten transparent components — thoroughness, never probability.",
-  observe:   "Cross-incident hit rates, trends and an overall AI-health score for the platform itself.",
-};
-
 const STACK = [
   "FastAPI", "PostgreSQL", "Redis", "Qdrant", "SentenceTransformers",
   "Prophet", "Prometheus", "React", "Vite", "React Three Fiber",
 ];
 
-const bootLines = (health, obs) => [
-  { text: "Initializing enterprise agent mesh", state: "done" },
-  { text: `Postgres · Redis · event queue — ${health ? "connected" : "unreachable"}`, state: health ? "done" : "err" },
+/* Cinematic boot sequence — every line describes a REAL subsystem; the two
+   live lines reflect true backend/observability state. ~3s total, skippable. */
+const bootSequence = (online, obs) => [
+  { text: "Initializing AEAM…", state: "done" },
+  { text: `Core services — Postgres · Redis · event queue ${online ? "connected" : "unreachable"}`, state: online ? "done" : "err" },
+  { text: "Loading Enterprise Memory", state: "done" },
+  { text: "Loading Policy Intelligence", state: "done" },
+  { text: "Loading Cross-Dataset Intelligence", state: "done" },
+  { text: "Loading Adaptive Detection", state: "done" },
+  { text: "Loading Advanced Retrieval", state: "done" },
+  { text: "Loading Explainability · AI Evaluation · Observability", state: "done" },
+  { text: "Synchronizing Agent Mesh", state: "done" },
   {
     text: obs?.total_investigations != null
-      ? `${obs.total_investigations} investigations in organizational memory`
-      : "Investigation history unavailable",
+      ? `Platform ready — ${obs.total_investigations} investigations in organizational memory`
+      : "Platform ready — investigation history unavailable",
     state: obs ? "done" : "warn",
   },
-  { text: "9 intelligence engines online", state: "done" },
 ];
+
+/* The real end-to-end flow, one hop per second — teaches the architecture
+   in under 20 seconds. Highlight cycles automatically; reduced motion gets
+   the static list. */
+const FLOW = [
+  ["Upload", "documents & datasets enter the platform"],
+  ["Monitor", "KPI feeds watched for anomalies"],
+  ["Orchestrator", "coordinates the investigation"],
+  ["Enterprise Memory", "similar past incidents recalled"],
+  ["Policy Intelligence", "governed business rules consulted"],
+  ["Cross-Dataset", "other datasets checked for correlation"],
+  ["Adaptive Detection", "long-horizon baselines applied"],
+  ["Advanced Retrieval", "knowledge evidence retrieved"],
+  ["Execution Planning", "one explainable plan synthesized"],
+  ["Explainability", "every recommendation justified"],
+  ["AI Evaluation", "investigation quality scored"],
+  ["Observability", "platform health measured"],
+  ["Action Engine", "Slack · Jira · webhooks executed"],
+  ["Report Agent", "audit-ready report generated"],
+  ["Console", "everything lands in this dashboard"],
+];
+
+function FlowStory() {
+  const [step, setStep] = useState(0);
+  const reduced = typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+  useEffect(() => {
+    if (reduced) return;
+    const id = setInterval(() => setStep((s) => (s + 1) % FLOW.length), 1200);
+    return () => clearInterval(id);
+  }, [reduced]);
+
+  return (
+    <div style={{
+      background: "linear-gradient(180deg,var(--surface-2),var(--surface))",
+      border: "1px solid var(--border)", borderRadius: "var(--r-lg)",
+      padding: "1.5rem 1.4rem", boxShadow: "var(--e1), var(--edge)",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: "0.45rem", flexWrap: "wrap" }}>
+        {FLOW.map(([label], i, arr) => {
+          const active = !reduced && i === step;
+          return (
+            <div key={label} style={{ display: "flex", alignItems: "center", gap: "0.45rem" }}>
+              <span style={{
+                padding: ".42rem .8rem", borderRadius: "var(--r-md)", fontSize: "var(--fs-xs)", fontWeight: 600,
+                whiteSpace: "nowrap", transition: "all .35s var(--ease-out)",
+                color: active ? "#fff" : "var(--text-2)",
+                background: active ? "var(--accent-dim)" : "rgba(255,255,255,.02)",
+                border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
+                boxShadow: active ? "0 0 18px rgba(91,157,255,.3)" : "none",
+                transform: active ? "translateY(-2px)" : "none",
+              }}>{label}</span>
+              {i < arr.length - 1 && <Icon name="arrowr" size={11} color={active ? "var(--accent)" : "var(--faint)"} />}
+            </div>
+          );
+        })}
+      </div>
+      <p aria-live="polite" style={{
+        margin: "1.1rem 0 0", minHeight: "1.4em", fontSize: "var(--fs-sm)",
+        color: "var(--muted)", fontFamily: "var(--font-mono)",
+      }}>
+        {reduced ? "Signals flow left to right — every investigation traverses this chain." : (
+          <><span style={{ color: "var(--accent)", fontWeight: 700 }}>{FLOW[step][0]}</span> — {FLOW[step][1]}</>
+        )}
+      </p>
+    </div>
+  );
+}
 
 const rise = {
   hidden: { opacity: 0, y: 22 },
@@ -83,6 +146,8 @@ export default function Welcome() {
   const [health, setHealth] = useState(null);
   const [obs, setObs] = useState(null);
   const [incidents, setIncidents] = useState(null);
+  const [bootDone, setBootDone] = useState(false);
+  const [bootHidden, setBootHidden] = useState(false);
 
   useEffect(() => {
     fetch("/health").then((r) => (r.ok ? r.json() : null)).then(setHealth).catch(() => setHealth(null));
@@ -94,12 +159,27 @@ export default function Welcome() {
   const aiHealth = obs?.overall_ai_health?.available ? obs.overall_ai_health.score : null;
   const resolved = obs?.investigation_success_rate?.available ? obs.investigation_success_rate : null;
   const online = health?.status === "healthy";
+  const meshLive = useMemo(() => buildMeshLive(incidents || [], obs), [incidents, obs]);
+
+  // Boot completes on its own (~3s) — the skip button just fast-forwards.
+  useEffect(() => {
+    const t = setTimeout(() => setBootDone(true), 3200);
+    return () => clearTimeout(t);
+  }, []);
+
+  // Once complete, the boot log folds away so the agent mesh is unobstructed;
+  // a small status chip remains and can reopen the log on demand.
+  useEffect(() => {
+    if (!bootDone) return;
+    const t = setTimeout(() => setBootHidden(true), 1400);
+    return () => clearTimeout(t);
+  }, [bootDone]);
 
   const stats = [
     { label: "Investigations recorded", value: obs?.total_investigations ?? null },
     { label: "AI health", value: aiHealth != null ? Math.round(aiHealth * 100) : null, suffix: "%" },
     { label: "Resolution rate", value: resolved ? Math.round(resolved.rate * 100) : null, suffix: "%" },
-    { label: "Intelligence engines", value: ENGINES.length },
+    { label: "Mesh components", value: ENGINES.length + 1, suffix: " agents" },
   ];
 
   return (
@@ -113,9 +193,9 @@ export default function Welcome() {
         alignItems: "center", justifyContent: "center", overflow: "hidden",
         background: "radial-gradient(1100px 600px at 50% 30%, rgba(56,120,220,.10), transparent 65%), var(--bg)",
       }}>
-        <div style={{ position: "absolute", inset: 0, opacity: 0.9 }}>
+        <div style={{ position: "absolute", inset: 0, opacity: 0.92 }}>
           <Suspense fallback={null}>
-            <AgentMesh variant="welcome" health={aiHealth} height="100%" />
+            <AgentMesh variant="welcome" health={aiHealth} height="100%" live={meshLive} />
           </Suspense>
         </div>
 
@@ -138,28 +218,65 @@ export default function Welcome() {
             senior analyst would — with memory, policy, evidence and an audit trail.
           </motion.p>
 
-          {/* Boot sequence — real dependency signals */}
-          <motion.div custom={3} initial="hidden" animate="show" variants={rise}
-            style={{
-              margin: "2rem auto 0", width: "min(430px, 90vw)", textAlign: "left",
-              background: "var(--glass-bg)", backdropFilter: "var(--glass-blur)",
-              border: "1px solid var(--border)", borderRadius: "var(--r-lg)",
-              padding: "1rem 1.2rem", fontFamily: "var(--font-mono)", fontSize: "var(--fs-xs)",
-              boxShadow: "var(--e3), var(--edge)",
-            }}>
-            {bootLines(online, obs).map((l, i) => (
-              <motion.div key={l.text} initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }}
-                transition={{ delay: 0.65 + i * 0.28 }}
-                style={{ display: "flex", alignItems: "center", gap: 10, padding: ".28rem 0", color: "var(--text-2)" }}>
-                <span style={{
-                  width: 7, height: 7, borderRadius: "50%", flexShrink: 0,
-                  background: l.state === "done" ? "var(--ok)" : l.state === "warn" ? "var(--warn)" : "var(--err)",
-                  boxShadow: `0 0 6px ${l.state === "done" ? "var(--ok)" : l.state === "warn" ? "var(--warn)" : "var(--err)"}`,
-                }} />
-                {l.text}
-              </motion.div>
-            ))}
-          </motion.div>
+          {/* Cinematic boot sequence — real subsystems, real signals, skippable.
+              Folds away after completion so the mesh stays visible; the chip
+              below can reopen it. */}
+          <div style={{ minHeight: 56, marginTop: "2rem" }}>
+            <AnimatePresence mode="wait">
+              {!bootHidden ? (
+                <motion.div key="bootlog" custom={3} initial="hidden" animate="show" variants={rise}
+                  exit={{ opacity: 0, y: -14, scale: 0.97, transition: { duration: 0.35 } }}
+                  style={{
+                    margin: "0 auto", width: "min(470px, 90vw)", textAlign: "left",
+                    background: "var(--glass-bg)", backdropFilter: "var(--glass-blur)",
+                    border: "1px solid var(--border)", borderRadius: "var(--r-lg)",
+                    padding: "1rem 1.2rem", fontFamily: "var(--font-mono)", fontSize: "var(--fs-xs)",
+                    boxShadow: "var(--e3), var(--edge)", position: "relative", pointerEvents: "auto",
+                  }}>
+                  <button onClick={() => (bootDone ? setBootHidden(true) : setBootDone(true))} style={{
+                    position: "absolute", top: 8, right: 10,
+                    background: "none", border: "none", cursor: "pointer",
+                    color: "var(--faint)", fontSize: "var(--fs-2xs)", fontFamily: "var(--font-mono)",
+                  }}>
+                    {bootDone ? "hide ✕" : "skip ↵"}
+                  </button>
+                  {bootSequence(online, obs).map((l, i) => (
+                    <motion.div key={l.text}
+                      initial={{ opacity: 0, x: -8 }}
+                      animate={bootDone ? { opacity: 1, x: 0, transition: { duration: 0.12 } } : { opacity: 1, x: 0 }}
+                      transition={bootDone ? undefined : { delay: 0.5 + i * 0.27 }}
+                      style={{ display: "flex", alignItems: "center", gap: 10, padding: ".26rem 0", color: "var(--text-2)" }}>
+                      <span style={{
+                        width: 7, height: 7, borderRadius: "50%", flexShrink: 0,
+                        background: l.state === "done" ? "var(--ok)" : l.state === "warn" ? "var(--warn)" : "var(--err)",
+                        boxShadow: `0 0 6px ${l.state === "done" ? "var(--ok)" : l.state === "warn" ? "var(--warn)" : "var(--err)"}`,
+                      }} />
+                      {l.text}
+                    </motion.div>
+                  ))}
+                </motion.div>
+              ) : (
+                <motion.button key="bootchip"
+                  initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, transition: { duration: 0.15 } }}
+                  onClick={() => setBootHidden(false)}
+                  title="Show the boot log"
+                  style={{
+                    margin: "0 auto", display: "inline-flex", alignItems: "center", gap: 9,
+                    pointerEvents: "auto", cursor: "pointer",
+                    background: "var(--glass-bg)", backdropFilter: "var(--glass-blur)",
+                    border: "1px solid var(--border)", borderRadius: 20,
+                    padding: ".45rem 1rem", fontFamily: "var(--font-mono)", fontSize: "var(--fs-2xs)",
+                    color: "var(--text-2)", boxShadow: "var(--e2), var(--edge)",
+                  }}>
+                  <span style={{ width: 7, height: 7, borderRadius: "50%", background: online ? "var(--ok)" : "var(--err)", boxShadow: `0 0 6px ${online ? "var(--ok)" : "var(--err)"}` }} />
+                  {online ? "Platform ready" : "Backend unreachable"}
+                  {obs?.total_investigations != null && ` — ${obs.total_investigations} investigations in memory`}
+                  <span style={{ color: "var(--faint)" }}>· log</span>
+                </motion.button>
+              )}
+            </AnimatePresence>
+          </div>
 
           <motion.div custom={4} initial="hidden" animate="show" variants={rise}
             style={{ marginTop: "2.2rem", display: "flex", gap: "0.9rem", justifyContent: "center", pointerEvents: "auto" }}>
@@ -195,9 +312,9 @@ export default function Welcome() {
         )}
       </Section>
 
-      {/* ── Capability grid — the real engine roster ───────────────────── */}
+      {/* ── Capability grid — the real component roster ────────────────── */}
       <Section>
-        <SectionTitle kicker="Intelligence engines" title="Nine engines, one investigation" />
+        <SectionTitle kicker="The agent mesh" title="One orchestrator, thirteen specialists" />
         <div className="aeam-grid-2" style={{ gap: "1rem" }}>
           {ENGINES.map((e, i) => (
             <motion.div key={e.key} variants={rise} custom={i % 3}
@@ -207,35 +324,19 @@ export default function Welcome() {
                 <span style={{ fontWeight: 650, color: "var(--text)", fontSize: "var(--fs-md)" }}>{e.label}</span>
               </div>
               <p style={{ color: "var(--muted)", fontSize: "var(--fs-sm)", lineHeight: 1.6 }}>
-                {ENGINE_DESCRIPTIONS[e.key]}
+                {e.purpose}
               </p>
             </motion.div>
           ))}
         </div>
       </Section>
 
-      {/* ── Architecture / data flow ───────────────────────────────────── */}
+      {/* ── Architecture story — animated end-to-end flow ──────────────── */}
       <Section>
-        <SectionTitle kicker="Architecture" title="Signal to action, fully audited" />
-        <motion.div variants={rise} style={{
-          display: "flex", alignItems: "center", gap: "0.4rem", flexWrap: "wrap",
-          background: "linear-gradient(180deg,var(--surface-2),var(--surface))",
-          border: "1px solid var(--border)", borderRadius: "var(--r-lg)",
-          padding: "1.6rem 1.4rem", boxShadow: "var(--e1), var(--edge)",
-        }}>
-          {["Signals", "Detection", "Orchestrator", "Evidence Mesh", "Execution Plan", "Actions", "Memory"].map((step, i, arr) => (
-            <div key={step} style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
-              <span style={{
-                padding: ".55rem .95rem", borderRadius: "var(--r-md)", fontSize: "var(--fs-sm)", fontWeight: 600,
-                color: i === 3 ? "var(--accent)" : "var(--text-2)",
-                background: i === 3 ? "var(--accent-dim)" : "rgba(255,255,255,.025)",
-                border: `1px solid ${i === 3 ? "var(--accent-border)" : "var(--border)"}`,
-                whiteSpace: "nowrap",
-              }}>{step}</span>
-              {i < arr.length - 1 && <Icon name="arrowr" size={13} color="var(--faint)" />}
-            </div>
-          ))}
-          <p style={{ width: "100%", margin: ".9rem 0 0", color: "var(--muted)", fontSize: "var(--fs-sm)", lineHeight: 1.6 }}>
+        <SectionTitle kicker="Architecture" title="Signal to action in one auditable chain" />
+        <motion.div variants={rise}>
+          <FlowStory />
+          <p style={{ margin: "1rem 0 0", color: "var(--muted)", fontSize: "var(--fs-sm)", lineHeight: 1.6 }}>
             Every investigation persists its complete evidence trail — memory recalls, policy matches,
             cross-dataset correlations, adaptive baselines, retrieved documents, the execution plan,
             its explanation and a quality score — as one auditable record. Resolved incidents feed back

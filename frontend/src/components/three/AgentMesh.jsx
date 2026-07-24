@@ -23,6 +23,7 @@ export const ENGINES = [
   { key: "monitor",   label: "Monitor Agent",       color: "#38bdf8", purpose: "Watches live KPI feeds and turns anomalies into investigation events." },
   { key: "memory",    label: "Enterprise Memory",   color: "#a78bfa", purpose: "Recalls similar resolved incidents and reuses their outcomes as evidence." },
   { key: "policy",    label: "Policy Registry",     color: "#5b9dff", purpose: "Matches incidents against extracted enterprise policies — metric + semantic tiers." },
+  { key: "policy_intel", label: "Policy Intelligence", color: "#818cf8", purpose: "Extracts explicit business rules from ingested documents into the governed policy table." },
   { key: "cross",     label: "Cross-Dataset",       color: "#2dd4bf", purpose: "Correlates the incident metric against other activated business datasets." },
   { key: "adaptive",  label: "Adaptive Detection",  color: "#fbbf24", purpose: "Longer-horizon baselines and day-of-week seasonality checks." },
   { key: "retrieval", label: "Advanced Retrieval",  color: "#38bdf8", purpose: "Hybrid dense + lexical retrieval with reranking and business-relevance ranking." },
@@ -39,13 +40,16 @@ const prefersReduced = () =>
   window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
 function layout(radius) {
+  // A nearly-flat circle; the scene's base tilt (see MeshScene) presents it
+  // as a clean ellipse so nodes and labels distribute around the ring
+  // instead of stacking vertically.
   return ENGINES.map((e, i) => {
     const a = (i / ENGINES.length) * Math.PI * 2;
     return {
       ...e,
       pos: new THREE.Vector3(
         Math.cos(a) * radius,
-        Math.sin(a * 2.0) * radius * 0.2,
+        Math.sin(a * 2.0) * radius * 0.09,
         Math.sin(a) * radius,
       ),
     };
@@ -70,11 +74,12 @@ function Core({ color, animate, hovered }) {
         <meshBasicMaterial color={color} wireframe transparent opacity={0.35} toneMapped={false} />
       </mesh>
       {!hovered && (
-        <Html center distanceFactor={9} style={{ pointerEvents: "none" }}>
+        <Html center style={{ pointerEvents: "none" }} zIndexRange={[5, 0]}>
+          {/* Screen-space constant size — never scales with camera distance. */}
           <div style={{
-            transform: "translateY(40px)", whiteSpace: "nowrap", textAlign: "center",
-            fontSize: 12, fontWeight: 700, letterSpacing: ".16em", color: "#e8edf6",
-            textShadow: "0 0 14px rgba(2,6,12,.9)", textTransform: "uppercase",
+            transform: "translateY(30px)", whiteSpace: "nowrap", textAlign: "center",
+            fontSize: 10, fontWeight: 700, letterSpacing: ".22em", color: "#cfd8e8",
+            textShadow: "0 0 12px rgba(2,6,12,.95)", textTransform: "uppercase",
             fontFamily: "'Segoe UI Variable Text','Segoe UI',system-ui,sans-serif",
           }}>
             Orchestrator
@@ -119,14 +124,16 @@ function EngineNode({ node, index, animate, active, hoveredKey, onHover, info })
         <meshBasicMaterial color={node.color} transparent opacity={hovered ? 0.24 : 0.11} toneMapped={false} />
       </mesh>
 
-      {/* Always-on elegant label; fades back while another node is examined. */}
-      <Html center distanceFactor={9} style={{ pointerEvents: "none" }} zIndexRange={[10, 0]}>
+      {/* Always-on label — constant screen size (never scales with depth),
+          alternating above/below the node so neighbours don't collide. */}
+      <Html center style={{ pointerEvents: "none" }} zIndexRange={[10, 0]}>
         <div style={{
-          transform: "translateY(24px)", whiteSpace: "nowrap", textAlign: "center",
-          fontSize: 11, fontWeight: 600, letterSpacing: ".02em",
-          color: hovered ? "#ffffff" : "#b9c3d6",
-          opacity: dimmed ? 0.25 : 1, transition: "opacity .2s, color .2s",
-          textShadow: "0 0 12px rgba(2,6,12,.95), 0 0 4px rgba(2,6,12,.9)",
+          transform: index % 2 === 0 ? "translateY(16px)" : "translateY(-18px)",
+          whiteSpace: "nowrap", textAlign: "center",
+          fontSize: 10, fontWeight: 600, letterSpacing: ".03em",
+          color: hovered ? "#ffffff" : "#9aa6bd",
+          opacity: dimmed ? 0.2 : 1, transition: "opacity .2s, color .2s",
+          textShadow: "0 0 10px rgba(2,6,12,.95), 0 0 3px rgba(2,6,12,.9)",
           fontFamily: "'Segoe UI Variable Text','Segoe UI',system-ui,sans-serif",
         }}>
           {node.label}
@@ -135,9 +142,9 @@ function EngineNode({ node, index, animate, active, hoveredKey, onHover, info })
 
       {/* Hover: the agent dossier — real state only. */}
       {hovered && (
-        <Html center distanceFactor={7} style={{ pointerEvents: "none" }} zIndexRange={[100, 90]}>
+        <Html center style={{ pointerEvents: "none" }} zIndexRange={[100, 90]}>
           <div style={{
-            transform: "translateY(-86px)", width: 250, textAlign: "left",
+            transform: "translateY(-78px)", width: 232, textAlign: "left",
             background: "rgba(12,16,24,.94)", border: `1px solid ${node.color}`,
             borderRadius: 10, padding: "10px 13px",
             boxShadow: `0 12px 40px rgba(2,6,12,.7), 0 0 24px ${node.color}33`,
@@ -225,9 +232,12 @@ function MeshScene({ coreColor, animate, radius, live, investigating }) {
 
   useFrame(({ pointer }, dt) => {
     if (!group.current) return;
-    if (animate && !hoveredKey) group.current.rotation.y += dt * 0.06;
-    group.current.rotation.x = THREE.MathUtils.lerp(group.current.rotation.x, pointer.y * -0.14, 0.04);
-    group.current.rotation.z = THREE.MathUtils.lerp(group.current.rotation.z, pointer.x * 0.045, 0.04);
+    // Slow enough that labels stay readable; hover freezes rotation entirely.
+    if (animate && !hoveredKey) group.current.rotation.y += dt * 0.035;
+    // Base tilt presents the ring as a circle/ellipse (round-table view)
+    // instead of an edge-on line; pointer parallax layers on top.
+    group.current.rotation.x = THREE.MathUtils.lerp(group.current.rotation.x, -0.3 + pointer.y * -0.1, 0.04);
+    group.current.rotation.z = THREE.MathUtils.lerp(group.current.rotation.z, pointer.x * 0.035, 0.04);
   });
 
   return (
@@ -283,7 +293,7 @@ export default function AgentMesh({ health = null, variant = "dashboard", height
       <div style={{ height, position: "relative" }} aria-label="AEAM agent mesh — live architecture map" role="img">
         <Canvas
           dpr={[1, 1.75]}
-          camera={{ position: [0, 1.15, welcome ? 5.4 : 4.9], fov: 44 }}
+          camera={{ position: [0, 0.55, welcome ? 5.7 : 5.2], fov: 44 }}
           gl={{ antialias: true, alpha: true, powerPreference: "high-performance" }}
           frameloop={animate ? "always" : "demand"}
           style={{ background: "transparent" }}
@@ -293,7 +303,7 @@ export default function AgentMesh({ health = null, variant = "dashboard", height
           {/* Cool rim light from behind-left for depth separation. */}
           <directionalLight position={[-6, 2, -4]} intensity={1.6} color="#2dd4bf" />
           <Suspense fallback={null}>
-            <MeshScene coreColor={coreColor} animate={animate} radius={welcome ? 2.2 : 1.95}
+            <MeshScene coreColor={coreColor} animate={animate} radius={welcome ? 2.45 : 2.15}
               live={live} investigating={investigating} />
             <Particles count={welcome ? 460 : 240} animate={animate} />
             {animate && (

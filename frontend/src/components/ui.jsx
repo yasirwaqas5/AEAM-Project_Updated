@@ -550,6 +550,9 @@ export function buildMeshLive(incidents = [], observability = null) {
         : lastSeen[key] ? fmtRelative(lastSeen[key]) : undefined,
     };
   }
+  // Policy Intelligence runs at DOCUMENT INGESTION time, not per incident —
+  // stated honestly rather than pretending an incident-level signal exists.
+  out.policy_intel = { state: "standby", lastActivity: "runs at document ingestion" };
   return out;
 }
 

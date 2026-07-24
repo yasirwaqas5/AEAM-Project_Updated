@@ -14,6 +14,9 @@ export const NAV_GROUPS = [
     items: [
       { to: "/",          label: "Dashboard", icon: "activity", status: "live" },
       { to: "/analytics", label: "Analytics", icon: "target",   status: "live" },
+      // Full-bleed startup-sequence showcase (renders outside the shell) —
+      // for demos, interviews and reviews. Dashboard stays the default.
+      { to: "/welcome",   label: "Welcome Tour", icon: "sparkle", status: "live" },
     ],
   },
   {
