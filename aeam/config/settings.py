@@ -498,6 +498,75 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Identity & Access Enforcement (Phase E3) ---
+    #
+    # Key material for the RS256 JWT verifier and CORS origins move out of
+    # main.py hardcoded literals and into configuration/SecretManager. All
+    # new fields default to empty/None so a `development` posture keeps
+    # working with the placeholder key exactly as it does today (COMPAT-1);
+    # non-development startup applies the SEC-4 fail-closed contract in
+    # main.create_app if key material is placeholder/absent. Engine-owned
+    # defaults (issuer/audience) live in aeam/security/jwt_auth.py -- these
+    # two Settings fields override them only when a value is actually set.
+
+    JWT_PUBLIC_KEY: str = Field(
+        default="",
+        description=(
+            "Phase E3 (SEC-1/SEC-4): PEM-encoded RSA public key for RS256 JWT "
+            "verification, resolved via SecretManager (env var wins). Highest "
+            "precedence key source. Empty = try JWT_PUBLIC_KEY_PATH next; if "
+            "both are empty and ENVIRONMENT is not 'development', startup "
+            "aborts (fail-closed, SEC-4)."
+        ),
+    )
+
+    JWT_PUBLIC_KEY_PATH: str = Field(
+        default="",
+        description=(
+            "Phase E3 (SEC-1/SEC-4): filesystem path to a PEM-encoded RSA "
+            "public key. Fallback used only when JWT_PUBLIC_KEY is empty. "
+            "Same fail-closed contract as JWT_PUBLIC_KEY."
+        ),
+    )
+
+    JWT_ISSUER: str | None = Field(
+        default=None,
+        description=(
+            "Phase E3 (SEC-2, ENG-6): overrides jwt_auth.py's engine-owned "
+            "default issuer claim ('aeam-auth'). None keeps the default -- "
+            "the value continues to live once, in its owning module."
+        ),
+    )
+
+    JWT_AUDIENCE: str | None = Field(
+        default=None,
+        description=(
+            "Phase E3 (SEC-2, ENG-6): overrides jwt_auth.py's engine-owned "
+            "default audience claim ('aeam-api'). None keeps the default."
+        ),
+    )
+
+    CORS_ALLOWED_ORIGINS: str = Field(
+        default="http://localhost:5173",
+        description=(
+            "Phase E3 (SEC-1): comma-separated list of origins the CORS "
+            "middleware admits. Default preserves today's dev frontend "
+            "origin exactly (COMPAT-1). Same comma-separated-string "
+            "convention as ACTIVATED_DATASET_IDS."
+        ),
+    )
+
+    AUDIT_LOG_FILE: str = Field(
+        default="/tmp/audit.log",
+        description=(
+            "Phase E3 (ARCH-7): filesystem path for the AuditLogger's file "
+            "sink. Kept for local-dev convenience; the durable sink is the "
+            "audit_logs table (created by DatabaseClient._init_schema, "
+            "written whenever AuditLogger is constructed with a database "
+            "client). Default preserves today's behaviour exactly."
+        ),
+    )
+
     # --- Validators ---
 
     @field_validator("ENVIRONMENT")
