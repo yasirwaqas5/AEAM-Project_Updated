@@ -15,6 +15,7 @@ from aeam.storage.blob_store import (
     BlobNotFoundError,
     compute_content_hash,
 )
+from aeam.storage.factory import build_blob_store
 
 __all__ = [
     "BlobStore",
@@ -22,4 +23,5 @@ __all__ = [
     "LocalDiskBlobStore",
     "BlobNotFoundError",
     "compute_content_hash",
+    "build_blob_store",
 ]

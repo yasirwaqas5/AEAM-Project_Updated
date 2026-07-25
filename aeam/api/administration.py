@@ -165,11 +165,36 @@ def _all_fields_payload(container: Any) -> dict[str, Any]:
     configured = _current_settings()
     effective = getattr(container, "settings", None)
     fields = [_serialize_field(f.key, configured, effective) for f in CONFIG_FIELDS]
+
+    # Phase E4 (PHIL-1): honestly disclose whether writes here actually
+    # survive instance recycle. `mode` comes from the effective settings
+    # if we have them (that is what the running process was constructed
+    # with) — falling back to `configured` for the very first payload
+    # before the container attaches its settings. `writes_durable` is a
+    # derived boolean for UI convenience; the raw mode string remains
+    # authoritative so future values ('per-tenant', 'read-only', ...) do
+    # not require a schema change.
+    source = effective if effective is not None else configured
+    persistence_mode = str(getattr(source, "CONFIG_PERSISTENCE_MODE", "durable") or "durable").strip().lower()
+    persistence_note = str(getattr(source, "CONFIG_PERSISTENCE_NOTE", "") or "")
+
+    config_persistence: dict[str, Any] = {
+        "mode": persistence_mode,
+        "writes_durable": persistence_mode == "durable",
+        "env_file": str(_ENV_PATH),
+    }
+    if persistence_note:
+        config_persistence["note"] = persistence_note
+
     return {
         "sections": list(SECTION_ORDER),
         "fields": fields,
         "restart_required": any(f["restart_required"] for f in fields),
         "env_file": str(_ENV_PATH),
+        # Additive (Phase E4, COMPAT-4): pre-E4 frontends that do not
+        # read this key see no behavior change; new frontends can render
+        # it to warn operators when writes will not survive recycle.
+        "config_persistence": config_persistence,
     }
 
 

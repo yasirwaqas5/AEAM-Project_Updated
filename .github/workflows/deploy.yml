@@ -68,7 +68,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest pytest-cov
+          pip install pytest pytest-cov "moto[s3]>=5.0"
 
       - name: Run tests
         run: python -m pytest --tb=short -q

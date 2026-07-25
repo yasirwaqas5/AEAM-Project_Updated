@@ -2,9 +2,31 @@
 # AEAM — Google Cloud Run Deployment Manifest
 # deploy/cloudrun.yaml
 #
-# Single-container modular monolith deployment.
+# Single-container modular monolith deployment on ephemeral compute.
 # Deploy with:
 #   gcloud run services replace deploy/cloudrun.yaml --region REGION
+#
+# Phase E4 (ARCH-7 / SEC-5 / TECH-5) state-placement contract:
+#   * BlobStore    -> S3-compatible bucket (BLOB_STORAGE_BACKEND=s3)
+#                     because Cloud Run's local disk is ephemeral.
+#   * ForecastAgent models -> Cloud Storage FUSE mount or a co-located
+#                     bucket in front of a persistent /models path.
+#   * Audit trail  -> audit_logs table (Phase E3); no file dependency.
+#   * .env writes  -> disclosed via CONFIG_PERSISTENCE_MODE=ephemeral
+#                     (Phase E4, PHIL-1) — the D5 admin UI shows the
+#                     honest posture; use env-var overrides here for
+#                     durable production changes.
+#
+# Single-writer components (documented per ARCH-7):
+#   MonitorAgent, IngestionWorker.
+# maxScale=5 is safe only because both are guarded by:
+#   * Redis-shared deduplication + idempotency (multi-instance safe).
+#   * Per-incident IncidentContext (Phase E2 ARCH-8 — the Orchestrator
+#     itself is reentrant across concurrent handlers).
+#
+# NO credential literals in this file. Every secret is sourced from
+# Google Secret Manager via secretKeyRef; the shipped repo never
+# contains a real key.
 # ============================================================
 
 apiVersion: serving.knative.dev/v1
@@ -24,12 +46,16 @@ spec:
   template:
     metadata:
       annotations:
-        # Auto-scaling bounds.
+        # Auto-scaling bounds. See "Single-writer components" note above.
         autoscaling.knative.dev/minScale: "1"
         autoscaling.knative.dev/maxScale: "5"
 
         # CPU is always allocated (not throttled between requests).
         run.googleapis.com/cpu-throttling: "false"
+
+        # Phase E4: use gen2 so the container gets a proper Linux
+        # runtime for boto3 / Cloud Storage FUSE mounts.
+        run.googleapis.com/execution-environment: gen2
 
     spec:
       # Request timeout — allow long investigations.
@@ -49,6 +75,7 @@ spec:
               memory: 4Gi
 
           env:
+            # ---------- Datastores (SEC-5: all via Secret Manager) ----------
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -67,6 +94,7 @@ spec:
                   name: aeam-vector-db-url
                   key: latest
 
+            # ---------- Posture ----------
             - name: ENVIRONMENT
               value: "production"
 
@@ -78,6 +106,93 @@ spec:
 
             - name: MAX_INVESTIGATION_DEPTH
               value: "5"
+
+            # ---------- Phase E3 (SEC-1..7, ARCH-7) — identity & audit ----------
+            # SEC-4 fail-closed: startup aborts if these are unset in a
+            # non-development environment.
+            - name: JWT_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aeam-jwt-public-key
+                  key: latest
+
+            # Optional overrides for the engine-owned defaults.
+            # - name: JWT_ISSUER
+            #   value: "aeam-auth"
+            # - name: JWT_AUDIENCE
+            #   value: "aeam-api"
+
+            - name: CORS_ALLOWED_ORIGINS
+              # Comma-separated origins. Update to the production
+              # console origin (e.g. https://aeam.example.com).
+              value: "https://aeam.example.com"
+
+            - name: AUDIT_LOG_FILE
+              # File sink is best-effort on ephemeral compute; the
+              # durable sink is the audit_logs table (Phase E3).
+              value: "/tmp/audit.log"
+
+            # ---------- Phase E4 (ARCH-7) — durable BlobStore ----------
+            - name: BLOB_STORAGE_BACKEND
+              value: "s3"
+
+            - name: BLOB_S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: aeam-blob-bucket
+                  key: latest
+
+            # Optional — leave unset to use the AWS regional endpoint.
+            # Set this for MinIO / R2 / GCS-via-HMAC.
+            # - name: BLOB_S3_ENDPOINT_URL
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: aeam-blob-endpoint-url
+            #       key: latest
+
+            - name: BLOB_S3_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: aeam-blob-region
+                  key: latest
+
+            # Credentials — omit both to fall back to the workload
+            # identity / IAM role the Cloud Run service runs as
+            # (the recommended posture — no long-lived keys).
+            # - name: BLOB_S3_ACCESS_KEY_ID
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: aeam-blob-access-key-id
+            #       key: latest
+            # - name: BLOB_S3_SECRET_ACCESS_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: aeam-blob-secret-access-key
+            #       key: latest
+
+            - name: BLOB_S3_PREFIX
+              value: "aeam/prod"
+
+            # ---------- Phase E4 (ARCH-7) — durable model artifacts ----------
+            # Cloud Run mounts a Cloud Storage FUSE volume at /models
+            # via the run.googleapis.com/volume-mounts annotation
+            # (configured out-of-band by the operator's Terraform).
+            - name: FORECAST_MODEL_DIR
+              value: "/models"
+
+            # ---------- Phase E4 (PHIL-1) — config persistence honesty ----------
+            # Cloud Run's writable layer is ephemeral. .env writes made
+            # via the D5 admin API succeed locally but are lost on
+            # instance recycle — surface that to the operator.
+            - name: CONFIG_PERSISTENCE_MODE
+              value: "ephemeral"
+
+            - name: CONFIG_PERSISTENCE_NOTE
+              value: >-
+                Writes via the admin API are LOCAL to the current instance
+                and do NOT survive recycle on Cloud Run. For durable
+                production changes, edit deploy/cloudrun.yaml and
+                redeploy.
 
           # Liveness probe — restart container if /health fails.
           livenessProbe:

@@ -58,3 +58,16 @@ python-multipart
 pypdf            # PDF text-layer extraction
 python-docx      # DOCX paragraph/table text extraction
 openpyxl         # .xlsx reading via pandas.read_excel
+
+# --- Durable object-store BlobStore backend (Phase E4, ARCH-7 / TECH-5) ---
+# Retires the "local-disk blobs on ephemeral compute" audit finding.
+# boto3 is the client; the S3BlobStore talks to any S3-compatible endpoint
+# (AWS S3, MinIO, Cloudflare R2, GCS via the HMAC/S3 interoperability API),
+# so no separate Azure/GCS SDK is needed at this phase.
+boto3
+
+# --- Test-only ---
+# moto provides an in-process S3 mock that lets the E4 BlobStore contract
+# suite run against S3 without any network dependency. Not required at
+# runtime; install this line only in the CI/test environment.
+# moto[s3]     # test-only; install with: pip install "moto[s3]"

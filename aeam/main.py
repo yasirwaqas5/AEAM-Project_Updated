@@ -19,7 +19,7 @@ import logging
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response
@@ -32,6 +32,7 @@ from aeam.core.priority_queue import EventPriorityQueue
 from aeam.integrations.database import DatabaseClient
 from aeam.integrations.redis_client import RedisClient
 from aeam.storage.blob_store import BlobStore, LocalDiskBlobStore
+from aeam.storage.factory import build_blob_store
 from aeam.registry.repositories import (
     IngestionJobRepository,
     DatasetRepository,
@@ -244,10 +245,15 @@ def _build_container(settings: Settings) -> AppContainer:
     pipeline = StructuredDataPipeline()
 
     # Enterprise Data Layer (Phase B1.1) — content-addressable blob store for
-    # original ingested files. Local-disk backend; the registry tables were
-    # created during DatabaseClient construction above.
+    # original ingested files. Phase E4 (ARCH-7) delegates backend selection
+    # to build_blob_store: 'local' preserves today's LocalDiskBlobStore
+    # byte-identically; 's3' targets any S3-compatible endpoint (AWS, MinIO,
+    # R2, GCS-via-HMAC) with credentials resolved through SecretManager.
     logger.info("Initialising BlobStore …")
-    blob_store = LocalDiskBlobStore(settings.BLOB_STORAGE_DIR)
+    blob_store = build_blob_store(
+        settings=settings,
+        secret_manager=SecretManager(settings=settings),
+    )
 
     return AppContainer(
         settings=settings,
@@ -372,10 +378,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Orchestrator allocates a fresh one per incident inside handle_event().
 
     # --- Forecast Agent (Phase 5) ---
+    # Phase E4 (ARCH-7): model_dir is sourced from Settings when set,
+    # so ephemeral-compute deployments (Cloud Run) can point it at a
+    # durable mount. Empty preserves the ForecastAgent engine-owned
+    # default 'models/forecasting' byte-for-byte (COMPAT-1).
+    _forecast_kwargs: dict[str, Any] = {}
+    if settings.FORECAST_MODEL_DIR:
+        _forecast_kwargs["model_dir"] = settings.FORECAST_MODEL_DIR
     forecast_agent = ForecastAgent(
         long_term_memory=long_term_memory,
         data_pipeline=container.pipeline,
         settings=settings,
+        **_forecast_kwargs,
     )
 
     # --- RAG and Report Agents (Phases 4 and 7) ---

@@ -1,8 +1,25 @@
 version: "3.9"
 
+# ============================================================
+# AEAM — local development compose (Phase E4, ARCH-7 / SEC-5)
+#
+# Local single-node posture. All persistent state is on named
+# volumes (blob store, Postgres, Redis, Qdrant), so an instance
+# recycle preserves uploaded knowledge, models, incidents, and
+# indexes exactly as production would on a durable substrate.
+#
+# NO CREDENTIAL LITERALS. Every secret comes from the environment
+# via the accompanying .env file (see .env.example). Missing an
+# expected variable fails fast — passwords are never inherited
+# from a hardcoded default.
+#
+# Production (Cloud Run) posture lives in deploy/cloudrun.yaml,
+# not here. This file is for a developer laptop.
+# ============================================================
+
 services:
 
-  # 🔴 AEAM APP (MAIN SYSTEM)
+  # AEAM APP
   aeam-app:
     build: .
     container_name: aeam-app
@@ -13,20 +30,58 @@ services:
       - redis
       - qdrant
     environment:
-      DATABASE_URL: postgresql://postgres:secret@postgres:5432/postgres
-      REDIS_URL: redis://redis:6379/0
-      VECTOR_DB_URL: http://qdrant:6333
-      ENVIRONMENT: production
-      LLM_ENABLED: "true"
+      # Datastores — passwords sourced from .env (fail-fast if unset).
+      DATABASE_URL: "postgresql://postgres:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (see .env.example)}@postgres:5432/postgres"
+      REDIS_URL: "redis://redis:6379/0"
+      VECTOR_DB_URL: "http://qdrant:6333"
+
+      # Posture. 'production' keeps the security middleware live;
+      # local dev users who want the E3 dev-bypass may set
+      # ENVIRONMENT=development in their .env.
+      ENVIRONMENT: "${ENVIRONMENT:-production}"
+      LLM_ENABLED: "${LLM_ENABLED:-false}"
+
+      # E3: JWT public key + audit sink. When ENVIRONMENT!=development,
+      # JWT_PUBLIC_KEY (or JWT_PUBLIC_KEY_PATH) MUST be set — the
+      # container will refuse to start otherwise (SEC-4).
+      JWT_PUBLIC_KEY: "${JWT_PUBLIC_KEY:-}"
+      JWT_PUBLIC_KEY_PATH: "${JWT_PUBLIC_KEY_PATH:-}"
+      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-http://localhost:5173}"
+      AUDIT_LOG_FILE: "${AUDIT_LOG_FILE:-/var/log/aeam/audit.log}"
+
+      # E4: durable BlobStore backend. Default 'local' points at the
+      # named volume mounted below, which is durable across docker
+      # compose down/up. Flip to 's3' + BLOB_S3_* to talk to any
+      # S3-compatible endpoint (MinIO, R2, GCS-via-HMAC, AWS S3).
+      BLOB_STORAGE_BACKEND: "${BLOB_STORAGE_BACKEND:-local}"
+      BLOB_STORAGE_DIR: "/var/lib/aeam/blobs"
+      BLOB_S3_BUCKET: "${BLOB_S3_BUCKET:-}"
+      BLOB_S3_ENDPOINT_URL: "${BLOB_S3_ENDPOINT_URL:-}"
+      BLOB_S3_REGION: "${BLOB_S3_REGION:-}"
+      BLOB_S3_ACCESS_KEY_ID: "${BLOB_S3_ACCESS_KEY_ID:-}"
+      BLOB_S3_SECRET_ACCESS_KEY: "${BLOB_S3_SECRET_ACCESS_KEY:-}"
+      BLOB_S3_PREFIX: "${BLOB_S3_PREFIX:-}"
+
+      # E4: forecast models — point at the durable volume so retrains
+      # are not required on every recreate.
+      FORECAST_MODEL_DIR: "/var/lib/aeam/models"
+
+      # E4 PHIL-1: this compose posture IS durable (both blob dir and
+      # model dir are on named volumes below) — surface that honestly
+      # in the admin API so operators are not misled about scope.
+      CONFIG_PERSISTENCE_MODE: "${CONFIG_PERSISTENCE_MODE:-durable}"
+    volumes:
+      - aeam_blobs:/var/lib/aeam/blobs
+      - aeam_models:/var/lib/aeam/models
     restart: always
 
-  # 🟦 POSTGRES
+  # POSTGRES
   postgres:
     image: postgres:15
     container_name: aeam-postgres
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: secret
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (see .env.example)}"
       POSTGRES_DB: postgres
     ports:
       - "5432:5432"
@@ -34,7 +89,7 @@ services:
       - postgres_data:/var/lib/postgresql/data
     restart: always
 
-  # 🟨 REDIS
+  # REDIS
   redis:
     image: redis:7
     container_name: aeam-redis
@@ -44,7 +99,7 @@ services:
       - redis_data:/data
     restart: always
 
-  # 🟩 QDRANT (VECTOR DB)
+  # QDRANT (VECTOR DB)
   qdrant:
     image: qdrant/qdrant
     container_name: aeam-qdrant
@@ -54,8 +109,10 @@ services:
       - qdrant_data:/qdrant/storage
     restart: always
 
-# 💾 VOLUMES (PERSISTENCE)
+# VOLUMES (durable state — survives compose down/up)
 volumes:
   postgres_data:
   redis_data:
   qdrant_data:
+  aeam_blobs:    # E4: uploaded ingested files
+  aeam_models:   # E4: trained Prophet model artifacts

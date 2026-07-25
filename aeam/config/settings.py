@@ -167,6 +167,79 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Durable BlobStore backend (Phase E4, ARCH-7 / SEC-5 / TECH-5) ---
+    #
+    # Selects which concrete BlobStore implementation the platform runs.
+    # 'local' preserves today's LocalDiskBlobStore behavior byte-for-byte
+    # (COMPAT-1: unchanged when nothing is configured). 's3' targets any
+    # S3-compatible endpoint (AWS S3, MinIO, R2, GCS-via-HMAC) and is the
+    # correct posture for ephemeral compute like Cloud Run — where the
+    # audit found today's local-disk backend evaporates on instance
+    # recycle. All S3 credential/endpoint values are resolved through
+    # SecretManager (SEC-5); nothing here is a hardcoded credential.
+
+    BLOB_STORAGE_BACKEND: str = Field(
+        default="local",
+        description=(
+            "Phase E4 (ARCH-7): 'local' for LocalDiskBlobStore, 's3' for "
+            "the S3-compatible backend. Default preserves today's local "
+            "behavior; production posture on ephemeral compute must set "
+            "this to 's3' (see deploy/cloudrun.yaml)."
+        ),
+    )
+
+    BLOB_S3_BUCKET: str = Field(
+        default="",
+        description=(
+            "Phase E4: S3 bucket name for the durable BlobStore. Required "
+            "when BLOB_STORAGE_BACKEND=s3; ignored otherwise."
+        ),
+    )
+
+    BLOB_S3_ENDPOINT_URL: str = Field(
+        default="",
+        description=(
+            "Phase E4: custom S3 endpoint URL for non-AWS backends "
+            "(MinIO, Cloudflare R2, GCS HMAC). Empty routes to the AWS "
+            "regional endpoint via boto3's default provider chain."
+        ),
+    )
+
+    BLOB_S3_REGION: str = Field(
+        default="",
+        description=(
+            "Phase E4: AWS region for endpoint resolution. Optional for "
+            "non-AWS endpoints."
+        ),
+    )
+
+    BLOB_S3_ACCESS_KEY_ID: str = Field(
+        default="",
+        description=(
+            "Phase E4 (SEC-5): S3 access key ID resolved through "
+            "SecretManager (never hardcoded in tracked deployment "
+            "artifacts). Empty falls back to boto3's default provider "
+            "chain (IMDS, IAM role, shared credentials, env)."
+        ),
+    )
+
+    BLOB_S3_SECRET_ACCESS_KEY: str = Field(
+        default="",
+        description=(
+            "Phase E4 (SEC-5): S3 secret access key resolved through "
+            "SecretManager. Empty falls back to boto3's default provider "
+            "chain — matching the paired access key ID field."
+        ),
+    )
+
+    BLOB_S3_PREFIX: str = Field(
+        default="",
+        description=(
+            "Phase E4: key prefix inside BLOB_S3_BUCKET. Empty by default; "
+            "set this when a single bucket is shared across environments."
+        ),
+    )
+
     INGEST_WORKER_POLL_SECONDS: float = Field(
         default=2.0,
         gt=0,
@@ -278,6 +351,18 @@ class Settings(BaseSettings):
         gt=0.5,
         lt=1.0,
         description="Confidence interval width for Prophet forecasts.",
+    )
+
+    FORECAST_MODEL_DIR: str = Field(
+        default="",
+        description=(
+            "Phase E4 (ARCH-7): filesystem path where Prophet model artifacts "
+            "are persisted. Empty (the default) keeps ForecastAgent's own "
+            "engine-owned default ('models/forecasting') exactly as it was "
+            "before E4 (COMPAT-1). On ephemeral compute (Cloud Run) this "
+            "MUST point at a durable mount so re-training is not required "
+            "on every instance recycle — see deploy/cloudrun.yaml."
+        ),
     )
 
     # --- Google Sheets configuration ---
@@ -564,6 +649,39 @@ class Settings(BaseSettings):
             "audit_logs table (created by DatabaseClient._init_schema, "
             "written whenever AuditLogger is constructed with a database "
             "client). Default preserves today's behaviour exactly."
+        ),
+    )
+
+    # --- Configuration persistence disclosure (Phase E4, PHIL-1 / PHIL-5) ---
+    #
+    # The Enterprise Configuration Engine (D5) writes to the project .env
+    # file. On a durable single-node deployment that survives instance
+    # recycle exactly as an operator would expect. On ephemeral compute
+    # (Cloud Run), the .env file lives inside the container's writable
+    # layer and evaporates on every recycle — the write itself succeeds,
+    # but the value is lost. Silently succeeding without disclosing that
+    # is dishonest; these two fields let the admin API surface the true
+    # posture in every response.
+
+    CONFIG_PERSISTENCE_MODE: str = Field(
+        default="durable",
+        description=(
+            "Phase E4 (PHIL-1): 'durable' when writes to the D5 config "
+            ".env file survive instance recycle (single-node deployments; "
+            "any environment with a persistent volume mounted at the .env "
+            "path). 'ephemeral' when they do not (Cloud Run's writable "
+            "layer). The admin API surfaces this so the UI never claims "
+            "durability the platform cannot deliver."
+        ),
+    )
+
+    CONFIG_PERSISTENCE_NOTE: str = Field(
+        default="",
+        description=(
+            "Phase E4 (PHIL-1): optional operator-facing message shown by "
+            "the admin API alongside CONFIG_PERSISTENCE_MODE. Free text — "
+            "e.g. 'writes evaporate on instance recycle; use env-var "
+            "overrides in cloudrun.yaml for durable production changes'."
         ),
     )
 
