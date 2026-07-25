@@ -330,6 +330,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     container = _build_container(settings)
     app.state.container = container
 
+    # Phase E3 (ARCH-7): upgrade the AuditLogger with the DB client now
+    # that the container exists. Middleware holds the same AuditLogger
+    # instance, so subsequent audit writes land in the audit_logs table
+    # alongside the file sink. Development environments and any startup
+    # posture without a DB simply keep file-only behaviour (COMPAT-1).
+    audit_logger = getattr(app.state, "audit_logger", None)
+    if audit_logger is not None and getattr(container, "db", None) is not None:
+        audit_logger.attach_database(container.db)
+        logger.info(
+            "AuditLogger durable sink attached (audit_logs table). "
+            "File sink at %s remains active.", settings.AUDIT_LOG_FILE,
+        )
+
     # -----------------------------
     # Orchestrator Wiring (Phase 3)
     # -----------------------------
@@ -1045,8 +1058,12 @@ def create_app() -> FastAPI:
     rate_limiter = RateLimiter(redis_client=redis_client)
     # Phase E3 (ARCH-7): file-sink path is now configurable; the durable
     # DB-backed sink is attached in the lifespan (once the DB client is
-    # available on the container) via container.audit_logger.
+    # available on the container) via audit_logger.attach_database().
     audit_logger = AuditLogger(log_file=settings.AUDIT_LOG_FILE)
+    # Exposed on app.state so the lifespan can upgrade it with a real DB
+    # client once the container is built. The middleware holds the same
+    # instance, so attach_database() takes effect for it too.
+    application.state.audit_logger = audit_logger
 
     application.add_middleware(
         SecurityMiddleware,

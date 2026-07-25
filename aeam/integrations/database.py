@@ -598,12 +598,33 @@ class DatabaseClient:
         );
         """
 
+        # Audit logs table for Phase E3 (ARCH-7) — durable sink alongside
+        # the file sink kept by AuditLogger. Same idempotent-DDL convention
+        # as action_logs above; JSONB is native on PostgreSQL and text
+        # affinity on SQLite (identical to action_logs.parameters/result).
+        # Follows the file record's shape exactly (user_id/action/endpoint/
+        # status_code + timestamp + hash), plus an entry_id primary key and
+        # an extra JSONB column for any additional caller-supplied fields.
+        create_audit_logs = """
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            entry_id TEXT PRIMARY KEY,
+            timestamp TIMESTAMP,
+            user_id TEXT,
+            action TEXT,
+            endpoint TEXT,
+            status_code INTEGER,
+            hash TEXT,
+            extra JSONB
+        );
+        """
+
         try:
             with self._engine.begin() as conn:
                 conn.execute(text(create_incidents))
                 conn.execute(text(create_decisions))
                 conn.execute(text(create_metrics))
                 conn.execute(text(create_action_logs))
+                conn.execute(text(create_audit_logs))
             logger.info("Database tables verified/created successfully.")
         except SQLAlchemyError as exc:
             logger.error("Table creation failed: %s", exc)
