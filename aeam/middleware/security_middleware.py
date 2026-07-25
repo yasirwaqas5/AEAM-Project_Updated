@@ -48,16 +48,56 @@ _PUBLIC_PATHS: frozenset[str] = frozenset({"/", "/health", "/docs", "/openapi.js
 # Keys are path prefixes, matched by ``startswith``, longest prefix first.
 # ---------------------------------------------------------------------------
 _ENDPOINT_RBAC_MAP: list[tuple[str, str, str]] = [
-    # (path_prefix, resource, action)  — ordered longest-prefix first.
-    ("/api/v1/actions/approve",  "actions",   "approve"),
-    ("/api/v1/actions",          "actions",   "execute"),
-    ("/api/v1/incidents/resolve","incidents", "resolve"),
-    ("/api/v1/incidents",        "incidents", "view"),
-    ("/api/v1/documents/ingest", "documents", "ingest"),
-    ("/api/v1/documents",        "documents", "search"),
-    ("/api/v1/kpis/trigger",     "kpis",      "trigger"),
-    ("/api/v1/kpis",             "kpis",      "read"),
-    ("/api/v1/logs",             "logs",      "view"),
+    # (path_prefix, resource, action) — ordered LONGEST-PREFIX FIRST.
+    # Every entry with a longer, more-specific prefix MUST come before
+    # any entry that would otherwise swallow it (e.g. an admin sub-path
+    # must precede its broader parent). _resolve_rbac iterates in order
+    # and returns the first startswith() hit.
+
+    # --- Strictest tier: configuration-writing endpoints (Phase E3,
+    # SEC-3 / SEC-7). All map to admin:config, which only the 'admin'
+    # role holds — no other role can reach these paths.
+    ("/api/v1/admin/config",      "admin",     "config"),
+    ("/api/v1/debug/retrieval",   "admin",     "config"),
+
+    # --- Actions (approve is stricter than execute).
+    ("/api/v1/actions/approve",   "actions",   "approve"),
+    ("/api/v1/actions",           "actions",   "execute"),
+
+    # --- Incidents (resolve is stricter than view).
+    ("/api/v1/incidents/resolve", "incidents", "resolve"),
+    ("/api/v1/incidents",         "incidents", "view"),
+
+    # --- Documents: the legacy /documents/ingest route was retained by
+    # the pre-E3 map even though the real router lives at /api/v1/ingest;
+    # both are mapped so callers using either path see the same guard.
+    ("/api/v1/documents/ingest",  "documents", "ingest"),
+    ("/api/v1/documents",         "documents", "search"),
+    ("/api/v1/ingest",            "documents", "ingest"),
+
+    # --- Knowledge: read via GET on /knowledge; write endpoints under
+    # /knowledge (delete/reindex) require admin:config — added before
+    # the broader /knowledge entry so they resolve first.
+    ("/api/v1/knowledge/delete",  "admin",     "config"),
+    ("/api/v1/knowledge/reindex", "admin",     "config"),
+    ("/api/v1/knowledge",         "documents", "search"),
+
+    # --- Data Center: activating/deactivating datasets is configuration.
+    ("/api/v1/data-center",       "admin",     "config"),
+
+    # --- KPIs (trigger is stricter than read).
+    ("/api/v1/kpis/trigger",      "kpis",      "trigger"),
+    ("/api/v1/kpis",              "kpis",      "read"),
+
+    # --- Manual trigger endpoint (the actual router prefix — the
+    # pre-E3 map only covered /kpis/trigger, missing this path).
+    ("/api/v1/trigger",           "kpis",      "trigger"),
+
+    # --- Read-only observability and status: modelled as logs:view
+    # so the auditor role reaches them by construction.
+    ("/api/v1/logs",              "logs",      "view"),
+    ("/api/v1/observability",     "logs",      "view"),
+    ("/api/v1/system",            "logs",      "view"),
 ]
 
 # Rate limit configuration applied to all authenticated requests.

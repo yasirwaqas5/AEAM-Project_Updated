@@ -59,6 +59,11 @@ _PERMISSION_MATRIX: dict[str, frozenset[str]] = {
         "actions:execute",
         "actions:approve",
         "logs:view",
+        # Phase E3 (SEC-3, SEC-7): strictest tier — configuration-writing
+        # endpoints (admin/config, data-center activate/deactivate/purge,
+        # knowledge delete/reindex, debug/retrieval). Admin-only by
+        # construction; no other role holds this grant.
+        "admin:config",
     }),
     "auditor": frozenset({
         "incidents:view",
