@@ -916,6 +916,82 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 # ---------------------------------------------------------------------------
+# Phase E3 — JWT key material resolution (SEC-1/SEC-4)
+# ---------------------------------------------------------------------------
+#
+# The RS256 public key the JWTAuth verifier uses is resolved through
+# SecretManager -- the very component the audit found had never been
+# used. Precedence:
+#
+#   1. env / settings JWT_PUBLIC_KEY   (PEM literal)
+#   2. env / settings JWT_PUBLIC_KEY_PATH (filesystem path to a PEM file)
+#   3. fail (non-development)  |  well-known placeholder (development)
+#
+# The "fail" case is SEC-4's fail-closed contract: refuse to bring the
+# platform up in an environment where anyone could authenticate, rather
+# than silently accepting the placeholder in production. Development
+# keeps the pre-E3 placeholder so local dev behaves exactly as before
+# (COMPAT-1).
+
+_DEV_PLACEHOLDER_KEY: str = "dummy-public-key"
+
+
+def _build_jwt_auth(settings: Settings) -> JWTAuth:
+    """Resolve the JWT public key from SecretManager and construct JWTAuth.
+
+    Fails closed in non-development environments if no real key material
+    is configured. In development, falls back to the well-known
+    placeholder with a loud WARNING so nobody deploys it by accident.
+    """
+    secret_manager = SecretManager(settings=settings)
+    environment = (settings.ENVIRONMENT or "").strip().lower()
+
+    # 1. PEM literal via SecretManager (env-first, settings-fallback).
+    pem: str = str(secret_manager.get_secret("JWT_PUBLIC_KEY", default="") or "").strip()
+
+    # 2. Filesystem path fallback.
+    if not pem:
+        path: str = str(secret_manager.get_secret("JWT_PUBLIC_KEY_PATH", default="") or "").strip()
+        if path:
+            try:
+                pem = Path(path).read_text(encoding="utf-8").strip()
+                logger.info("JWT public key loaded from JWT_PUBLIC_KEY_PATH=%s", path)
+            except OSError as exc:
+                # In non-development, refusing to start is safer than
+                # falling through to the placeholder.
+                if environment != "development":
+                    raise RuntimeError(
+                        f"JWT_PUBLIC_KEY_PATH={path!r} could not be read: {exc}. "
+                        "Startup aborted (Phase E3, SEC-4)."
+                    ) from exc
+                logger.warning(
+                    "JWT_PUBLIC_KEY_PATH=%s unreadable (%s); development "
+                    "environment will use the placeholder key.", path, exc,
+                )
+
+    # 3. Fail-closed / dev placeholder.
+    if not pem:
+        if environment != "development":
+            raise RuntimeError(
+                "No JWT public key configured. Set JWT_PUBLIC_KEY (PEM "
+                "literal) or JWT_PUBLIC_KEY_PATH (file path) via the "
+                "environment or Settings. Startup aborted (Phase E3, SEC-4)."
+            )
+        logger.warning(
+            "JWT public key not configured; ENVIRONMENT=development is using "
+            "the placeholder key %r. This MUST NOT reach staging/production.",
+            _DEV_PLACEHOLDER_KEY,
+        )
+        pem = _DEV_PLACEHOLDER_KEY
+
+    return JWTAuth(
+        public_key=pem,
+        issuer=settings.JWT_ISSUER,
+        audience=settings.JWT_AUDIENCE,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Application factory
 # ---------------------------------------------------------------------------
 
@@ -951,17 +1027,26 @@ def create_app() -> FastAPI:
     )
 
     # -------------------------------------------------
-    # Phase 8: Security Middleware Registration
+    # Phase 8 / Phase E3: Security Middleware Registration
     # -------------------------------------------------
     # We must create the Redis client here, not use the container
     # because container is not yet attached at this point.
     settings = Settings()  # pyright: ignore[reportCallIssue]
     redis_client = RedisClient(redis_url=str(settings.REDIS_URL))
 
-    jwt_auth = JWTAuth(public_key="dummy-public-key")  # replace later
+    # Phase E3 (SEC-1/SEC-4): resolve the RS256 public key from
+    # SecretManager (env-first, settings-fallback). In non-development
+    # environments a missing/placeholder key aborts startup loudly.
+    # Development keeps working with the well-known placeholder so today's
+    # local-dev bypass is byte-for-byte unchanged (COMPAT-1).
+    jwt_auth = _build_jwt_auth(settings)
+
     rbac = RBAC()
     rate_limiter = RateLimiter(redis_client=redis_client)
-    audit_logger = AuditLogger()
+    # Phase E3 (ARCH-7): file-sink path is now configurable; the durable
+    # DB-backed sink is attached in the lifespan (once the DB client is
+    # available on the container) via container.audit_logger.
+    audit_logger = AuditLogger(log_file=settings.AUDIT_LOG_FILE)
 
     application.add_middleware(
         SecurityMiddleware,
@@ -975,11 +1060,16 @@ def create_app() -> FastAPI:
     logger.info("Security middleware registered.")
 
     # -------------------------------------------------
-    # CORS middleware for frontend
+    # CORS middleware for frontend (Phase E3, SEC-1)
     # -------------------------------------------------
+    cors_origins = [
+        o.strip()
+        for o in (settings.CORS_ALLOWED_ORIGINS or "").split(",")
+        if o.strip()
+    ]
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173"],
+        allow_origins=cors_origins or ["http://localhost:5173"],
         allow_methods=["*"],
         allow_headers=["*"],
     )

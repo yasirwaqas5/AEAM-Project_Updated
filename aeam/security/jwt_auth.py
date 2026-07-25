@@ -21,7 +21,10 @@ from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
 
 logger = logging.getLogger(__name__)
 
-# Expected claim values (spec).
+# Engine-owned defaults for expected claim values (ENG-6).
+# The Settings-level fields JWT_ISSUER / JWT_AUDIENCE (Phase E3) may override
+# these at construction time; when they are None, the defaults below are used
+# so the value continues to live once, in its owning module.
 _EXPECTED_ISSUER: str = "aeam-auth"
 _EXPECTED_AUDIENCE: str = "aeam-api"
 
@@ -52,12 +55,26 @@ class JWTAuth:
         user_id = payload["sub"]
     """
 
-    def __init__(self, public_key: str) -> None:
+    def __init__(
+        self,
+        public_key: str,
+        issuer: str | None = None,
+        audience: str | None = None,
+    ) -> None:
         """
-        Initialise JWTAuth with an RSA public key.
+        Initialise JWTAuth with an RSA public key and optional claim overrides.
 
         Args:
             public_key: PEM-encoded RSA public key. Must not be empty.
+            issuer:     Overrides the engine-owned default issuer claim
+                        (:data:`_EXPECTED_ISSUER`, ``"aeam-auth"``). Pass
+                        None (the default) to keep the engine-owned value.
+                        Phase E3 (ENG-6): the default lives once, in this
+                        module; Settings.JWT_ISSUER may override it at
+                        construction time.
+            audience:   Overrides the engine-owned default audience claim
+                        (:data:`_EXPECTED_AUDIENCE`, ``"aeam-api"``). Same
+                        semantics as ``issuer``.
 
         Raises:
             ValueError: If ``public_key`` is empty or whitespace-only.
@@ -65,6 +82,8 @@ class JWTAuth:
         if not public_key or not public_key.strip():
             raise ValueError("public_key must be a non-empty PEM string.")
         self._public_key: str = public_key
+        self._issuer: str = issuer if issuer and issuer.strip() else _EXPECTED_ISSUER
+        self._audience: str = audience if audience and audience.strip() else _EXPECTED_AUDIENCE
 
     # ------------------------------------------------------------------
     # Public API
@@ -118,8 +137,8 @@ class JWTAuth:
                 token,
                 self._public_key,
                 algorithms=["RS256"],
-                issuer=_EXPECTED_ISSUER,
-                audience=_EXPECTED_AUDIENCE,
+                issuer=self._issuer,
+                audience=self._audience,
                 options={
                     "require": ["exp", "iss", "aud"],
                     "verify_exp": True,
