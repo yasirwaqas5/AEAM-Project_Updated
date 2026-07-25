@@ -5,16 +5,19 @@ import {
   severityOf, deriveStatus, getRetrievedCount, getRecommendedAction,
   fmtTime, fmtRelative,
 } from "../components/ui";
+import { fetchPage } from "../lib/api";
 import EvidencePanel from "../components/EvidencePanel";
 import Timeline from "../components/Timeline";
 
-// ─── Data fetching (API contract unchanged) ──────────────────────────────────
+// ─── Data fetching (Phase E6: bounded paged consumption) ──────────────────────
+//
+// The incidents list can grow without bound. Rather than pulling the whole
+// table into the browser on every load, fetch a bounded page and let the
+// operator "Load more" on demand. The backend endpoint stays
+// backward-compatible (a parameter-less call still returns everything); this
+// page opts into the E6 limit/offset + X-Total-Count contract.
 
-async function fetchIncidents() {
-  const res = await fetch(`/api/v1/incidents/`);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
-}
+const PAGE_SIZE = 100;
 
 const SEVERITY_FILTERS = ["ALL", "CRITICAL", "HIGH", "MEDIUM", "LOW"];
 
@@ -88,29 +91,53 @@ function CardSkeleton() {
 export default function Incidents() {
   const [incidents, setIncidents] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState(null);
   const [filter, setFilter] = useState("ALL");
   const [modal, setModal] = useState(null); // { kind, incident }
+  const [total, setTotal] = useState(null);
+  const [hasMore, setHasMore] = useState(false);
 
+  // Server-side severity filter maps to the E6 `severity` query param so we
+  // never over-fetch; "ALL" fetches unfiltered. Changing the filter reloads
+  // page one.
   const load = useCallback(async () => {
     setLoading(true); setError(null);
     try {
-      const data = await fetchIncidents();
-      setIncidents(Array.isArray(data) ? data : []);
+      const params = filter !== "ALL" ? { severity: filter } : {};
+      const page = await fetchPage("/api/v1/incidents/", { limit: PAGE_SIZE, offset: 0, params });
+      setIncidents(page.items);
+      setTotal(page.total);
+      setHasMore(page.hasMore);
     } catch (e) {
       setError(e.message);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [filter]);
+
+  const loadMore = useCallback(async () => {
+    setLoadingMore(true);
+    try {
+      const params = filter !== "ALL" ? { severity: filter } : {};
+      const page = await fetchPage("/api/v1/incidents/", {
+        limit: PAGE_SIZE, offset: incidents.length, params,
+      });
+      setIncidents((prev) => [...prev, ...page.items]);
+      setTotal(page.total);
+      setHasMore(page.hasMore);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [filter, incidents.length]);
 
   useEffect(() => { load(); }, [load]);
 
-  const displayed = filter === "ALL"
-    ? incidents
-    : incidents.filter((i) => (i.severity ?? "").toUpperCase() === filter);
-
-  const sorted = [...displayed].sort((a, b) => severityOf(b.severity).rank - severityOf(a.severity).rank);
+  // Severity filtering now happens server-side; sort the loaded page by rank
+  // for display consistency with the pre-E6 behaviour.
+  const sorted = [...incidents].sort((a, b) => severityOf(b.severity).rank - severityOf(a.severity).rank);
 
   const openModal = (kind, incident) => setModal({ kind, incident });
   const closeModal = () => setModal(null);
@@ -149,7 +176,9 @@ export default function Incidents() {
 
         {!loading && !error && (
           <div style={{ fontSize: "0.72rem", color: "var(--muted)", letterSpacing: "0.06em", marginBottom: "1.1rem" }}>
-            {sorted.length} incident{sorted.length !== 1 ? "s" : ""}{filter !== "ALL" && ` · filtered by ${filter}`}
+            Showing {sorted.length}
+            {total != null ? ` of ${total}` : ""} incident{total !== 1 ? "s" : ""}
+            {filter !== "ALL" && ` · filtered by ${filter}`}
           </div>
         )}
 
@@ -176,6 +205,16 @@ export default function Incidents() {
             {sorted.map((inc) => (
               <IncidentCard key={inc.incident_id ?? Math.random()} incident={inc} onOpen={openModal} />
             ))}
+          </div>
+        )}
+
+        {/* Phase E6: bounded pagination — fetch the next page on demand
+            rather than pulling the entire table into the browser at once. */}
+        {!loading && !error && hasMore && (
+          <div style={{ display: "flex", justifyContent: "center", marginTop: "1.4rem" }}>
+            <Button icon="layers" onClick={loadMore} disabled={loadingMore}>
+              {loadingMore ? "Loading…" : `Load more${total != null ? ` (${total - sorted.length} remaining)` : ""}`}
+            </Button>
           </div>
         )}
       </div>

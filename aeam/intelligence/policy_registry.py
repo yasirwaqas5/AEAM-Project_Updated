@@ -189,10 +189,13 @@ class PolicyRegistry:
             text = p.raw_text or p.business_rule or ""
             if not text.strip():
                 continue
-            try:
-                policy_vector = self._embed.encode_text(text)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("PolicyRegistry | policy embedding failed | policy_id=%s | error=%s", p.policy_id, exc)
+            # Phase E6: prefer the STORED embedding computed once at
+            # extraction time — this is the O(policies)-per-incident cost the
+            # audit flagged, eliminated. Only re-embed on the fly for policies
+            # whose vector is absent (pre-E6 rows, or extraction without an
+            # embedding service), preserving exact behaviour for them.
+            policy_vector = self._policy_vector(p, text)
+            if policy_vector is None:
                 continue
             sim = _cosine_similarity(query_vector, policy_vector)
             if sim >= self._semantic_threshold:
@@ -208,6 +211,28 @@ class PolicyRegistry:
     def curated_domains(self) -> list[str]:
         """The RuleEngine's known metric domains (read-only passthrough)."""
         return self._rules.loaded_domains
+
+    def _policy_vector(self, policy: Any, text: str) -> list[float] | None:
+        """
+        Return the policy's embedding vector for semantic scoring.
+
+        Phase E6: uses the stored ``policy.embedding`` when present (computed
+        once at extraction time). Falls back to embedding ``text`` on the fly
+        for policies with no stored vector, so pre-E6 rows still match exactly
+        as before — just without the storage speed-up until re-extracted.
+        Returns ``None`` if no vector can be produced (embedding failure).
+        """
+        stored = getattr(policy, "embedding", None)
+        if isinstance(stored, list) and stored:
+            return stored
+        try:
+            return self._embed.encode_text(text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "PolicyRegistry | policy embedding failed | policy_id=%s | error=%s",
+                getattr(policy, "policy_id", "?"), exc,
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Internal

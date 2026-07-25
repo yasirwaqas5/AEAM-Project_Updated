@@ -213,7 +213,15 @@ def _build_container(settings: Settings) -> AppContainer:
                    application from starting in a broken state.
     """
     logger.info("Initialising DatabaseClient …")
-    db = DatabaseClient(database_url=str(settings.DATABASE_URL))
+    # Phase E6 (resource management): connection-pool bounds are now
+    # configurable so a load spike is met with bounded back-pressure rather
+    # than unbounded connection growth. Defaults match the pre-E6 values.
+    db = DatabaseClient(
+        database_url=str(settings.DATABASE_URL),
+        pool_size=settings.DB_POOL_SIZE,
+        max_overflow=settings.DB_MAX_OVERFLOW,
+        pool_timeout=settings.DB_POOL_TIMEOUT_SECONDS,
+    )
 
     logger.info("Initialising RedisClient …")
     redis_client = RedisClient(redis_url=str(settings.REDIS_URL))
@@ -767,6 +775,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         db=container.db,
         policy_extractor=policy_extractor,
         policy_extraction_enabled=settings.POLICY_EXTRACTION_ENABLED,
+        # Phase E6: reuse the SAME embedding model already loaded above so
+        # each policy's embedding is computed once, at extraction time.
+        embedding_service=embedding_service,
     )
     dataset_processor = DatasetIngestJobProcessor(
         blob_store=container.blob_store,

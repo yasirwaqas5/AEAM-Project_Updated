@@ -14,6 +14,9 @@ pydantic-settings
 # --- Database ---
 sqlalchemy
 psycopg2-binary
+# Phase E5: schema migration mechanism. Native companion of SQLAlchemy
+# (already installed) — the single schema truth; replaces hand-applied DDL.
+alembic
 
 # --- Cache / message broker ---
 redis

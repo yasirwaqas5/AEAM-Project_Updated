@@ -70,6 +70,18 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-cov "moto[s3]>=5.0"
 
+      # Phase E5: migration up/down against the PRODUCTION dialect
+      # (PostgreSQL), addressing the SQLite/PG drift risk. Runs before the
+      # unit suite so a broken or non-reversible migration fails fast.
+      - name: Verify migrations (PostgreSQL up → down → up)
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+          alembic current
+        env:
+          DATABASE_URL: "postgresql://postgres:password@localhost:5432/postgres"
+
       - name: Run tests
         run: python -m pytest --tb=short -q
         env:

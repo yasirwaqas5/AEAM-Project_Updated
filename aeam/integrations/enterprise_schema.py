@@ -155,7 +155,9 @@ CREATE TABLE IF NOT EXISTS policies (
     time_constraint   TEXT,
     priority          TEXT,
     related_metrics   JSONB,              -- list of metric name strings
-    extracted_at      TIMESTAMP
+    extracted_at      TIMESTAMP,
+    embedding         JSONB,              -- Phase E6: stored policy embedding (list[float]); NULL until computed
+    embedding_model   TEXT                -- Phase E6: model id the embedding was produced with (TECH-6 invalidation)
 );
 """
 
@@ -178,12 +180,49 @@ _INDEXES: tuple[str, ...] = (
 )
 
 
+def _ensure_policy_embedding_columns(conn) -> None:
+    """
+    Dev-only idempotent add of the Phase E6 ``embedding`` /
+    ``embedding_model`` columns to an EXISTING ``policies`` table.
+
+    A fresh database gets these columns straight from ``_POLICIES``'s
+    ``CREATE TABLE`` above. But a developer whose ``policies`` table was
+    created before E6 needs them added in place — the production path for
+    that is migration ``0003_policy_embedding``; this keeps the dev-only
+    startup path in lock-step (COMPAT-2). Never drops or alters existing
+    columns; a failure here is logged and swallowed so a locked/edge-case
+    DB never blocks startup (the migration remains the authoritative path).
+    """
+    existing = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(policies)")} \
+        if conn.dialect.name == "sqlite" else None
+
+    for column, coltype in (("embedding", "JSONB"), ("embedding_model", "TEXT")):
+        try:
+            if conn.dialect.name == "sqlite":
+                if existing is not None and column not in existing:
+                    conn.exec_driver_sql(f"ALTER TABLE policies ADD COLUMN {column} {coltype}")
+            else:
+                # PostgreSQL supports IF NOT EXISTS natively.
+                conn.exec_driver_sql(
+                    f"ALTER TABLE policies ADD COLUMN IF NOT EXISTS {column} {coltype}"
+                )
+        except SQLAlchemyError as exc:
+            logger.warning(
+                "policies.%s add skipped (already present or unsupported): %s",
+                column, exc,
+            )
+
+
 def create_enterprise_tables(engine: Engine) -> None:
     """
     Create the Enterprise Data Layer registry tables and indexes if absent.
 
     Idempotent and additive: safe to call on every startup, creates nothing
     that already exists, and never touches the pre-existing AEAM tables.
+
+    **Phase E5:** this is a dev-only convenience path kept in lock-step
+    with the Alembic baseline (migration ``0001_baseline``); production
+    schema is managed by ``alembic upgrade head``.
 
     Args:
         engine: The shared SQLAlchemy engine from
@@ -199,6 +238,9 @@ def create_enterprise_tables(engine: Engine) -> None:
                 conn.execute(text(ddl))
             for idx in _INDEXES:
                 conn.execute(text(idx))
+            # Phase E6: backfill the embedding columns onto an existing
+            # policies table (fresh tables already have them from _POLICIES).
+            _ensure_policy_embedding_columns(conn)
         logger.info(
             "Enterprise Data Layer schema verified/created | tables=%d | indexes=%d",
             len(ENTERPRISE_TABLES), len(_INDEXES),

@@ -576,10 +576,57 @@ class Settings(BaseSettings):
         default=None,
         ge=1,
         description=(
-            "Phase D4: caps how many most-recent incidents "
+            "Phase D4/E6: caps how many most-recent incidents "
             "GET /api/v1/observability/ considers when building its summary. "
             "A read-time windowing cap only -- never deletes or alters any "
-            "persisted incident row. None = unbounded (current behavior)."
+            "persisted incident row. None means the E6 sane default window "
+            "applies (disclosed in the response's 'retention' block); set an "
+            "explicit value to override it in either direction."
+        ),
+    )
+
+    # --- Resource management (Phase E6, ENG-6 / PHIL-5) ---
+    #
+    # Explicit, configured bounds on the shared resource pools the platform
+    # holds, so a load spike degrades gracefully (bounded pools) instead of
+    # exhausting connections or threads. Defaults reproduce today's
+    # hard-coded values exactly (COMPAT-1) — this only makes them tunable.
+
+    DB_POOL_SIZE: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "Phase E6: persistent SQLAlchemy connection-pool size for the "
+            "DatabaseClient. Default 5 matches the pre-E6 hard-coded value."
+        ),
+    )
+
+    DB_MAX_OVERFLOW: int = Field(
+        default=10,
+        ge=0,
+        description=(
+            "Phase E6: additional transient DB connections allowed beyond "
+            "DB_POOL_SIZE under load. Default 10 matches the pre-E6 value."
+        ),
+    )
+
+    DB_POOL_TIMEOUT_SECONDS: int = Field(
+        default=30,
+        ge=1,
+        description=(
+            "Phase E6: seconds a caller waits for a pooled DB connection "
+            "before failing fast (bounded back-pressure) instead of blocking "
+            "unboundedly. Default 30 is SQLAlchemy's own default."
+        ),
+    )
+
+    API_MAX_PAGE_SIZE: int = Field(
+        default=1000,
+        ge=1,
+        description=(
+            "Phase E6: hard upper bound on the `limit` any paginated list "
+            "endpoint will honour, so no single request can pull an "
+            "unbounded payload regardless of the requested size."
         ),
     )
 

@@ -26,11 +26,16 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/logs", tags=["Logs"])
+
+# Phase E6: the pre-E6 endpoint always returned the 50 most recent rows.
+# That constant becomes the DEFAULT limit so an unparameterised call is
+# byte-identical to today; callers may page deeper with ?limit=&offset=.
+_DEFAULT_LIMIT: int = 50
 
 
 # ---------------------------------------------------------------------------
@@ -38,21 +43,39 @@ router = APIRouter(prefix="/api/v1/logs", tags=["Logs"])
 # ---------------------------------------------------------------------------
 
 @router.get("/agents", response_model=list[dict])
-def list_agent_logs(request: Request):
+def list_agent_logs(
+    request: Request,
+    limit: int = Query(
+        default=_DEFAULT_LIMIT,
+        ge=1,
+        le=500,
+        description=(
+            "Maximum number of agent-log rows to return, newest first. "
+            "Defaults to 50 — the pre-E6 fixed page size — so an "
+            "unparameterised call is unchanged."
+        ),
+    ),
+    offset: int = Query(
+        default=0,
+        ge=0,
+        description="Number of rows to skip (for pagination).",
+    ),
+):
     container = request.app.state.container
     try:
         db = container.db
         # Select the JSON `result` column so we can surface the execution
         # metadata (duration, retry count, failure reason, validation result)
-        # that ActionAgent embeds there.
+        # that ActionAgent embeds there. Index-backed by
+        # idx_action_logs_executed_at (Phase E5).
         query = """
         SELECT action_type as agent, incident_id, status,
                result, executed_at as timestamp
         FROM action_logs
         ORDER BY executed_at DESC
-        LIMIT 50
+        LIMIT :limit OFFSET :offset
         """
-        rows = _fetch_all(db, query)
+        rows = _fetch_all(db, query, {"limit": limit, "offset": offset})
         logs = []
         for row in rows:
             meta = _parse_result(row.get("result"))
@@ -105,10 +128,10 @@ def _parse_result(result: Any) -> dict[str, Any]:
     return {}
 
 
-def _fetch_all(db: Any, query: str) -> list[dict[str, Any]]:
+def _fetch_all(db: Any, query: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     from sqlalchemy import text
 
     with db._engine.connect() as conn:
-        result = conn.execute(text(query))
+        result = conn.execute(text(query), params or {})
         rows = result.mappings().all()
         return [dict(row) for row in rows]

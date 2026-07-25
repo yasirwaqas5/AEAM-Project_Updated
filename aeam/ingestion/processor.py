@@ -92,6 +92,7 @@ class DocumentIngestJobProcessor:
         db: DatabaseClient,
         policy_extractor: PolicyExtractor | None = None,
         policy_extraction_enabled: bool = True,
+        embedding_service: Any | None = None,
     ) -> None:
         if blob_store is None:
             raise ValueError("blob_store must not be None.")
@@ -106,6 +107,13 @@ class DocumentIngestJobProcessor:
         self._policy_repo = PolicyRepository(db)
         self._policy_extractor = policy_extractor
         self._policy_extraction_enabled = policy_extraction_enabled
+        # Phase E6: compute a policy's embedding ONCE, here at extraction
+        # time, so PolicyRegistry never re-embeds the whole corpus per
+        # incident. Optional — when absent, embeddings stay NULL and
+        # PolicyRegistry falls back to on-the-fly embedding (pre-E6 behaviour).
+        # The SAME shared EmbeddingService already used by the ingestion
+        # pipeline is passed here (no second model load).
+        self._embedding_service = embedding_service
 
     # ------------------------------------------------------------------
     # JobProcessor protocol
@@ -246,11 +254,22 @@ class DocumentIngestJobProcessor:
         source_document = doc.origin_path or doc.title or doc.doc_id
         for p in policies:
             try:
+                raw_text = p.get("raw_text", "")
+                # Phase E6: compute the policy embedding ONCE here, using the
+                # SAME text PolicyRegistry's semantic tier scores against
+                # (raw_text, falling back to business_rule). Stored so the
+                # registry reads the vector instead of recomputing it per
+                # incident. A failure to embed is non-fatal — the policy is
+                # still stored with a NULL embedding and the registry falls
+                # back to on-the-fly embedding for it.
+                embedding, embedding_model = self._compute_policy_embedding(
+                    raw_text or (p.get("business_rule") or "")
+                )
                 self._policy_repo.create(Policy(
                     doc_id=doc.doc_id,
                     source_document=source_document,
                     source_chunk=p.get("source_chunk"),
-                    raw_text=p.get("raw_text", ""),
+                    raw_text=raw_text,
                     business_rule=p.get("business_rule"),
                     condition=p.get("condition"),
                     threshold=p.get("threshold"),
@@ -262,6 +281,8 @@ class DocumentIngestJobProcessor:
                     time_constraint=p.get("time_constraint"),
                     priority=p.get("priority"),
                     related_metrics=p.get("related_metrics", []),
+                    embedding=embedding,
+                    embedding_model=embedding_model,
                 ))
             except Exception as exc:  # noqa: BLE001
                 logger.error(
@@ -273,6 +294,27 @@ class DocumentIngestJobProcessor:
             "DocumentIngestJobProcessor | stored %d polic%s | doc_id=%s",
             len(policies), "y" if len(policies) == 1 else "ies", doc.doc_id,
         )
+
+    def _compute_policy_embedding(self, text: str) -> tuple[list[float] | None, str | None]:
+        """
+        Compute the stored embedding for a policy's text (Phase E6).
+
+        Returns ``(vector, model_name)`` on success, or ``(None, None)`` when
+        no embedding service is wired or the text is empty — in which case the
+        policy is persisted with a NULL embedding and PolicyRegistry embeds it
+        on the fly at match time (pre-E6 behaviour, unchanged).
+        """
+        if self._embedding_service is None or not text or not text.strip():
+            return None, None
+        try:
+            vector = self._embedding_service.encode_text(text.strip())
+            model_name = getattr(self._embedding_service, "model_name", None)
+            return (list(vector) if vector is not None else None), model_name
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "DocumentIngestJobProcessor | policy embedding failed (stored NULL): %s", exc,
+            )
+            return None, None
 
     def _load_document(self, job: IngestionJob) -> Any:
         if job.parent_type != ParentType.DOCUMENT or not job.parent_id:

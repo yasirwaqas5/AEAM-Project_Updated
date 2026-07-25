@@ -68,13 +68,22 @@ class BaseRepository:
         )
         return self.model_cls.from_row(row) if row else None
 
-    def list_all(self, limit: int | None = None) -> list[Any]:
+    def list_all(self, limit: int | None = None, offset: int = 0) -> list[Any]:
+        # Phase E6: ``offset`` is additive — default 0 keeps every existing
+        # caller byte-identical. Only applied alongside a ``limit`` (a bare
+        # OFFSET without LIMIT is meaningless in SQL and unsupported on some
+        # dialects), so unbounded ``list_all()`` is unchanged.
         query = f"SELECT * FROM {self.table}"
         params: dict[str, Any] = {}
         if limit is not None:
-            query += " LIMIT :limit"
+            query += " LIMIT :limit OFFSET :offset"
             params["limit"] = limit
+            params["offset"] = max(0, int(offset))
         return [self.model_cls.from_row(r) for r in self._db.fetch_all(query, params)]
+
+    def total(self) -> int:
+        """Row count for pagination — alias of :meth:`count` with a clearer name."""
+        return self.count()
 
     def _query(self, where: str, params: dict[str, Any]) -> list[Any]:
         return [

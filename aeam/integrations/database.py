@@ -537,7 +537,18 @@ class DatabaseClient:
         """
         Create required AEAM tables if they do not exist.
 
-        This is a development convenience, not a production migration tool.
+        **DEV-ONLY CONVENIENCE (Phase E5).** This ``CREATE IF NOT EXISTS``
+        path is retained so a developer can spin up a fresh SQLite or
+        PostgreSQL database with zero setup. It is NOT the production
+        schema-management mechanism: from Phase E5 onward, **Alembic
+        migrations (``migrations/`` + ``alembic upgrade head``) are the
+        single schema truth** (COMPAT-5). A migration-built database and
+        this startup path produce an identical schema — asserted by
+        ``aeam/tests/test_phase_e5_migrations.py::
+        test_migrated_schema_matches_startup_ddl``. Keep the two in sync:
+        any table/column/index added here must also land in a migration
+        revision, and vice-versa.
+
         Tables are created with a schema compatible with SQLite and PostgreSQL.
         For PostgreSQL, the column types are valid; for SQLite, the type
         names are ignored (SQLite uses type affinity) but the structure works.
@@ -618,6 +629,22 @@ class DatabaseClient:
         );
         """
 
+        # Phase E5 hot-path indexes — kept in lock-step with migration
+        # 0002_hot_path_indexes so the dev-only startup path and the
+        # migration path produce an identical schema. Idempotent.
+        create_indexes = (
+            "CREATE INDEX IF NOT EXISTS idx_incidents_timestamp "
+            "ON incidents (timestamp DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_metrics_metric_timestamp "
+            "ON metrics (metric, timestamp DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp "
+            "ON audit_logs (timestamp DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id "
+            "ON audit_logs (user_id);",
+            "CREATE INDEX IF NOT EXISTS idx_action_logs_executed_at "
+            "ON action_logs (executed_at DESC);",
+        )
+
         try:
             with self._engine.begin() as conn:
                 conn.execute(text(create_incidents))
@@ -625,6 +652,8 @@ class DatabaseClient:
                 conn.execute(text(create_metrics))
                 conn.execute(text(create_action_logs))
                 conn.execute(text(create_audit_logs))
+                for index_ddl in create_indexes:
+                    conn.execute(text(index_ddl))
             logger.info("Database tables verified/created successfully.")
         except SQLAlchemyError as exc:
             logger.error("Table creation failed: %s", exc)

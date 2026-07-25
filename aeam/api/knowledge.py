@@ -288,20 +288,38 @@ def list_documents(
     status: str | None = Query(default=None, description="Filter by AssetStatus."),
     q: str | None = Query(default=None, description="Basic case-insensitive search over title/origin_path."),
     limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0, description="Phase E6: rows to skip for pagination."),
 ) -> JSONResponse:
-    """List documents, optionally filtered by status and/or a basic text search, newest first."""
+    """List documents, optionally filtered by status and/or a basic text search, newest first.
+
+    Phase E6: ``offset`` paginates; the total registered-document count is
+    returned in the ``X-Total-Count`` header. Defaults are unchanged
+    (limit 200, offset 0) so existing callers are unaffected.
+    """
     _validate_status(status)
     container = request.app.state.container
     doc_repo = DocumentRepository(container.db)
 
-    docs = doc_repo.list_by_status(status) if status else doc_repo.list_all(limit=limit)
+    # Bounded read (index-friendly); status filter path is already bounded
+    # by its own query. offset only meaningful on the unfiltered list path.
+    docs = doc_repo.list_by_status(status) if status else doc_repo.list_all(limit=limit, offset=offset)
     if q and q.strip():
         needle = q.strip().lower()
         docs = [d for d in docs if _matches(needle, d.title, d.origin_path)]
     docs.sort(key=lambda d: d.created_at or "", reverse=True)
 
+    headers: dict[str, str] = {}
+    try:
+        headers["X-Total-Count"] = str(doc_repo.total())
+    except Exception:  # noqa: BLE001 — header is advisory, never fail the read
+        pass
+
     source_names = _source_name_map(SourceRepository(container.db))
-    return JSONResponse(status_code=200, content=[_document_to_dict(d, source_names) for d in docs])
+    return JSONResponse(
+        status_code=200,
+        content=[_document_to_dict(d, source_names) for d in docs],
+        headers=headers,
+    )
 
 
 @router.get("/documents/{doc_id}", summary="Get one document, with its active version")

@@ -295,7 +295,29 @@ class Policy(_Asset):
     priority: str | None = None
     related_metrics: list[str] = field(default_factory=list)
     extracted_at: str = field(default_factory=_now_iso)
+    # Phase E6: stored embedding of the policy's text, computed ONCE at
+    # extraction time so PolicyRegistry no longer re-embeds the whole corpus
+    # per incident. ``None`` until computed (pre-E6 rows, or extraction
+    # without an embedding service) — PolicyRegistry falls back to on-the-fly
+    # embedding for those, so behaviour is unchanged until backfilled.
+    embedding: list[float] | None = None
+    embedding_model: str | None = None
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "Policy":
-        return _Asset._base_from_row(cls, row, ("actions", "related_metrics"))
+        policy = _Asset._base_from_row(cls, row, ("actions", "related_metrics"))
+        # Decode embedding with a None default so "never computed" (NULL)
+        # stays distinguishable from an (invalid) empty vector. A stored
+        # vector is a JSON list; NULL/blank stays None.
+        raw = row.get("embedding")
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            policy.embedding = None
+        elif isinstance(raw, list):
+            policy.embedding = raw
+        elif isinstance(raw, str):
+            try:
+                decoded = json.loads(raw)
+                policy.embedding = decoded if isinstance(decoded, list) else None
+            except (ValueError, TypeError):
+                policy.embedding = None
+        return policy
