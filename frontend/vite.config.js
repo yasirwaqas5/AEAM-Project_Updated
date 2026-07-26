@@ -3,6 +3,14 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
+  // Phase E10: frontend test baseline (TECH-1 — the one justified new tool,
+  // retiring the "zero frontend tests" audit finding). Vite's own `test`
+  // config key is read by Vitest; no separate config file needed.
+  test: {
+    environment: "jsdom",
+    globals: true,
+    setupFiles: ["./src/test/setup.js"],
+  },
   server: {
     port: 5173,
     proxy: {

@@ -18,6 +18,62 @@ export async function fetchJSON(url, options) {
   return res.json();
 }
 
+/* ──────────────────────────────────────────────────────────────────────────
+ * Phase E10 — session/bearer-token plumbing.
+ *
+ * Every page in this codebase calls the backend with either a bare `fetch()`
+ * or the two helpers above, always with a same-origin relative path
+ * (`/api/...`, `/health`, `/metrics`). Rather than touching every call site
+ * to attach `Authorization: Bearer <token>`, this module wraps the global
+ * `fetch` exactly once (module import is a singleton) so every existing
+ * call site gets the header for free, and gets routed through one place
+ * when the backend responds 401 (token missing/expired/invalid) so the
+ * session layer can react honestly instead of a page silently rendering
+ * empty data. AuthProvider (layout/AuthProvider.jsx) is the only caller of
+ * `setAuthToken` / `setUnauthorizedHandler`.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+let _authToken = null;
+let _onUnauthorized = null;
+
+export function setAuthToken(token) {
+  _authToken = token || null;
+}
+
+export function getAuthToken() {
+  return _authToken;
+}
+
+/** Registered once by AuthProvider; called whenever a same-origin API call gets a 401. */
+export function setUnauthorizedHandler(fn) {
+  _onUnauthorized = typeof fn === "function" ? fn : null;
+}
+
+function _isSameOriginApiUrl(input) {
+  const url = typeof input === "string" ? input : input?.url || "";
+  return url.startsWith("/api/") || url.startsWith("/health") || url.startsWith("/metrics");
+}
+
+if (typeof window !== "undefined" && !window.__aeamFetchPatched) {
+  window.__aeamFetchPatched = true;
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = async (input, init = {}) => {
+    const tagged = _isSameOriginApiUrl(input);
+    let finalInit = init;
+    if (tagged && _authToken) {
+      finalInit = {
+        ...init,
+        headers: { ...(init.headers || {}), Authorization: `Bearer ${_authToken}` },
+      };
+    }
+    const res = await nativeFetch(input, finalInit);
+    if (tagged && res.status === 401 && _onUnauthorized) {
+      _onUnauthorized();
+    }
+    return res;
+  };
+}
+
 /**
  * Fetch a bounded page of a list endpoint.
  *

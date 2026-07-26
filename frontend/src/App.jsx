@@ -1,9 +1,15 @@
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from "react-router-dom";
 import { Suspense, lazy, useEffect } from "react";
 
 import { ToastProvider } from "./layout/ToastHost";
 import { HealthProvider } from "./layout/HealthProvider";
+import { AuthProvider, useAuth } from "./layout/AuthProvider";
+import ErrorBoundary from "./layout/ErrorBoundary";
 import AppShell from "./layout/AppShell";
+import { Icon } from "./components/ui";
+import { NAV_ITEMS } from "./config/nav";
+
+const Login = lazy(() => import("./pages/Login"));
 
 /* ──────────────────────────────────────────────────────────────────────────
  * App.jsx — root: design tokens + route table.
@@ -28,6 +34,14 @@ const Actions           = lazy(() => import("./pages/Actions"));
 const Settings          = lazy(() => import("./pages/Settings"));
 const Admin             = lazy(() => import("./pages/Admin"));
 const Welcome           = lazy(() => import("./pages/Welcome"));
+
+/** Looks up the RBAC permission (if any) a route requires, from the single
+ *  nav.js source of truth — a route's guard and its sidebar visibility can
+ *  never drift apart. */
+function permissionForPath(pathname) {
+  const item = NAV_ITEMS.find((i) => i.to === pathname);
+  return item?.permission || null;
+}
 
 /* ─── Design tokens ─────────────────────────────────────────────────────────
  * The single source of truth for the AEAM visual language.
@@ -164,25 +178,66 @@ function RouteFallback() {
   );
 }
 
+function Forbidden() {
+  const { pathname } = useLocation();
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "60vh", gap: "var(--sp-3)", textAlign: "center" }}>
+      <Icon name="shield" size={28} color="var(--err)" />
+      <h2 style={{ fontSize: "var(--fs-lg)", color: "var(--text)" }}>Access denied</h2>
+      <p style={{ color: "var(--muted)", fontSize: "var(--fs-sm)", maxWidth: 420 }}>
+        Your role does not grant access to <code>{pathname}</code>. Contact an administrator
+        if you believe this is incorrect.
+      </p>
+    </div>
+  );
+}
+
+/** Route-level enforcement of the same permission Sidebar uses to decide
+ *  visibility — reaching a hidden URL directly gets a 403 page, not the
+ *  page itself (Phase E10 acceptance: "an analyst cannot see or invoke
+ *  admin configuration"). */
+function RequirePermission({ children }) {
+  const { pathname } = useLocation();
+  const { hasPermission } = useAuth();
+  const permission = permissionForPath(pathname);
+  if (permission) {
+    const [resource, action] = permission.split(":");
+    if (!hasPermission(resource, action)) return <Forbidden />;
+  }
+  return children;
+}
+
+/** Redirects unauthenticated visitors to /login, remembering where they
+ *  were headed so Login can send them back after signing in. Renders
+ *  nothing while the boot-time dev-token probe is still in flight, so a
+ *  page never flashes the login screen during a dev-posture auto-login. */
+function RequireAuth({ children }) {
+  const { isAuthenticated, booting } = useAuth();
+  const location = useLocation();
+  if (booting) return <RouteFallback />;
+  if (!isAuthenticated) return <Navigate to="/login" replace state={{ from: location }} />;
+  return children;
+}
+
 function AppRoutes() {
   return (
     <Suspense fallback={<RouteFallback />}>
       <Routes>
         <Route path="/"              element={<Dashboard />} />
-        <Route path="/analytics"     element={<Analytics />} />
-        <Route path="/incidents"     element={<Incidents />} />
-        <Route path="/investigation" element={<Investigation />} />
-        <Route path="/human-review"  element={<HumanReview />} />
-        <Route path="/retrieval"     element={<RetrievalExplorer />} />
-        <Route path="/replay"        element={<Replay />} />
-        <Route path="/memory"        element={<Memory />} />
-        <Route path="/knowledge"     element={<KnowledgeCenter />} />
-        <Route path="/data"          element={<DataCenter />} />
-        <Route path="/agents"        element={<Agents />} />
-        <Route path="/actions"       element={<Actions />} />
-        <Route path="/trigger"       element={<Trigger />} />
-        <Route path="/settings"      element={<Settings />} />
-        <Route path="/admin"         element={<Admin />} />
+        <Route path="/analytics"     element={<RequirePermission><Analytics /></RequirePermission>} />
+        <Route path="/incidents"     element={<RequirePermission><Incidents /></RequirePermission>} />
+        <Route path="/investigation" element={<RequirePermission><Investigation /></RequirePermission>} />
+        <Route path="/human-review"  element={<RequirePermission><HumanReview /></RequirePermission>} />
+        <Route path="/retrieval"     element={<RequirePermission><RetrievalExplorer /></RequirePermission>} />
+        <Route path="/replay"        element={<RequirePermission><Replay /></RequirePermission>} />
+        <Route path="/memory"        element={<RequirePermission><Memory /></RequirePermission>} />
+        <Route path="/knowledge"     element={<RequirePermission><KnowledgeCenter /></RequirePermission>} />
+        <Route path="/data"          element={<RequirePermission><DataCenter /></RequirePermission>} />
+        <Route path="/agents"        element={<RequirePermission><Agents /></RequirePermission>} />
+        <Route path="/actions"       element={<RequirePermission><Actions /></RequirePermission>} />
+        <Route path="/trigger"       element={<RequirePermission><Trigger /></RequirePermission>} />
+        <Route path="/settings"      element={<RequirePermission><Settings /></RequirePermission>} />
+        <Route path="/admin"         element={<RequirePermission><Admin /></RequirePermission>} />
         <Route path="*"              element={<Navigate to="/" replace />} />
       </Routes>
     </Suspense>
@@ -199,21 +254,30 @@ export default function App() {
 
   return (
     <ToastProvider>
-      <HealthProvider>
-        <BrowserRouter>
-          <Routes>
-            {/* The Welcome Experience renders OUTSIDE the shell — a full-bleed
-                startup sequence for demos/presentations. The console (every
-                other route) keeps the operational AppShell. */}
-            <Route path="/welcome" element={
-              <Suspense fallback={<RouteFallback />}><Welcome /></Suspense>
-            } />
-            <Route path="*" element={
-              <AppShell><AppRoutes /></AppShell>
-            } />
-          </Routes>
-        </BrowserRouter>
-      </HealthProvider>
+      <BrowserRouter>
+        <AuthProvider>
+          <HealthProvider>
+            <ErrorBoundary>
+              <Routes>
+                {/* The Welcome Experience renders OUTSIDE the shell — a full-bleed
+                    startup sequence for demos/presentations. The console (every
+                    other route) keeps the operational AppShell. */}
+                <Route path="/welcome" element={
+                  <Suspense fallback={<RouteFallback />}><Welcome /></Suspense>
+                } />
+                <Route path="/login" element={
+                  <Suspense fallback={<RouteFallback />}><Login /></Suspense>
+                } />
+                <Route path="*" element={
+                  <RequireAuth>
+                    <AppShell><AppRoutes /></AppShell>
+                  </RequireAuth>
+                } />
+              </Routes>
+            </ErrorBoundary>
+          </HealthProvider>
+        </AuthProvider>
+      </BrowserRouter>
     </ToastProvider>
   );
 }

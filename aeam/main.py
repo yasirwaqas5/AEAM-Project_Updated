@@ -24,6 +24,7 @@ from typing import Any, AsyncIterator
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from aeam.config.settings import Settings
 from aeam.core.deduplication import EventDeduplicator
@@ -126,6 +127,7 @@ from aeam.api.data_center import router as data_center_router
 from aeam.api.observability import router as observability_router
 from aeam.api.administration import router as administration_router
 from aeam.api.review import router as review_router
+from aeam.api.auth import router as auth_router
 
 # ---------------------------------------------------------------------------
 # Logging bootstrap
@@ -1266,6 +1268,10 @@ def create_app() -> FastAPI:
     # client once the container is built. The middleware holds the same
     # instance, so attach_database() takes effect for it too.
     application.state.audit_logger = audit_logger
+    # Phase E10: exposed so the auth router can read ENVIRONMENT before the
+    # lifespan-built AppContainer exists (the dev-token endpoint must be
+    # gated from the very first request the app serves).
+    application.state.settings = settings
 
     application.add_middleware(
         SecurityMiddleware,
@@ -1307,9 +1313,83 @@ def create_app() -> FastAPI:
     application.include_router(observability_router)
     application.include_router(administration_router)
     application.include_router(review_router)
+    application.include_router(auth_router)
 
     _register_routes(application)
+    _mount_frontend_build(application)
     return application
+
+
+# ---------------------------------------------------------------------------
+# Phase E10 — production frontend serving (ARCH-1: single deployable)
+# ---------------------------------------------------------------------------
+
+# frontend/dist relative to the repository root (this file lives at
+# aeam/main.py, so parents[1] is the repo root).
+_FRONTEND_DIST: Path = Path(__file__).resolve().parents[1] / "frontend" / "dist"
+
+# Prefixes that must NEVER fall through to the SPA index.html -- they are
+# either real API/infra surfaces or already have their own explicit routes.
+_NON_SPA_PREFIXES: tuple[str, ...] = (
+    "api/", "health", "metrics", "docs", "redoc", "openapi.json", "internal/", "favicon.ico",
+)
+
+
+def _mount_frontend_build(app: FastAPI) -> None:
+    """
+    Serve the built React console from the same FastAPI process.
+
+    Phase E10 (ARCH-1): the console ships as a static Vite build
+    (``frontend/dist``), mounted by the monolith rather than requiring a
+    separate Vite dev server or reverse proxy in production. Reused
+    unchanged in local dev: if ``frontend/dist`` does not exist (nobody has
+    run ``npm run build`` yet), this is a silent no-op and the existing
+    ``GET /`` liveness JSON route continues to answer at ``/`` exactly as
+    before (COMPAT-1) -- local dev keeps using the Vite dev server on 5173
+    with its ``/api`` proxy, as documented in the frontend README.
+    """
+    if not _FRONTEND_DIST.is_dir():
+        logger.info(
+            "frontend/dist not found at %s -- skipping static frontend mount "
+            "(expected in local dev; run `npm run build` to enable it).",
+            _FRONTEND_DIST,
+        )
+        return
+
+    assets_dir = _FRONTEND_DIST / "assets"
+    if assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="frontend-assets")
+
+    index_path = _FRONTEND_DIST / "index.html"
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def _serve_spa(full_path: str) -> Response:
+        """SPA fallback: any GET not matched above and not an API/infra path
+        returns the built index.html so client-side routing (react-router)
+        can take over. API/infra prefixes are excluded so a genuinely
+        missing API route still returns a normal 404, not HTML."""
+        if full_path.startswith(_NON_SPA_PREFIXES):
+            return JSONResponse(status_code=404, content={"detail": "Not found."})
+        candidate = _FRONTEND_DIST / full_path
+        if full_path and candidate.is_file():
+            return Response(content=candidate.read_bytes(), media_type=_guess_media_type(candidate))
+        return Response(content=index_path.read_bytes(), media_type="text/html")
+
+    logger.info("Frontend production build mounted from %s", _FRONTEND_DIST)
+
+
+def _guess_media_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    return {
+        ".js": "application/javascript",
+        ".css": "text/css",
+        ".svg": "image/svg+xml",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".ico": "image/x-icon",
+        ".json": "application/json",
+        ".woff2": "font/woff2",
+    }.get(suffix, "application/octet-stream")
 
 
 # ---------------------------------------------------------------------------

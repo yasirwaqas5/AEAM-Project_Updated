@@ -3,6 +3,7 @@ import { Icon } from "../components/ui";
 import { StatusDot } from "../components/library";
 import { matchNav } from "../config/nav";
 import { useHealth } from "./HealthProvider";
+import { useAuth } from "./AuthProvider";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * layout/TopBar.jsx
@@ -22,6 +23,9 @@ export default function TopBar({ onHamburger, onSearch }) {
   const { pathname } = useLocation();
   const active = matchNav(pathname);
   const { overall, agentsActive } = useHealth();
+  const { sub, roles, isDev, logout } = useAuth();
+  const initials = (sub || "?").slice(0, 2).toUpperCase();
+  const roleLabel = roles?.length ? roles.join(", ") : "no roles";
 
   const crumbGroup = active?.group;
   const crumbPage = active?.label || "—";
@@ -60,14 +64,23 @@ export default function TopBar({ onHamburger, onSearch }) {
         <span className="aeam-env" style={{ color: ENV_COLOR.color, borderColor: ENV_COLOR.border, background: ENV_COLOR.bg }}
           title="Frontend build environment">{ENV}</span>
 
-        {/* Current user */}
-        <span className="aeam-user" title="Signed-in operator">
-          <span className="aeam-avatar">OP</span>
+        {/* Current user — Phase E10: real principal + roles from the session's JWT */}
+        <span className="aeam-user" title={`${sub || "Unauthenticated"} · ${roleLabel}${isDev ? " · dev posture" : ""}`}>
+          <span className="aeam-avatar">{initials}</span>
           <span className="aeam-user-meta">
-            <span className="aeam-user-name">Operator</span>
-            <span className="aeam-user-role">SRE · read/write</span>
+            <span className="aeam-user-name">{sub || "Unauthenticated"}</span>
+            <span className="aeam-user-role">{roleLabel}{isDev ? " · dev" : ""}</span>
           </span>
         </span>
+        <button
+          type="button"
+          className="aeam-collapse-btn"
+          onClick={logout}
+          aria-label="Sign out"
+          title="Sign out"
+        >
+          <Icon name="x" size={13} />
+        </button>
       </div>
     </header>
   );

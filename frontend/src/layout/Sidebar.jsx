@@ -1,14 +1,32 @@
 import { NavLink } from "react-router-dom";
 import { Icon } from "../components/ui";
 import { NAV_GROUPS } from "../config/nav";
+import { useAuth } from "./AuthProvider";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * layout/Sidebar.jsx
  * Persistent, grouped, collapsible + resizable navigation. Reads NAV_GROUPS
  * so pages are declared once. Replaces the old top Navbar.
+ *
+ * Phase E10: items whose `permission` the current roles don't grant are
+ * hidden entirely (not just disabled) — role-aware navigation, same RBAC
+ * vocabulary as the backend (lib/rbac.js). A group with no visible items
+ * disappears too, so an analyst never sees an empty "System" heading.
  * ────────────────────────────────────────────────────────────────────────── */
 
 export default function Sidebar({ collapsed, onToggle, onNavigate, onResizeStart }) {
+  const { hasPermission } = useAuth();
+  const visibleGroups = NAV_GROUPS
+    .map((group) => ({
+      ...group,
+      items: group.items.filter((item) => {
+        if (!item.permission) return true;
+        const [resource, action] = item.permission.split(":");
+        return hasPermission(resource, action);
+      }),
+    }))
+    .filter((group) => group.items.length > 0);
+
   return (
     <aside className="aeam-sidebar" aria-label="Primary navigation">
       <div className="aeam-sidebar-head">
@@ -22,7 +40,7 @@ export default function Sidebar({ collapsed, onToggle, onNavigate, onResizeStart
       </div>
 
       <nav className="aeam-nav">
-        {NAV_GROUPS.map((group) => (
+        {visibleGroups.map((group) => (
           <div className="aeam-nav-group" key={group.label}>
             <div className="aeam-nav-group-label">{group.label}</div>
             {group.items.map((item) => (

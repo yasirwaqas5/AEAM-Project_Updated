@@ -41,7 +41,17 @@ logger = logging.getLogger(__name__)
 _INTERNAL_PREFIX: str = "/internal"
 
 # Routes that never require authentication (e.g. health check).
-_PUBLIC_PATHS: frozenset[str] = frozenset({"/", "/health", "/docs", "/openapi.json", "/redoc", "/favicon.ico"})
+# Phase E10: /api/v1/auth/dev-token is how a caller obtains a token in the
+# first place (dev posture only -- the route itself 404s outside
+# development, see aeam/api/auth.py), so it must be reachable pre-auth.
+# /api/v1/auth/session deliberately is NOT listed here: it still requires a
+# verified bearer token in any non-development environment (no RBAC
+# resource mapping is needed since it grants no permission beyond "prove
+# who you are").
+_PUBLIC_PATHS: frozenset[str] = frozenset({
+    "/", "/health", "/docs", "/openapi.json", "/redoc", "/favicon.ico",
+    "/api/v1/auth/dev-token",
+})
 
 # ---------------------------------------------------------------------------
 # Endpoint → (resource, action) mapping for RBAC.
