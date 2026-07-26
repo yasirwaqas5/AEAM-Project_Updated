@@ -39,6 +39,9 @@ ENTERPRISE_TABLES: tuple[str, ...] = (
     "versions",
     "ingestion_jobs",
     "policies",
+    # Phase E9 — Human-in-the-Loop Enforcement.
+    "incident_approvals",
+    "review_verdicts",
 )
 
 # ---------------------------------------------------------------------------
@@ -161,8 +164,51 @@ CREATE TABLE IF NOT EXISTS policies (
 );
 """
 
+# --- Phase E9: Human-in-the-Loop Enforcement -------------------------------
+# Two additive tables. Neither alters an existing table, and an incident
+# with no approval requirement never gets a row in either — incidents that
+# predate this phase therefore read back exactly as they always did
+# (COMPAT-1). MEM-2: verdicts are new records ABOUT an incident, never a
+# mutation of the incident row.
+
+_INCIDENT_APPROVALS = """
+CREATE TABLE IF NOT EXISTS incident_approvals (
+    approval_id      TEXT PRIMARY KEY,
+    incident_id      TEXT,               -- -> incidents.incident_id (unenforced)
+    investigation_id TEXT,               -- Orchestrator's per-investigation id
+    event_type       TEXT,
+    metric           TEXT,
+    severity         TEXT,
+    status           TEXT,               -- 'pending'|'approved'|'rejected'
+    required_tiers   JSONB,              -- ordered chain, e.g. ["analyst","manager"]
+    current_tier     INTEGER,            -- index of the tier whose approval is awaited
+    pending_actions  JSONB,              -- [{"step":...,"params":{...}}] withheld, in runbook order
+    executed_actions JSONB,              -- step names that returned SUCCESS on approval
+    skipped_actions  JSONB,              -- [{"action":...,"reason":...}]
+    created_at       TIMESTAMP,
+    updated_at       TIMESTAMP
+);
+"""
+
+_REVIEW_VERDICTS = """
+CREATE TABLE IF NOT EXISTS review_verdicts (
+    verdict_id         TEXT PRIMARY KEY,
+    approval_id        TEXT,             -- -> incident_approvals.approval_id (unenforced)
+    incident_id        TEXT,             -- -> incidents.incident_id (unenforced)
+    tier               INTEGER,          -- 0-based index into required_tiers
+    tier_label         TEXT,             -- the tier's name at the time of the verdict
+    verdict            TEXT,             -- 'approved'|'rejected'|'changes_requested'|'escalated'
+    reviewer_id        TEXT,             -- acting principal (E3 identity)
+    reviewer_roles     JSONB,            -- roles that principal held
+    attribution_source TEXT,             -- 'jwt'|'request'|'unattributed'
+    note               TEXT,
+    created_at         TIMESTAMP
+);
+"""
+
 _DDL: tuple[str, ...] = (
     _SOURCES, _DOCUMENTS, _DATASETS, _SCHEMAS, _VERSIONS, _INGESTION_JOBS, _POLICIES,
+    _INCIDENT_APPROVALS, _REVIEW_VERDICTS,
 )
 
 # Helpful lookup indexes for the query patterns later phases rely on.
@@ -177,6 +223,11 @@ _INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_jobs_status ON ingestion_jobs (status);",
     "CREATE INDEX IF NOT EXISTS idx_jobs_content_hash ON ingestion_jobs (content_hash);",
     "CREATE INDEX IF NOT EXISTS idx_policies_doc ON policies (doc_id);",
+    # Phase E9 — the review queue reads by status, everything else by incident.
+    "CREATE INDEX IF NOT EXISTS idx_approvals_incident ON incident_approvals (incident_id);",
+    "CREATE INDEX IF NOT EXISTS idx_approvals_status ON incident_approvals (status);",
+    "CREATE INDEX IF NOT EXISTS idx_verdicts_incident ON review_verdicts (incident_id);",
+    "CREATE INDEX IF NOT EXISTS idx_verdicts_approval ON review_verdicts (approval_id);",
 )
 
 

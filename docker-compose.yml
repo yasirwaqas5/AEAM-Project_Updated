@@ -55,6 +55,13 @@ services:
       LLM_PROVIDER: "${LLM_PROVIDER:-groq}"
       USE_MOCK_LLM: "${USE_MOCK_LLM:-true}"
 
+      # E9 (AGENT-5): human-approval enforcement, on by default here so
+      # local runs exercise the same gate production does. Notifications
+      # are never gated; only state-changing runbook steps wait for a
+      # verdict. See docs/human_in_the_loop.md.
+      HUMAN_APPROVAL_ENFORCED: "${HUMAN_APPROVAL_ENFORCED:-true}"
+      APPROVAL_TIER_CHAIN: "${APPROVAL_TIER_CHAIN:-reviewer}"
+
       # E3: JWT public key + audit sink. When ENVIRONMENT!=development,
       # JWT_PUBLIC_KEY (or JWT_PUBLIC_KEY_PATH) MUST be set — the
       # container will refuse to start otherwise (SEC-4).

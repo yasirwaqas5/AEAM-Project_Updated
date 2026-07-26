@@ -53,10 +53,13 @@ Key directories (`aeam/`):
   `monitor/`, `kpi/` (rule engine + statistical detector), `forecast/` (Prophet),
   `rag/` (ingestion + layered retrieval pipeline), `action/`, `report/`.
 - `api/` — FastAPI routers (`incidents`, `trigger`, `system`, `logs`, `ingest`,
-  `knowledge`, `data_center`, `retrieval_debug`).
+  `knowledge`, `data_center`, `retrieval_debug`, `observability`, `administration`,
+  `review`).
 - `core/` — `event_bus`, `event_models`, `priority_queue`, `deduplication`, `idempotency`, `state_machine`.
 - `integrations/` — `database`, `redis_client`, `vector_db`, `embedding_service`, `secret_manager`.
 - `intelligence/` — dataset intelligence, policy extraction/registry, cross-dataset & adaptive detection.
+- `governance/` — human-in-the-loop enforcement (Phase E9): approval-chain resolution,
+  pending-action recording, verdict application, and release of withheld execution.
 - `memory/`, `ingestion/`, `pipelines/`, `registry/`, `security/`, `monitoring/`, `connectors/`, `storage/`.
 
 Data flow:
@@ -93,8 +96,9 @@ Central coordinator of the incident lifecycle: `EVENT_RECEIVED → INVESTIGATING
 - `_investigate(ctx)` runs one pass: DecisionEngine decides, then (idempotently, once per incident) gathers advisory findings from Enterprise Memory (C1), Policy Registry (C3), Cross-Dataset Intelligence (C4), Adaptive Detection (C5), and RAG (Phase 4); forces LLM reasoning at depth ≥ 3.
 - `_evaluate(ctx)` routes on EvaluationEngine result: CONTINUE (recurse) / STOP / ESCALATE.
 - `_finalize_incident(ctx)` executes the event's safe runbook via ActionAgent, sends structured Slack/Jira/email notifications, writes a consolidated `audit_summary`, persists via LongTermMemory, and remembers the incident.
+- **Human-approval gate (Phase E9, AGENT-5).** When C7's execution plan set `human_approval_required` AND a `HumanReviewService` is wired AND `HUMAN_APPROVAL_ENFORCED` is on, `_finalize_incident` records the runbook's *gated* steps (`is_gated_step()` in `runbooks.py` — everything except Slack/Jira/marketing-Slack/email, because informing humans is never gated) as **pending** instead of executing them, appends a `human_approval` findings entry, and writes an `incident_approvals` row keyed by the persisted incident id. Only an authorized approval through `/api/v1/review` releases them, through the unchanged ActionAgent. Any of the three conditions being false reproduces pre-E9 behaviour exactly. See `docs/human_in_the_loop.md`.
 - Constraints: no detection logic, no direct DB writes (delegates to LTM), no external API calls (delegates to ActionAgent). Advisory findings NEVER feed back into RuleEngine/DecisionEngine/ActionAgent.
-- Key collaborators: `decision_engine`, `evaluation_engine`, `incident_context`, `state_machine`, `investigation_status`, `notifications`, `runbooks`, `cause_quality`.
+- Key collaborators: `decision_engine`, `evaluation_engine`, `incident_context`, `state_machine`, `investigation_status`, `notifications`, `runbooks`, `cause_quality`, `governance/human_review`.
 
 ### Monitor — `aeam/agents/monitor/monitor_agent.py`
 Deterministic KPI detection + event creation; runs a continuous polling loop in a background thread (`start()`).

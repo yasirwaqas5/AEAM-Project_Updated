@@ -88,6 +88,63 @@ class ParentType:
     ALL = {DOCUMENT, DATASET, SOURCE_SYNC}
 
 
+class ApprovalStatus:
+    """
+    Lifecycle of ONE incident's approval requirement (Phase E9).
+
+    ``PENDING`` covers both "no tier has approved yet" and "some, but not
+    all, tiers of an ordered chain have approved" — ``IncidentApproval
+    .current_tier`` says which. Gated steps execute exactly once, on the
+    transition into ``APPROVED``; ``REJECTED`` halts the chain permanently
+    and no gated step ever runs.
+    """
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    ALL = {PENDING, APPROVED, REJECTED}
+    #: Statuses from which the approval can no longer transition.
+    TERMINAL = {APPROVED, REJECTED}
+
+
+class Verdict:
+    """
+    The four review verdicts (Phase E9) — the SAME vocabulary the Human
+    Review workspace has offered since it shipped, now persisted.
+
+    Only ``APPROVED`` advances the approval chain, and only ``REJECTED``
+    halts it. ``CHANGES_REQUESTED`` and ``ESCALATED`` are genuine recorded
+    verdicts with reviewer attribution that leave the incident pending —
+    they express "not yet / not by me", which is neither an approval nor a
+    rejection, and pretending otherwise would misstate what the human did.
+    """
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    CHANGES_REQUESTED = "changes_requested"
+    ESCALATED = "escalated"
+    ALL = {APPROVED, REJECTED, CHANGES_REQUESTED, ESCALATED}
+    #: Verdicts that move the approval chain to its next tier.
+    ADVANCING = {APPROVED}
+    #: Verdicts that terminate the chain without executing anything.
+    HALTING = {REJECTED}
+
+
+class AttributionSource:
+    """
+    Where a verdict's acting principal came from (Phase E9, PHIL-1).
+
+    Recorded per verdict so the audit trail never implies an identity was
+    cryptographically established when it was not.
+    """
+    #: Principal taken from a verified JWT (the E3 identity path).
+    JWT = "jwt"
+    #: Principal supplied in the request body — only reachable when the
+    #: security middleware is bypassed (ENVIRONMENT=development).
+    REQUEST = "request"
+    #: No identity available at all.
+    UNATTRIBUTED = "unattributed"
+    ALL = {JWT, REQUEST, UNATTRIBUTED}
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -321,3 +378,91 @@ class Policy(_Asset):
             except (ValueError, TypeError):
                 policy.embedding = None
         return policy
+
+
+@dataclass
+class IncidentApproval(_Asset):
+    """
+    ONE incident's approval requirement and the gated steps it holds back
+    (Phase E9 — Human-in-the-Loop Enforcement).
+
+    Created by the Orchestrator at finalization ONLY when the execution
+    plan set ``human_approval_required=True`` and enforcement is on. Its
+    existence is what makes the gate real: ``pending_actions`` is the
+    exact, ordered list of ActionAgent calls that were NOT executed, each
+    recorded with the parameters the Orchestrator had already built, so an
+    approval later executes precisely what was withheld — never a
+    re-derived or re-planned set.
+
+    MEM-2: this is a NEW record about an incident, never a mutation of the
+    incident row. An incident that predates this phase simply has no
+    approval record, and every reader treats absence as "no gate".
+    """
+    approval_id: str = field(default_factory=_new_id)
+    #: ``incidents.incident_id`` of the persisted incident (unenforced FK).
+    incident_id: str = ""
+    #: The Orchestrator's own per-investigation id (its IncidentContext id),
+    #: which is NOT the same value as ``incident_id`` — the incidents table
+    #: generates its own primary key on insert. Kept for traceability
+    #: between the findings JSON and this record.
+    investigation_id: str | None = None
+    event_type: str | None = None
+    metric: str | None = None
+    severity: str | None = None
+    status: str = ApprovalStatus.PENDING
+    #: Ordered approval chain, e.g. ``["reviewer"]`` (single-tier default)
+    #: or ``["analyst", "manager", "risk"]``.
+    required_tiers: list[str] = field(default_factory=list)
+    #: Index into ``required_tiers`` of the tier whose approval is awaited.
+    #: Equals ``len(required_tiers)`` once every tier has approved.
+    current_tier: int = 0
+    #: ``[{"step": "diagnostics", "params": {...}}, ...]`` — exactly what
+    #: was withheld, in runbook order.
+    pending_actions: list[dict[str, Any]] = field(default_factory=list)
+    #: Runbook step names that actually returned SUCCESS on approval.
+    executed_actions: list[str] = field(default_factory=list)
+    #: ``[{"action": ..., "reason": ...}]`` for steps that did not run.
+    skipped_actions: list[dict[str, Any]] = field(default_factory=list)
+    created_at: str = field(default_factory=_now_iso)
+    updated_at: str = field(default_factory=_now_iso)
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "IncidentApproval":
+        return _Asset._base_from_row(
+            cls, row,
+            ("required_tiers", "pending_actions", "executed_actions", "skipped_actions"),
+        )
+
+
+@dataclass
+class ReviewVerdict(_Asset):
+    """
+    ONE human verdict, attributed to ONE principal, at ONE tier of an
+    approval chain (Phase E9).
+
+    Verdicts are append-only: a chain of three tiers produces three rows,
+    each with its own reviewer, so "who approved what, and in which order"
+    is answerable from the table alone. A rejection is recorded the same
+    way — the row names the tier and principal that halted the chain.
+    """
+    verdict_id: str = field(default_factory=_new_id)
+    #: -> incident_approvals.approval_id (unenforced FK).
+    approval_id: str = ""
+    #: -> incidents.incident_id (unenforced FK); denormalised so verdict
+    #: history is queryable per incident without a join.
+    incident_id: str = ""
+    #: 0-based index into the approval's ``required_tiers`` at the time
+    #: this verdict was cast.
+    tier: int = 0
+    tier_label: str | None = None
+    verdict: str = Verdict.APPROVED
+    reviewer_id: str = ""
+    reviewer_roles: list[str] = field(default_factory=list)
+    #: See :class:`AttributionSource` — how the principal was established.
+    attribution_source: str = AttributionSource.UNATTRIBUTED
+    note: str | None = None
+    created_at: str = field(default_factory=_now_iso)
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "ReviewVerdict":
+        return _Asset._base_from_row(cls, row, ("reviewer_roles",))

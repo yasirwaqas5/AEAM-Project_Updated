@@ -724,6 +724,60 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Human-in-the-Loop Enforcement (Phase E9, AGENT-5 / COMPAT-6) ---
+    #
+    # C7 has computed `human_approval_required` since Phase C7, but nothing
+    # enforced it — the runbook executed regardless, which AGENT-5 permits
+    # only if the flag is documented as advisory. E9 makes it a real gate at
+    # the execution boundary. The three fields below are the whole control
+    # surface: whether the gate is enforced at all, and which ordered chain
+    # of approval tiers an incident must clear before its gated runbook
+    # steps run.
+    #
+    # Deliberately NOT registered in aeam/config/config_registry.py: the D5
+    # admin API can edit every field it lists, and an approval gate that a
+    # single API call can switch off is not a governance control. Changing
+    # these is a deployment-time act (env var / cloudrun.yaml), auditable in
+    # the deployment record rather than silently at runtime.
+
+    HUMAN_APPROVAL_ENFORCED: bool = Field(
+        default=True,
+        description=(
+            "Phase E9 (AGENT-5): when true, an incident whose execution plan "
+            "sets human_approval_required=True has its GATED runbook steps "
+            "recorded as pending instead of executed; only an authorized "
+            "approval through the review API executes them. Notifications "
+            "(Slack/Jira/email) are never gated — informing humans is not an "
+            "action that needs approving. Set false to restore the pre-E9 "
+            "advisory behaviour exactly (the tables stay, inert): this is "
+            "the phase's documented rollback switch."
+        ),
+    )
+
+    APPROVAL_TIER_CHAIN: str = Field(
+        default="reviewer",
+        description=(
+            "Phase E9: the DEFAULT ordered approval chain, comma-separated "
+            "(same convention as ACTIVATED_DATASET_IDS). One entry — the "
+            "default — is a single-tier requirement and behaves exactly like "
+            "a one-step approval (COMPAT-1/6). Several entries (e.g. "
+            "'analyst,manager,risk') require every tier to approve IN ORDER "
+            "before any gated step executes."
+        ),
+    )
+
+    APPROVAL_TIER_CHAIN_OVERRIDES: str | None = Field(
+        default=None,
+        description=(
+            "Phase E9: optional per-severity chain overrides, formatted "
+            "'SEVERITY:tier1,tier2;SEVERITY2:tier1' (e.g. "
+            "'CRITICAL:analyst,manager,risk;HIGH:analyst,manager'). Severity "
+            "match is case-insensitive. A severity with no override uses "
+            "APPROVAL_TIER_CHAIN. A matched policy that names responsible "
+            "roles takes precedence over both (see docs/human_in_the_loop.md)."
+        ),
+    )
+
     # --- Identity & Access Enforcement (Phase E3) ---
     #
     # Key material for the RS256 JWT verifier and CORS origins move out of

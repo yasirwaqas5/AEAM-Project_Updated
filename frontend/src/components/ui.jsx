@@ -323,6 +323,43 @@ export function getAIEvaluationData(incident) {
 }
 
 /**
+ * The human-approval gate recorded for this incident (type "human_approval",
+ * Phase E9) — present ONLY when C7's human_approval_required was true AND
+ * enforcement was on, i.e. when gated runbook steps were actually withheld.
+ * Shape: {approval_id, required, enforced, status, required_tiers,
+ * current_tier, chain_source, pending_actions, gate_reason}.
+ *
+ * Returns null for every incident that was never gated — including every
+ * incident that predates Phase E9. Absence means "no gate", never "denied":
+ * callers must not render a pending-approval state from a null (COMPAT-1).
+ *
+ * Note this is the snapshot written at finalization. The LIVE state (which
+ * tier the chain is on now, who approved) lives in the review API
+ * (/api/v1/review/incidents/{id}) — this helper is what lets any incident
+ * view show "gated" without a second request.
+ */
+export function getHumanApproval(incident) {
+  const findings = getFindings(incident);
+  let latest = null;
+  for (const entry of findings) {
+    if (entry?.type === "human_approval" && entry.data) latest = entry.data;
+  }
+  return latest;
+}
+
+/**
+ * Runbook step names withheld pending human approval (Phase E9), e.g.
+ * ["diagnostics", "monitoring"]. Empty array when the incident was never
+ * gated — never a guess, and never the recommended-actions list, which is
+ * advisory text rather than withheld execution.
+ */
+export function getPendingActions(incident) {
+  const approval = getHumanApproval(incident);
+  const pending = approval?.pending_actions;
+  return Array.isArray(pending) ? pending.filter(Boolean) : [];
+}
+
+/**
  * The root_cause_source provenance tag from audit_summary (Phase E1, ENG-5):
  * "rag" | "llm_reasoning" | "placeholder" | null. null means either pre-E1
  * incident or no root cause was set.

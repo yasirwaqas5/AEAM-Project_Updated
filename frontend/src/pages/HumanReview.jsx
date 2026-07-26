@@ -5,38 +5,117 @@ import {
 } from "../components/ui";
 import { PageContainer, MetricCard, Panel, EmptyState, LoadingState, ErrorState } from "../components/library";
 import EvidencePanel from "../components/EvidencePanel";
+import { fetchJSON } from "./KnowledgeCenter";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * pages/HumanReview.jsx  (Human Review Workspace)
  *
- * Reuses the existing, UNMODIFIED incidents API (GET /api/v1/incidents/ —
- * SELECT * already returns requires_human, severity, confidence, root_cause,
- * findings/evidence) and the same ui.jsx incident-shape helpers every other
- * page in this app already uses (deriveStatus, getRecommendedActions,
- * getEvidence, getRetrievedCount). No new backend endpoint, no schema change.
+ * Phase E9 — this workspace is now PERSISTED. Until E9 the incidents table
+ * had no verdict columns and no write endpoint existed, so every verdict was
+ * recorded in browser session state and the page said so in a banner. That
+ * banner is gone because it stopped being true: verdicts go to
+ * aeam/api/review.py, survive restart, carry the acting principal, and — for
+ * an approval that completes the chain — actually release the runbook steps
+ * the Orchestrator withheld.
  *
- * Architecture note (see the Architecture Gate for this phase): the incidents
- * table has no reviewer/verdict columns and no write endpoint exists. Rather
- * than invent one, Approve / Reject / Request Changes / Escalate / Assign
- * Reviewer are implemented as REAL interactions against LOCAL, session-only
- * state — never sent to the backend, never presented as if they were. This
- * is the "UI only if backend unavailable" path the mission explicitly named
- * for Assign Reviewer, applied consistently to every verdict action so the
- * workflow is honest end-to-end: nothing here is fabricated as persisted.
+ * Two backend surfaces, both new in E9 and both read verbatim (no derived
+ * governance state is computed in the browser — the chain, the tier, and
+ * what executed are the server's answers):
+ *   GET  /api/v1/review/queue      — incidents holding withheld actions
+ *   GET  /api/v1/review/verdicts   — persisted verdict history
+ *   POST /api/v1/review/incidents/{id}/{approve|reject|verdict}
+ *
+ * The incidents API (GET /api/v1/incidents/) is still read, unmodified, for
+ * the evidence/confidence/root-cause detail each queue row displays — the
+ * queue says WHAT is gated, the incident record says what the investigation
+ * found. Incidents that predate this phase simply never appear in the queue.
  * ────────────────────────────────────────────────────────────────────────── */
 
-const fetchIncidents = async () => {
-  const res = await fetch("/api/v1/incidents/");
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
-};
+const fetchIncidents = () => fetchJSON("/api/v1/incidents/");
+const fetchQueue = () => fetchJSON("/api/v1/review/queue");
+const fetchVerdicts = () => fetchJSON("/api/v1/review/verdicts?limit=50");
+
+const submitVerdict = (incidentId, verdict, note) =>
+  fetchJSON(`/api/v1/review/incidents/${incidentId}/verdict`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ verdict, note: note || null }),
+  });
 
 const VERDICTS = {
-  approved:          { label: "Approved",         color: "var(--ok)",   icon: "check" },
-  rejected:          { label: "Rejected",         color: "var(--err)",  icon: "x" },
+  approved:          { label: "Approved",          color: "var(--ok)",   icon: "check" },
+  rejected:          { label: "Rejected",          color: "var(--err)",  icon: "x" },
   changes_requested: { label: "Changes Requested", color: "var(--warn)", icon: "alert" },
-  escalated:         { label: "Escalated",        color: "var(--info)", icon: "shield" },
+  escalated:         { label: "Escalated",         color: "var(--info)", icon: "shield" },
 };
+
+// Verdicts that leave the approval chain exactly where it was. Labelled as
+// such in the UI so a reviewer is never led to believe "Request Changes"
+// approved or rejected anything.
+const NON_DECIDING = new Set(["changes_requested", "escalated"]);
+
+// ─── Approval chain (server-provided; never inferred here) ──────────────────
+
+function ApprovalChain({ approval }) {
+  const tiers = approval.required_tiers || [];
+  const current = approval.current_tier ?? 0;
+  if (tiers.length === 0) return null;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem" }}>
+      <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>
+        Approval Chain {tiers.length > 1 ? `(${tiers.length} tiers, in order)` : "(single tier)"}
+      </span>
+      <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: "0.35rem" }}>
+        {tiers.map((tier, i) => {
+          const done = i < current;
+          const active = i === current && approval.status === "pending";
+          const color = done ? "var(--ok)" : active ? "var(--warn)" : "var(--muted)";
+          return (
+            <span key={`${tier}-${i}`} style={{ display: "flex", alignItems: "center", gap: "0.35rem" }}>
+              {i > 0 && <Icon name="chevron" size={11} style={{ transform: "rotate(-90deg)", opacity: 0.5 }} />}
+              <span style={{
+                display: "inline-flex", alignItems: "center", gap: "0.3rem",
+                fontSize: "0.72rem", color, fontWeight: active ? 600 : 400,
+                padding: "0.15rem 0.5rem", borderRadius: 999,
+                border: `1px solid color-mix(in srgb, ${color} 40%, transparent)`,
+                background: active ? `color-mix(in srgb, ${color} 10%, transparent)` : "transparent",
+              }}>
+                {done && <Icon name="check" size={11} />}
+                {tier}
+              </span>
+            </span>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ─── Withheld actions (what the gate is actually holding back) ──────────────
+
+function WithheldActions({ approval }) {
+  const pending = approval.pending_actions || [];
+  if (pending.length === 0) {
+    return (
+      <div style={{ fontSize: "0.74rem", color: "var(--muted)" }}>
+        No runbook steps were withheld — notifications already dispatched.
+      </div>
+    );
+  }
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "0.35rem" }}>
+      <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>
+        Withheld Until Approved ({pending.length})
+      </span>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "0.35rem" }}>
+        {pending.map((step) => (
+          <Badge key={step} label={step} color="var(--warn)" dot />
+        ))}
+      </div>
+    </div>
+  );
+}
 
 // ─── Evidence Summary (condensed — full detail via the reused EvidencePanel) ─
 
@@ -64,101 +143,146 @@ function EvidenceSummary({ incident, expanded, onToggle }) {
   );
 }
 
-// ─── Verdict action bar (records to LOCAL state only — never sent anywhere) ──
+// ─── Verdict action bar (persisted — POSTs to the review API) ───────────────
 
-function VerdictBar({ onRecord }) {
+function VerdictBar({ approval, onSubmit, busy, error }) {
   const [pendingVerdict, setPendingVerdict] = useState(null);
-  const [reviewer, setReviewer] = useState("Operator");
   const [note, setNote] = useState("");
+
+  const awaiting = approval.awaiting_tier;
 
   if (pendingVerdict) {
     const v = VERDICTS[pendingVerdict];
+    const deciding = !NON_DECIDING.has(pendingVerdict);
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem", padding: "0.8rem", border: `1px solid color-mix(in srgb, ${v.color} 33%, transparent)`, borderRadius: 9, background: `color-mix(in srgb, ${v.color} 6%, transparent)` }}>
         <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", fontSize: "0.78rem", color: v.color, fontWeight: 600 }}>
           <Icon name={v.icon} size={14} /> Confirm: {v.label}
+          {awaiting && <span style={{ fontWeight: 400, color: "var(--muted)" }}>· as {awaiting}</span>}
         </div>
-        <input value={reviewer} onChange={(e) => setReviewer(e.target.value)} placeholder="Reviewer name"
-          style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6, padding: "0.4rem 0.6rem", fontSize: "0.78rem", color: "var(--text)" }} />
+        <div style={{ fontSize: "0.72rem", color: "var(--muted)" }}>
+          {deciding
+            ? (pendingVerdict === "approved"
+                ? ((approval.remaining_tiers || []).length > 1
+                    ? `Advances the chain to ${(approval.remaining_tiers || [])[1]}. Nothing executes until every tier has approved.`
+                    : "This is the final tier — the withheld runbook steps will execute now.")
+                : "Halts the chain permanently. No withheld step will ever execute for this incident.")
+            : "Recorded with your identity; the approval chain stays exactly where it is."}
+        </div>
         <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Optional note…" rows={2}
           style={{ background: "var(--bg)", border: "1px solid var(--border)", borderRadius: 6, padding: "0.4rem 0.6rem", fontSize: "0.78rem", color: "var(--text)", fontFamily: "inherit", resize: "vertical" }} />
+        {error && <div style={{ fontSize: "0.74rem", color: "var(--err)" }}>{error}</div>}
         <div style={{ display: "flex", gap: "0.5rem" }}>
-          <Button variant="primary" onClick={() => { onRecord(pendingVerdict, reviewer, note); setPendingVerdict(null); setNote(""); }}>
-            Confirm {v.label}
+          <Button variant="primary" disabled={busy}
+            onClick={async () => {
+              const ok = await onSubmit(pendingVerdict, note);
+              if (ok) { setPendingVerdict(null); setNote(""); }
+            }}>
+            {busy ? "Submitting…" : `Confirm ${v.label}`}
           </Button>
-          <Button onClick={() => setPendingVerdict(null)}>Cancel</Button>
+          <Button onClick={() => setPendingVerdict(null)} disabled={busy}>Cancel</Button>
         </div>
       </div>
     );
   }
 
   return (
-    <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem" }}>
-      <Button icon="check" onClick={() => setPendingVerdict("approved")}>Approve</Button>
-      <Button icon="x" onClick={() => setPendingVerdict("rejected")}>Reject</Button>
-      <Button icon="alert" onClick={() => setPendingVerdict("changes_requested")}>Request Changes</Button>
-      <Button icon="shield" onClick={() => setPendingVerdict("escalated")}>Escalate</Button>
+    <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem" }}>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem" }}>
+        <Button icon="check" onClick={() => setPendingVerdict("approved")}>Approve</Button>
+        <Button icon="x" onClick={() => setPendingVerdict("rejected")}>Reject</Button>
+        <Button icon="alert" onClick={() => setPendingVerdict("changes_requested")}>Request Changes</Button>
+        <Button icon="shield" onClick={() => setPendingVerdict("escalated")}>Escalate</Button>
+      </div>
+      {error && <div style={{ fontSize: "0.74rem", color: "var(--err)" }}>{error}</div>}
     </div>
   );
 }
 
 // ─── Review queue card ───────────────────────────────────────────────────────
 
-function ReviewCard({ incident, onRecord }) {
+function ReviewCard({ approval, incident, onSubmit }) {
   const [evidenceOpen, setEvidenceOpen] = useState(false);
-  const sev = severityOf(incident.severity);
-  const recommended = getRecommendedActions(incident);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const sev = severityOf(approval.severity || incident?.severity);
+  const recommended = incident ? getRecommendedActions(incident) : [];
+
+  const handle = useCallback(async (verdict, note) => {
+    setBusy(true); setError(null);
+    try {
+      await onSubmit(approval.incident_id, verdict, note);
+      return true;
+    } catch (e) {
+      setError(e.message);
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }, [approval.incident_id, onSubmit]);
 
   return (
     <Card accent={sev.color} style={{ display: "flex", flexDirection: "column", gap: "0.9rem" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "0.5rem" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "0.6rem" }}>
-          <SeverityBadge severity={incident.severity} />
+          <SeverityBadge severity={approval.severity || incident?.severity} />
           <span style={{ fontFamily: "var(--font-mono)", fontSize: "0.85rem", fontWeight: 600, color: "var(--text)" }}>
-            {incident.event_type || "—"}
+            {approval.event_type || incident?.event_type || "—"}
           </span>
-          <span style={{ fontSize: "0.72rem", color: "var(--muted)" }}>· {incident.metric || "—"}</span>
+          <span style={{ fontSize: "0.72rem", color: "var(--muted)" }}>· {approval.metric || incident?.metric || "—"}</span>
         </div>
-        <span style={{ fontSize: "0.68rem", color: "var(--muted)", fontFamily: "var(--font-mono)" }}>{fmtRelative(incident.timestamp)}</span>
+        <span style={{ fontSize: "0.68rem", color: "var(--muted)", fontFamily: "var(--font-mono)" }}>{fmtRelative(approval.created_at)}</span>
       </div>
 
       <div className="aeam-grid-auto">
-        <Field label="Root Cause" value={incident.root_cause || "Pending"} />
+        <Field label="Root Cause" value={incident?.root_cause || "Pending"} />
         <div style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
           <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>Confidence</span>
-          <ConfidenceBar value={incident.confidence} />
+          <ConfidenceBar value={incident?.confidence} />
         </div>
         <Field label="Recommended Action" value={recommended.join("; ")} />
       </div>
 
-      <EvidenceSummary incident={incident} expanded={evidenceOpen} onToggle={() => setEvidenceOpen((v) => !v)} />
+      <ApprovalChain approval={approval} />
+      <WithheldActions approval={approval} />
 
-      <VerdictBar onRecord={(verdict, reviewer, note) => onRecord(incident, verdict, reviewer, note)} />
+      {incident && (
+        <EvidenceSummary incident={incident} expanded={evidenceOpen} onToggle={() => setEvidenceOpen((v) => !v)} />
+      )}
+
+      <VerdictBar approval={approval} onSubmit={handle} busy={busy} error={error} />
     </Card>
   );
 }
 
-// ─── Session Review History (explicitly labeled non-persisted) ─────────────
+// ─── Persisted verdict history ──────────────────────────────────────────────
 
 function ReviewHistory({ entries }) {
   if (entries.length === 0) {
     return (
-      <EmptyState icon="clock" title="No review history yet"
-        description="Review decisions are not yet persisted by the backend — nothing to show until Approve/Reject/Request Changes/Escalate is used in this session." />
+      <EmptyState icon="clock" title="No verdicts recorded yet"
+        description="Approve / Reject / Request Changes / Escalate decisions appear here once cast — they are persisted, attributed, and survive restart." />
     );
   }
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem" }}>
-      {entries.map((e, i) => {
-        const v = VERDICTS[e.verdict];
+      {entries.map((e) => {
+        const v = VERDICTS[e.verdict] || { label: e.verdict, color: "var(--muted)" };
+        const tier = e.tier_label ? `${e.tier_label} (tier ${(e.tier ?? 0) + 1})` : `tier ${(e.tier ?? 0) + 1}`;
         return (
-          <div key={i} style={{ display: "flex", flexDirection: "column", gap: "0.3rem", padding: "0.7rem 0.9rem", border: "1px solid var(--border)", borderRadius: 9 }}>
+          <div key={e.verdict_id} style={{ display: "flex", flexDirection: "column", gap: "0.3rem", padding: "0.7rem 0.9rem", border: "1px solid var(--border)", borderRadius: 9 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "0.5rem" }}>
               <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
                 <Badge label={v.label} color={v.color} dot />
-                <span style={{ fontSize: "0.78rem", color: "var(--text)", fontFamily: "var(--font-mono)" }}>{e.incident.event_type} · {e.incident.metric}</span>
+                <span style={{ fontSize: "0.78rem", color: "var(--text)", fontFamily: "var(--font-mono)" }}>{e.incident_id}</span>
+                <span style={{ fontSize: "0.7rem", color: "var(--muted)" }}>· {tier}</span>
               </div>
-              <span style={{ fontSize: "0.68rem", color: "var(--muted)" }}>{fmtRelative(e.at)} by {e.reviewer}</span>
+              <span style={{ fontSize: "0.68rem", color: "var(--muted)" }}>
+                {fmtRelative(e.created_at)} by {e.reviewer_id}
+                {e.attribution_source && e.attribution_source !== "jwt" && (
+                  <span style={{ color: "var(--warn)" }}> · identity: {e.attribution_source}</span>
+                )}
+              </span>
             </div>
             {e.note && <div style={{ fontSize: "0.76rem", color: "var(--muted)" }}>{e.note}</div>}
           </div>
@@ -171,16 +295,23 @@ function ReviewHistory({ entries }) {
 // ─── Page ───────────────────────────────────────────────────────────────────
 
 export default function HumanReview() {
+  const [queue, setQueue] = useState([]);
+  const [enforced, setEnforced] = useState(true);
   const [incidents, setIncidents] = useState([]);
+  const [verdicts, setVerdicts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [reviewed, setReviewed] = useState({}); // { [incident_id]: reviewHistoryEntry }
 
   const load = useCallback(async () => {
     setLoading(true); setError(null);
     try {
-      const data = await fetchIncidents();
-      setIncidents(Array.isArray(data) ? data : []);
+      const [queueData, verdictData, incidentData] = await Promise.all([
+        fetchQueue(), fetchVerdicts(), fetchIncidents(),
+      ]);
+      setQueue(Array.isArray(queueData?.queue) ? queueData.queue : []);
+      setEnforced(queueData?.enforced !== false);
+      setVerdicts(Array.isArray(verdictData?.verdicts) ? verdictData.verdicts : []);
+      setIncidents(Array.isArray(incidentData) ? incidentData : []);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -190,89 +321,92 @@ export default function HumanReview() {
 
   useEffect(() => { load(); }, [load]);
 
-  const recordVerdict = useCallback((incident, verdict, reviewer, note) => {
-    setReviewed((prev) => ({
-      ...prev,
-      [incident.incident_id]: { incident, verdict, reviewer: reviewer || "Operator", note, at: new Date().toISOString() },
-    }));
-  }, []);
+  // Cast a verdict, then re-read from the server. The page never guesses the
+  // resulting state — whether the chain advanced, halted, or released
+  // execution is the review API's answer, not a local optimistic update.
+  const castVerdict = useCallback(async (incidentId, verdict, note) => {
+    await submitVerdict(incidentId, verdict, note);
+    await load();
+  }, [load]);
 
-  const needsReview = useMemo(
-    () => incidents.filter((i) => i.requires_human && !reviewed[i.incident_id]),
-    [incidents, reviewed],
+  const incidentsById = useMemo(() => {
+    const map = {};
+    for (const inc of incidents) map[inc.incident_id] = inc;
+    return map;
+  }, [incidents]);
+
+  const escalatedCount = useMemo(
+    () => incidents.filter((i) => i.requires_human).length, [incidents],
   );
-  const historyEntries = useMemo(
-    () => Object.values(reviewed).sort((a, b) => new Date(b.at) - new Date(a.at)),
-    [reviewed],
+  const withheldCount = useMemo(
+    () => queue.reduce((sum, a) => sum + (a.pending_actions?.length || 0), 0), [queue],
   );
-  const escalatedCount = useMemo(() => incidents.filter((i) => i.requires_human).length, [incidents]);
-  const avgConfidence = useMemo(() => {
-    const withConf = needsReview.filter((i) => i.confidence != null);
-    if (!withConf.length) return null;
-    return withConf.reduce((s, i) => s + i.confidence, 0) / withConf.length;
-  }, [needsReview]);
+  const multiTierCount = useMemo(
+    () => queue.filter((a) => (a.required_tiers || []).length > 1).length, [queue],
+  );
+
+  const header = (
+    <PageHeader
+      title="Human Review Queue"
+      subtitle="Approve, reject, request changes, or escalate — verdicts are persisted, attributed, and gate execution"
+      right={<Button icon="activity" onClick={load} disabled={loading}>{loading ? "Loading…" : "Refresh"}</Button>}
+    />
+  );
 
   if (loading) {
-    return (
-      <PageContainer>
-        <PageHeader title="Human Review Queue" subtitle="Work the escalation backlog — assign, approve, reject, request changes, or escalate" />
-        <LoadingState label="Loading the review queue…" rows={5} />
-      </PageContainer>
-    );
+    return <PageContainer>{header}<LoadingState label="Loading the review queue…" rows={5} /></PageContainer>;
   }
 
   if (error) {
-    return (
-      <PageContainer>
-        <PageHeader title="Human Review Queue" subtitle="Work the escalation backlog — assign, approve, reject, request changes, or escalate"
-          right={<Button icon="activity" onClick={load}>Retry</Button>} />
-        <ErrorState message={error} onRetry={load} />
-      </PageContainer>
-    );
+    return <PageContainer>{header}<ErrorState message={error} onRetry={load} /></PageContainer>;
   }
 
   return (
     <PageContainer max={1100}>
-      <PageHeader
-        title="Human Review Queue"
-        subtitle="Work the escalation backlog — assign, approve, reject, request changes, or escalate"
-        right={<Button icon="activity" onClick={load} disabled={loading}>{loading ? "Loading…" : "Refresh"}</Button>}
-      />
+      {header}
 
-      <div style={{
-        display: "flex", alignItems: "center", gap: "0.6rem", marginBottom: "1.2rem",
-        padding: "0.7rem 1rem", border: "1px solid var(--border)", borderRadius: 9,
-        background: "rgba(0,180,255,0.06)", fontSize: "0.76rem", color: "var(--muted)",
-      }}>
-        <Icon name="alert" size={14} color="var(--info)" />
-        Review decisions below are recorded for <strong style={{ color: "var(--text)" }}>this browser session only</strong> — the
-        incidents API has no reviewer/verdict write endpoint yet, so nothing here is sent to or persisted by the backend.
-      </div>
+      {!enforced && (
+        <div style={{
+          display: "flex", alignItems: "center", gap: "0.6rem", marginBottom: "1.2rem",
+          padding: "0.7rem 1rem", border: "1px solid var(--border)", borderRadius: 9,
+          background: "rgba(255,180,0,0.07)", fontSize: "0.76rem", color: "var(--muted)",
+        }}>
+          <Icon name="alert" size={14} color="var(--warn)" />
+          Approval enforcement is <strong style={{ color: "var(--text)" }}>disabled</strong> on this
+          deployment (HUMAN_APPROVAL_ENFORCED=false), so runbook steps execute without waiting for a
+          verdict. Verdicts cast here are still persisted and attributed — but they are not gating anything.
+        </div>
+      )}
 
       <div className="aeam-grid-metrics" style={{ marginBottom: "1.4rem" }}>
-        <MetricCard label="In Queue" value={needsReview.length} icon="alert" accent="var(--warn)" sub="need attention" />
-        <MetricCard label="Escalated (total)" value={escalatedCount} icon="shield" sub="requires_human = true" />
-        <MetricCard label="Avg Confidence (pending)" value={avgConfidence != null ? `${Math.round(avgConfidence * (avgConfidence <= 1 ? 100 : 1))}%` : "—"} icon="check" accent="var(--info)" />
-        <MetricCard label="Reviewed This Session" value={historyEntries.length} icon="target" accent="var(--ok)" sub="not persisted" />
+        <MetricCard label="Awaiting Approval" value={queue.length} icon="alert" accent="var(--warn)" sub="gated incidents" />
+        <MetricCard label="Actions Withheld" value={withheldCount} icon="shield" accent="var(--err)" sub="will run on approval" />
+        <MetricCard label="Multi-Tier Chains" value={multiTierCount} icon="target" sub="need every tier, in order" />
+        <MetricCard label="Escalated (total)" value={escalatedCount} icon="activity" accent="var(--info)" sub="requires_human = true" />
       </div>
 
       <div style={{ marginBottom: "1.4rem" }}>
-        <Panel title="Review Queue" icon="shield" pad={needsReview.length === 0}>
-          {needsReview.length === 0 ? (
-            <EmptyState icon="shield" title="No incidents currently need review"
-              description="Escalated incidents (requires_human = true) will appear here." />
+        <Panel title="Review Queue" icon="shield" pad={queue.length === 0}>
+          {queue.length === 0 ? (
+            <EmptyState icon="shield" title="Nothing is waiting on a human"
+              description="Incidents appear here only when their execution plan required approval and runbook steps were actually withheld." />
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: "0.9rem", padding: "1.1rem" }}>
-              {needsReview.map((inc) => (
-                <ReviewCard key={inc.incident_id} incident={inc} onRecord={recordVerdict} />
+              {queue.map((approval) => (
+                <ReviewCard
+                  key={approval.approval_id}
+                  approval={approval}
+                  incident={incidentsById[approval.incident_id]}
+                  onSubmit={castVerdict}
+                />
               ))}
             </div>
           )}
         </Panel>
       </div>
 
-      <Panel title="Review History (this session)" icon="clock">
-        <ReviewHistory entries={historyEntries} />
+      <Panel title="Verdict History" icon="clock">
+        <ReviewHistory entries={verdicts} />
       </Panel>
     </PageContainer>
   );

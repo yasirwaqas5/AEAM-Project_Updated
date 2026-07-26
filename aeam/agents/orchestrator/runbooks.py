@@ -12,10 +12,28 @@ Each runbook maps an ``event_type`` to:
   snapshot, local monitoring flag, email report). No runbook may reference a
   destructive or irreversible action.
 
-This module contains no execution logic — the Orchestrator is still the only
-component that calls ActionAgent.execute(). This is a pure lookup table plus
-one selection function, matching the existing table-driven style already used
-elsewhere in the codebase (see rag_agent.py's ``_EVENT_TYPE_NL``).
+Phase E9 (Human-in-the-Loop Enforcement) adds one more classification to the
+same table-driven style: which ``action_plan`` steps are **gated** when an
+incident's execution plan requires human approval. Every step is safe and
+reversible — that is the catalog's entry condition and has not changed — but
+"safe" is not the same as "an operator is content for it to happen without
+being asked". The split is stated once here, in :data:`NEVER_GATED_STEPS`,
+so the Orchestrator and the review API cannot disagree about it:
+
+- **Never gated** — Slack, Jira, marketing Slack, email. These *inform*
+  humans; withholding them until a human approves would withhold the very
+  notification that tells someone an approval is waiting. Informing is never
+  gated.
+- **Gated** — everything else in an ``action_plan`` (diagnostics snapshots,
+  monitoring flags, webhooks, spreadsheet writes): they change system or
+  third-party state, and Phase E9 holds them until the incident's approval
+  chain is satisfied.
+
+This module still contains no execution logic — the Orchestrator (and, for
+approved-and-released steps, the review service) remain the only callers of
+ActionAgent.execute(). This is a pure lookup table plus selection functions,
+matching the existing table-driven style already used elsewhere in the
+codebase (see rag_agent.py's ``_EVENT_TYPE_NL``).
 """
 
 from __future__ import annotations
@@ -138,6 +156,40 @@ _DEFAULT_RUNBOOK: Runbook = {
 _ACTION_STEP_ALIASES: dict[str, tuple[str, dict]] = {
     "marketing_slack": ("slack", {"channel": "#marketing-alerts"}),
 }
+
+
+# Phase E9: runbook steps that are NEVER withheld pending human approval.
+# These notify humans (Slack/Jira/marketing Slack/email report) — gating a
+# notification would suppress the message that tells a reviewer an approval
+# is waiting, which is the opposite of human-in-the-loop. Every other step
+# in an action_plan is gated when the incident requires approval.
+NEVER_GATED_STEPS: frozenset[str] = frozenset({
+    "jira", "slack", "marketing_slack", "email",
+})
+
+
+def is_gated_step(step: str) -> bool:
+    """
+    Return ``True`` if ``step`` must wait for human approval when the
+    incident's execution plan requires it (Phase E9).
+
+    Unknown/new steps default to gated — the conservative direction: a step
+    nobody has classified is held for a human rather than executed on the
+    assumption it is harmless.
+
+    Args:
+        step: A runbook ``action_plan`` entry (e.g. ``"diagnostics"``).
+
+    Returns:
+        ``True`` if the step is subject to approval gating, ``False`` for
+        the notification steps in :data:`NEVER_GATED_STEPS`.
+
+    Example::
+
+        is_gated_step("slack")        # False — informing is never gated
+        is_gated_step("diagnostics")  # True
+    """
+    return step not in NEVER_GATED_STEPS
 
 
 def resolve_action_step(step: str) -> tuple[str, dict]:

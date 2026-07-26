@@ -39,6 +39,8 @@ from aeam.registry.repositories import (
     SchemaRepository,
     VersionRepository,
     PolicyRepository,
+    IncidentApprovalRepository,
+    ReviewVerdictRepository,
 )
 from aeam.ingestion.worker import IngestionWorker
 from aeam.ingestion.processor import DocumentIngestJobProcessor
@@ -66,6 +68,7 @@ from aeam.intelligence.policy_registry import PolicyRegistry
 from aeam.intelligence.cross_dataset_analyzer import CrossDatasetAnalyzer
 from aeam.intelligence.adaptive_detection import AdaptiveDetectionEngine
 from aeam.intelligence.execution_planning import ExecutionPlanningEngine
+from aeam.governance.human_review import HumanReviewService
 from aeam.intelligence.explainability import ExplainabilityEngine
 from aeam.intelligence.ai_evaluation import AIEvaluationEngine
 from aeam.agents.rag.hybrid_retrieval import BM25Index, HybridRetrievalPipeline
@@ -122,6 +125,7 @@ from aeam.api.knowledge import router as knowledge_router
 from aeam.api.data_center import router as data_center_router
 from aeam.api.observability import router as observability_router
 from aeam.api.administration import router as administration_router
+from aeam.api.review import router as review_router
 
 # ---------------------------------------------------------------------------
 # Logging bootstrap
@@ -896,6 +900,28 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         approval_required_quality_levels=_approval_quality_levels,
     )
 
+    # --- Human-in-the-Loop Enforcement (Phase E9, AGENT-5) ---
+    # The single service both the Orchestrator (which records what it
+    # withheld) and the review API (which releases it) use, so the two can
+    # never disagree about what "approved" means. It reuses the EXACT SAME
+    # action_agent instance the Orchestrator holds — an approved action runs
+    # through the unchanged ActionAgent, not a second executor — and the
+    # existing repository pattern over container.db. Always constructed:
+    # whether the gate actually withholds anything is decided by
+    # settings.HUMAN_APPROVAL_ENFORCED, read live via the service's
+    # `enforced` property, not by whether this object exists.
+    human_review_service = HumanReviewService(
+        approval_repo=IncidentApprovalRepository(container.db),
+        verdict_repo=ReviewVerdictRepository(container.db),
+        settings=settings,
+        action_agent=action_agent,
+    )
+    container.human_review_service = human_review_service
+    logger.info(
+        "Human review service | enforced=%s | default_chain=%s",
+        human_review_service.enforced, settings.APPROVAL_TIER_CHAIN,
+    )
+
     # --- Enterprise Explainability Engine (Phase D1) ---
     # Zero external dependencies -- pure synthesis over findings AND the
     # execution plan ExecutionPlanningEngine already produced. No new
@@ -935,6 +961,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         execution_planning_engine=execution_planning_engine,
         explainability_engine=explainability_engine,
         ai_evaluation_engine=ai_evaluation_engine,
+        human_review_service=human_review_service,
     )
 
     # Register wildcard handler
@@ -1279,6 +1306,7 @@ def create_app() -> FastAPI:
     application.include_router(data_center_router)
     application.include_router(observability_router)
     application.include_router(administration_router)
+    application.include_router(review_router)
 
     _register_routes(application)
     return application

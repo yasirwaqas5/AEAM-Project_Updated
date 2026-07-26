@@ -40,7 +40,7 @@ from aeam.agents.orchestrator.evaluation_engine import EvaluationEngine
 from aeam.agents.orchestrator.incident_context import IncidentContext
 from aeam.agents.orchestrator.investigation_status import derive_investigation_status
 from aeam.agents.orchestrator.notifications import format_jira_description, format_slack_message
-from aeam.agents.orchestrator.runbooks import get_runbook, resolve_action_step
+from aeam.agents.orchestrator.runbooks import get_runbook, is_gated_step, resolve_action_step
 from aeam.agents.orchestrator.state_machine import IncidentState, IncidentStateMachine
 from aeam.agents.rag.cause_quality import best_meaningful_cause
 from aeam.agents.rag.rag_agent import RAGAgent, parse_llm_json
@@ -149,6 +149,7 @@ class Orchestrator:
         execution_planning_engine: Any | None = None,  # Phase C7 — Enterprise Action Planning Engine
         explainability_engine: Any | None = None,  # Phase D1 — Enterprise Explainability Engine
         ai_evaluation_engine: Any | None = None,  # Phase D2 — Enterprise AI Evaluation & Quality Engine
+        human_review_service: Any | None = None,  # Phase E9 — Human-in-the-Loop Enforcement
         short_term_memory: ShortTermMemory | None = None,   # DEPRECATED (Phase E2) — see class docstring
         state_machine: IncidentStateMachine | None = None,  # DEPRECATED (Phase E2) — see class docstring
     ) -> None:
@@ -167,6 +168,10 @@ class Orchestrator:
         self._execution_planner = execution_planning_engine  # Phase C7
         self._explainability_engine = explainability_engine  # Phase D1
         self._ai_evaluator = ai_evaluation_engine  # Phase D2
+        # Phase E9: when wired AND enforcing, gated runbook steps are
+        # recorded as pending instead of executed. None (or a service with
+        # enforcement off) leaves finalization byte-identical to pre-E9.
+        self._human_review = human_review_service  # Phase E9
 
         # Phase E2, ARCH-8: no per-incident instance attributes. STM,
         # FSM, active event, and investigation_started_at all live on the
@@ -731,10 +736,15 @@ class Orchestrator:
            completeness -- appended as its own advisory findings entry.
            Never changes findings, the execution plan, or explainability;
            only evaluates them.
-        6. Execute the runbook's action plan via ActionAgent. Only actions
-           that actually return ``SUCCESS`` are recorded as executed; every
-           skipped or failed action is recorded with its reason — this
-           method never claims an action ran unless ActionAgent confirmed it.
+        6. Execute the runbook's action plan via ActionAgent — SUBJECT TO
+           the human-approval gate (Phase E9). When the execution plan set
+           ``human_approval_required`` and enforcement is on, gated steps
+           are recorded as pending instead of executed and released later
+           by an authorized approval; notification steps are never gated.
+           Only actions that actually return ``SUCCESS`` are recorded as
+           executed; every withheld, skipped, or failed action is recorded
+           with its reason — this method never claims an action ran unless
+           ActionAgent confirmed it.
         7. Send Slack/Jira notifications built from explicit named fields
            (see :mod:`~aeam.agents.orchestrator.notifications`) — never a
            raw JSON dump of findings or the LLM response.
@@ -951,6 +961,19 @@ class Orchestrator:
                 len(ai_evaluation_result.get("weaknesses", [])), incident_id,
             )
 
+        # --- Human-in-the-Loop gate (Phase E9, AGENT-5) ---
+        # C7's human_approval_required has been computed since Phase C7 and
+        # enforced by nothing. Here it becomes a real gate: when the plan
+        # requires approval AND a HumanReviewService is wired AND enforcement
+        # is on, gated runbook steps are RECORDED as pending instead of
+        # executed, and only an authorized approval through the review API
+        # releases them. All three conditions must hold — an unwired service
+        # or HUMAN_APPROVAL_ENFORCED=false leaves this method behaving
+        # exactly as it did before E9 (COMPAT-1), which is the documented
+        # rollback posture.
+        gate = self._resolve_approval_gate(ctx, event_data)
+        pending_actions: list[dict[str, Any]] = []
+
         # --- Execute the safe runbook action plan. ---
         executed_actions: list[str] = []
         skipped_actions: list[dict[str, str]] = []
@@ -1029,6 +1052,25 @@ class Orchestrator:
                     "window_minutes": 120,
                     "reason": f"Elevated monitoring after {event_severity} incident.",
                 })
+
+            # Phase E9: withhold, don't execute. The fully-built params are
+            # recorded verbatim so an approval later runs exactly this call —
+            # never a re-derived or re-planned one.
+            if gate["active"] and is_gated_step(step):
+                pending_actions.append({"step": step, "params": params})
+                skipped_actions.append({
+                    "action": step,
+                    "reason": (
+                        f"Withheld pending human approval "
+                        f"({' → '.join(gate['required_tiers'])})."
+                    ),
+                })
+                logger.info(
+                    "finalize_incident | action %s WITHHELD pending approval | "
+                    "incident_id=%s", step, incident_id,
+                )
+                continue
+
             _run_step(step, params)
 
         # Notification steps — built from explicit named fields only.
@@ -1092,6 +1134,34 @@ class Orchestrator:
             "body": report.get("detailed_report", ""),
         })
 
+        # --- Human-approval findings entry (Phase E9). Appended only when
+        # the gate actually held something back, so an incident with no
+        # approval requirement carries no such entry and renders exactly as
+        # before (COMPAT-1). Stored inside the existing "findings" JSON
+        # column, like every other engine's entry — no schema change here;
+        # the durable approval record itself lands in incident_approvals
+        # once the incident row exists (below).
+        if gate["active"]:
+            ctx.stm.append("findings", {
+                "type": "human_approval",
+                "data": {
+                    "approval_id": gate["approval_id"],
+                    "required": True,
+                    "enforced": True,
+                    "status": "pending",
+                    "required_tiers": list(gate["required_tiers"]),
+                    "current_tier": 0,
+                    "chain_source": gate["chain_source"],
+                    "pending_actions": [entry["step"] for entry in pending_actions],
+                    "gate_reason": gate["reason"],
+                },
+            })
+            logger.info(
+                "finalize_incident | human approval gate ACTIVE | tiers=%s | "
+                "withheld=%d | incident_id=%s",
+                gate["required_tiers"], len(pending_actions), incident_id,
+            )
+
         # --- Consolidated audit summary: the single source of truth the
         # frontend reads instead of reconstructing state from scattered
         # findings entries. Stored inside the existing "findings" JSON
@@ -1137,11 +1207,41 @@ class Orchestrator:
             "llm_response":        ctx.stm.get("llm_response", ""),
         }
 
+        db_incident_id: str | None = None
         try:
             db_incident_id = self._ltm.record_incident(payload)
             logger.info("finalize_incident | persisted | incident_id=%s", db_incident_id)
         except Exception as exc:  # noqa: BLE001
             logger.error("finalize_incident | LTM persist failed: %s", exc)
+
+        # --- Persist the approval requirement (Phase E9). Written AFTER the
+        # incident row so it is keyed by the incident_id the review queue and
+        # the console actually address (the incidents table generates its own
+        # primary key on insert — it is not the Orchestrator's per-
+        # investigation id, which is recorded alongside for traceability).
+        # A failure here must never block finalization, exactly like the LTM
+        # and Enterprise Memory writes around it — but it IS loud: the gate
+        # already withheld the actions, so an unrecorded approval means those
+        # actions are unreleasable until an operator intervenes.
+        if gate["active"]:
+            try:
+                self._human_review.record_pending_approval(
+                    approval_id=gate["approval_id"],
+                    incident_id=db_incident_id or incident_id,
+                    investigation_id=incident_id,
+                    event_type=event_data.get("event_type"),
+                    metric=event_data.get("metric"),
+                    severity=event_data.get("severity"),
+                    required_tiers=list(gate["required_tiers"]),
+                    pending_actions=pending_actions,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "finalize_incident | approval record FAILED — %d gated action(s) "
+                    "are withheld with no approval record to release them | "
+                    "incident_id=%s | error=%s",
+                    len(pending_actions), db_incident_id or incident_id, exc,
+                )
 
         # --- Enterprise Memory (Phase C1): turn this resolved incident into
         # reusable organizational knowledge for future investigations. Every
@@ -1196,6 +1296,99 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _resolve_approval_gate(
+        self, ctx: IncidentContext, event_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Decide whether this incident's gated runbook steps must wait for a
+        human (Phase E9, AGENT-5).
+
+        The gate is active only when ALL of the following hold:
+
+        1. A :class:`~aeam.governance.human_review.HumanReviewService` is
+           wired (a platform built without one has no gate to enforce).
+        2. That service reports ``enforced`` — i.e.
+           ``HUMAN_APPROVAL_ENFORCED`` is on. Off is the documented rollback
+           posture and reproduces pre-E9 behaviour exactly.
+        3. The Enterprise Action Planning Engine's own execution plan set
+           ``human_approval_required=True``. This method never re-derives
+           that judgement — it reads C7's already-computed flag from the
+           findings entry, exactly as the explainability and evaluation
+           stages read the plan they explain and score.
+
+        Args:
+            ctx:        The live incident context (findings are read from
+                        its STM; nothing is written).
+            event_data: The incident's event fields (severity drives the
+                        configured chain override, if any).
+
+        Returns:
+            ``{"active", "required_tiers", "approval_id", "chain_source",
+            "reason"}``. ``active`` is ``False`` for every incident that is
+            not gated, in which case the other fields carry the honest
+            reason why.
+        """
+        findings = ctx.stm.get("findings", []) or []
+
+        execution_plan: dict[str, Any] = {}
+        for entry in findings:
+            if isinstance(entry, dict) and entry.get("type") == "execution_plan":
+                execution_plan = entry.get("data") or {}
+
+        inactive = {
+            "active": False,
+            "required_tiers": [],
+            "approval_id": None,
+            "chain_source": None,
+        }
+
+        if self._human_review is None:
+            return {**inactive, "reason": "No human review service is wired."}
+        if not self._human_review.enforced:
+            return {
+                **inactive,
+                "reason": "Approval enforcement is disabled (HUMAN_APPROVAL_ENFORCED=false).",
+            }
+        if execution_plan.get("human_approval_required") is not True:
+            return {
+                **inactive,
+                "reason": "The execution plan did not require human approval.",
+            }
+
+        try:
+            required_tiers = self._human_review.resolve_chain(
+                event_data.get("severity"), findings,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # A chain-resolution failure must never quietly release the
+            # gate — fall back to the strictest coherent posture (one
+            # approval still required) rather than executing ungated.
+            logger.error(
+                "finalize_incident | approval chain resolution failed, "
+                "falling back to a single-tier chain: %s", exc,
+            )
+            required_tiers = ["reviewer"]
+
+        return {
+            "active": True,
+            "required_tiers": required_tiers,
+            "approval_id": str(uuid.uuid4()),
+            "chain_source": (
+                "policy" if any(
+                    isinstance(e, dict) and e.get("type") == "policy"
+                    and any(
+                        isinstance(m, dict) and m.get("approval_required") and m.get("role")
+                        for m in ((e.get("data") or {}).get("matches") or [])
+                    )
+                    for e in findings
+                ) else "configuration"
+            ),
+            "reason": (
+                "The execution plan requires human approval; gated runbook "
+                "steps are withheld until the chain is satisfied."
+            ),
+        }
 
     def _escalation_reason(self, ctx: IncidentContext, investigation_status: str) -> str | None:
         """

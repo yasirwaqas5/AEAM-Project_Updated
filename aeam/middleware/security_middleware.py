@@ -64,6 +64,18 @@ _ENDPOINT_RBAC_MAP: list[tuple[str, str, str]] = [
     ("/api/v1/actions/approve",   "actions",   "approve"),
     ("/api/v1/actions",           "actions",   "execute"),
 
+    # --- Human Review (Phase E9, SEC-3 / SEC-7). Casting a verdict RELEASES
+    # withheld action execution, so it is guarded by the strictest action
+    # grant — actions:approve — exactly like /actions/approve above. The two
+    # read-only surfaces (queue depth and verdict history) are incident
+    # reading, so they map to incidents:view and stay reachable by the
+    # auditor/analyst roles that must be able to see governance state
+    # without being able to release anything. Both read prefixes are longer
+    # and therefore precede the broader /api/v1/review entry.
+    ("/api/v1/review/queue",      "incidents", "view"),
+    ("/api/v1/review/verdicts",   "incidents", "view"),
+    ("/api/v1/review",            "actions",   "approve"),
+
     # --- Incidents (resolve is stricter than view).
     ("/api/v1/incidents/resolve", "incidents", "resolve"),
     ("/api/v1/incidents",         "incidents", "view"),
@@ -254,6 +266,14 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             # Step 4: extract user_id and roles.
             user_id = str(payload.get("sub", "unknown"))
             roles: list[str] = self._extract_roles(payload)
+
+            # Phase E9: publish the verified principal on request.state so
+            # route handlers can ATTRIBUTE an action to it (the Human Review
+            # verdict endpoints record who approved what). This is
+            # attribution only — authorisation still happens here, in step 5;
+            # no handler re-checks permissions from these values.
+            request.state.user_id = user_id
+            request.state.roles = roles
 
             logger.info(
                 "SecurityMiddleware | authenticated | user_id=%s | roles=%s | "

@@ -239,6 +239,29 @@ spec:
             # - name: LLM_COST_PER_1K_COMPLETION_TOKENS_USD
             #   value: "0.08"
 
+            # ---------- Phase E9 (AGENT-5) — human-in-the-loop ----------
+            # C7's human_approval_required is ENFORCED here, not advisory:
+            # an incident that requires approval has its gated runbook steps
+            # withheld until an authorized reviewer approves through
+            # /api/v1/review. Slack/Jira/email always dispatch regardless —
+            # informing humans is never gated. Setting this to "false" is
+            # the documented rollback to pre-E9 advisory behaviour and
+            # should be a deliberate, recorded decision.
+            - name: HUMAN_APPROVAL_ENFORCED
+              value: "true"
+
+            # Default ordered chain. One tier = today's single-step
+            # approval. Set several (or use the per-severity overrides
+            # below) to require analyst → manager → risk in order.
+            - name: APPROVAL_TIER_CHAIN
+              value: "reviewer"
+
+            # Per-severity chains — uncomment to require more signatures on
+            # the incidents that warrant them. A matched policy naming
+            # responsible roles takes precedence over this.
+            # - name: APPROVAL_TIER_CHAIN_OVERRIDES
+            #   value: "CRITICAL:analyst,manager,risk;HIGH:analyst,manager"
+
           # Liveness probe — restart container if /health fails.
           livenessProbe:
             httpGet:

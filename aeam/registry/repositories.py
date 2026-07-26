@@ -23,13 +23,16 @@ from aeam.registry.models import (
     AssetStatus,
     Dataset,
     Document,
+    IncidentApproval,
     IngestionJob,
     JobStatus,
     ParentType,
     Policy,
+    ReviewVerdict,
     Schema,
     Source,
     SourceStatus,
+    Verdict,
     Version,
     _now_iso,
 )
@@ -270,3 +273,170 @@ class PolicyRepository(BaseRepository):
 
     def list_by_document(self, doc_id: str) -> list[Policy]:
         return self._query("doc_id = :doc_id", {"doc_id": doc_id})
+
+
+# ---------------------------------------------------------------------------
+# Phase E9 — Human-in-the-Loop Enforcement
+# ---------------------------------------------------------------------------
+
+class IncidentApprovalRepository(BaseRepository):
+    """
+    Persistence for the approval requirement attached to ONE incident.
+
+    Same thin-CRUD contract as every repository above: no workflow logic
+    lives here (that is :class:`~aeam.governance.human_review.HumanReviewService`),
+    only queries the review API and the Orchestrator need.
+    """
+    table, pk, model_cls = "incident_approvals", "approval_id", IncidentApproval
+
+    def get_by_incident(self, incident_id: str) -> IncidentApproval | None:
+        """
+        The approval record for ``incident_id``, or ``None`` when the
+        incident never required approval (including every incident that
+        predates Phase E9 — absence means "no gate", never "denied").
+        """
+        rows = self._db.fetch_all(
+            "SELECT * FROM incident_approvals WHERE incident_id = :iid "
+            "ORDER BY created_at ASC",
+            {"iid": incident_id},
+        )
+        return self.model_cls.from_row(rows[0]) if rows else None
+
+    def list_by_status(
+        self, status: str, limit: int | None = None, offset: int = 0,
+    ) -> list[IncidentApproval]:
+        """Approvals in ``status``, oldest first (the review queue's order)."""
+        query = (
+            "SELECT * FROM incident_approvals WHERE status = :s "
+            "ORDER BY created_at ASC"
+        )
+        params: dict[str, Any] = {"s": status}
+        if limit is not None:
+            query += " LIMIT :limit OFFSET :offset"
+            params["limit"] = limit
+            params["offset"] = max(0, int(offset))
+        return [self.model_cls.from_row(r) for r in self._db.fetch_all(query, params)]
+
+    def count_by_status(self, status: str) -> int:
+        row = self._db.fetch_one(
+            "SELECT COUNT(*) AS n FROM incident_approvals WHERE status = :s",
+            {"s": status},
+        )
+        return int(row["n"]) if row and row.get("n") is not None else 0
+
+    def save_progress(
+        self,
+        approval_id: str,
+        *,
+        status: str | None = None,
+        current_tier: int | None = None,
+        executed_actions: list[str] | None = None,
+        skipped_actions: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """
+        Partial update of the mutable columns, always refreshing
+        ``updated_at`` (mirrors :meth:`IngestionJobRepository.update_progress`).
+
+        ``pending_actions`` is deliberately NOT updatable: it records what
+        was withheld at finalization, and rewriting it would destroy the
+        guarantee that an approval executes exactly those steps.
+        """
+        fields: dict[str, Any] = {"updated_at": _now_iso()}
+        if status is not None:
+            fields["status"] = status
+        if current_tier is not None:
+            fields["current_tier"] = current_tier
+        if executed_actions is not None:
+            fields["executed_actions"] = executed_actions
+        if skipped_actions is not None:
+            fields["skipped_actions"] = skipped_actions
+        self.update(approval_id, fields)
+
+
+class ReviewVerdictRepository(BaseRepository):
+    """Append-only persistence for human review verdicts (Phase E9)."""
+    table, pk, model_cls = "review_verdicts", "verdict_id", ReviewVerdict
+
+    def list_for_approval(self, approval_id: str) -> list[ReviewVerdict]:
+        """Every verdict cast against ``approval_id``, in chain order."""
+        rows = self._db.fetch_all(
+            "SELECT * FROM review_verdicts WHERE approval_id = :aid "
+            "ORDER BY tier ASC, created_at ASC",
+            {"aid": approval_id},
+        )
+        return [self.model_cls.from_row(r) for r in rows]
+
+    def list_for_incident(self, incident_id: str) -> list[ReviewVerdict]:
+        rows = self._db.fetch_all(
+            "SELECT * FROM review_verdicts WHERE incident_id = :iid "
+            "ORDER BY tier ASC, created_at ASC",
+            {"iid": incident_id},
+        )
+        return [self.model_cls.from_row(r) for r in rows]
+
+    def get_for_tier(self, approval_id: str, tier: int) -> ReviewVerdict | None:
+        """
+        The chain-advancing/halting verdict already recorded at ``tier``,
+        if any. ``changes_requested`` / ``escalated`` verdicts are ignored
+        here: they leave the tier open, so a later approval at the same
+        tier is legitimate, not a duplicate.
+        """
+        rows = self._db.fetch_all(
+            "SELECT * FROM review_verdicts WHERE approval_id = :aid AND tier = :t "
+            "ORDER BY created_at ASC",
+            {"aid": approval_id, "t": int(tier)},
+        )
+        for row in rows:
+            model = self.model_cls.from_row(row)
+            if model.verdict in Verdict.ADVANCING or model.verdict in Verdict.HALTING:
+                return model
+        return None
+
+    def find_advancing_by_reviewer(
+        self, approval_id: str, reviewer_id: str,
+    ) -> ReviewVerdict | None:
+        """
+        An approval this principal has ALREADY cast against this chain.
+
+        Two purposes, one query: it makes a repeated approve request
+        idempotent (the second call finds the first and changes nothing),
+        and it stops one principal from satisfying several tiers of a
+        chain that exists precisely to require several people.
+        """
+        rows = self._db.fetch_all(
+            "SELECT * FROM review_verdicts WHERE approval_id = :aid "
+            "AND reviewer_id = :rid ORDER BY created_at ASC",
+            {"aid": approval_id, "rid": reviewer_id},
+        )
+        for row in rows:
+            model = self.model_cls.from_row(row)
+            if model.verdict in Verdict.ADVANCING:
+                return model
+        return None
+
+    def list_recent(
+        self, limit: int | None = None, offset: int = 0,
+        incident_id: str | None = None,
+    ) -> list[ReviewVerdict]:
+        """Verdict history, newest first (what the review workspace shows)."""
+        query = "SELECT * FROM review_verdicts"
+        params: dict[str, Any] = {}
+        if incident_id:
+            query += " WHERE incident_id = :iid"
+            params["iid"] = incident_id
+        query += " ORDER BY created_at DESC"
+        if limit is not None:
+            query += " LIMIT :limit OFFSET :offset"
+            params["limit"] = limit
+            params["offset"] = max(0, int(offset))
+        return [self.model_cls.from_row(r) for r in self._db.fetch_all(query, params)]
+
+    def count_all(self, incident_id: str | None = None) -> int:
+        if incident_id:
+            row = self._db.fetch_one(
+                "SELECT COUNT(*) AS n FROM review_verdicts WHERE incident_id = :iid",
+                {"iid": incident_id},
+            )
+        else:
+            row = self._db.fetch_one("SELECT COUNT(*) AS n FROM review_verdicts")
+        return int(row["n"]) if row and row.get("n") is not None else 0
