@@ -107,6 +107,23 @@ spec:
             - name: MAX_INVESTIGATION_DEPTH
               value: "5"
 
+            # ---------- Phase E7 (SEC-8, PHIL-1) — autonomous operations ----------
+            # The sole, honest gate for the autonomous MonitorAgent polling
+            # loop — no environment backdoor exists in the application code
+            # any more, so this value is the ONLY thing deciding whether
+            # production actually runs the "24/7 autonomous platform" this
+            # product claims to be (audit gate #4). Flip to "false" only for
+            # a deliberately trigger-only deployment.
+            - name: ENABLE_MONITOR_AGENT
+              value: "true"
+
+            # Heartbeat staleness threshold — several multiples of
+            # MONITOR_INTERVAL_SECONDS above so a normal sleep between
+            # cycles is never mistaken for a dead thread (see Settings
+            # docstring). 900s = 3x the 300s interval above.
+            - name: HEARTBEAT_STALE_SECONDS
+              value: "900"
+
             # ---------- Phase E3 (SEC-1..7, ARCH-7) — identity & audit ----------
             # SEC-4 fail-closed: startup aborts if these are unset in a
             # non-development environment.
@@ -193,6 +210,34 @@ spec:
                 and do NOT survive recycle on Cloud Run. For durable
                 production changes, edit deploy/cloudrun.yaml and
                 redeploy.
+
+            # ---------- Phase E8 (AI-1..AI-7) — AI governance ----------
+            # 'groq' is the only implemented provider (see
+            # docs/ai_governance.md). Since LLM_ENABLED is "false" above,
+            # this has no runtime effect yet — declared explicitly so
+            # turning LLM_ENABLED on later does not silently fall back to
+            # the unimplemented pre-E8 default ("gemini").
+            - name: LLM_PROVIDER
+              value: "groq"
+
+            # Explicit even though it matches the Settings default (true) —
+            # documents the deliberate choice: a real key + LLM_ENABLED=true
+            # + USE_MOCK_LLM=false are all THREE required together before
+            # this deployment would ever call a real model (LLMService's
+            # provider-truth check aborts startup otherwise).
+            - name: USE_MOCK_LLM
+              value: "true"
+
+            - name: LLM_TIMEOUT_SECONDS
+              value: "30"
+
+            # Cost rates: left at the honest zero default. An operator
+            # who wants llm_cost_usd_total to reflect a real number sets
+            # these to their negotiated per-1k-token price.
+            # - name: LLM_COST_PER_1K_PROMPT_TOKENS_USD
+            #   value: "0.05"
+            # - name: LLM_COST_PER_1K_COMPLETION_TOKENS_USD
+            #   value: "0.08"
 
           # Liveness probe — restart container if /health fails.
           livenessProbe:

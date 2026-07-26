@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from typing import Any
 
 from aeam.monitoring.logging_config import get_logger
@@ -106,6 +107,9 @@ class BM25Index:
         self._idf: dict[str, float] = {}                # cached idf per term
         self._avgdl: float = 0.0
         self._built: bool = False
+        # Phase E7 (RAG-6): wall-clock time of the last successful build,
+        # for staleness disclosure. None until the first build() call.
+        self._built_at: float | None = None
 
     # ------------------------------------------------------------------
     # Build
@@ -155,10 +159,55 @@ class BM25Index:
             self._idf[term] = math.log(1.0 + (n - df + 0.5) / (df + 0.5))
 
         self._built = True
+        self._built_at = time.time()
         logger.info(
             "BM25Index.build | docs=%d | vocab=%d | avgdl=%.1f",
             n, len(self._df), self._avgdl,
         )
+
+    @staticmethod
+    def _scroll_qdrant_documents(
+        qdrant_client: Any,
+        collection: str,
+        batch_size: int,
+    ) -> list[dict[str, Any]]:
+        """
+        Scroll every point in a Qdrant collection into ``build()``-ready
+        document dicts. Shared by :meth:`from_qdrant` and
+        :meth:`refresh_from_qdrant` (Phase E7) so the scroll/payload-mapping
+        logic exists exactly once. Never raises — returns whatever was
+        collected before a failure, so a partial/empty result degrades
+        rather than blocking the caller.
+        """
+        documents: list[dict[str, Any]] = []
+        offset: Any = None
+        try:
+            while True:
+                points, offset = qdrant_client.scroll(
+                    collection_name=collection,
+                    limit=batch_size,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for point in points:
+                    payload: dict[str, Any] = dict(getattr(point, "payload", None) or {})
+                    text = payload.pop("text", "")
+                    chunk_id = payload.pop("chunk_id", str(getattr(point, "id", "")))
+                    documents.append({
+                        "chunk_id": chunk_id,
+                        "text": text,
+                        "metadata": payload,
+                    })
+                if offset is None:
+                    break
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "BM25Index._scroll_qdrant_documents | scroll failed for "
+                "collection=%r: %s | returning %d docs collected so far",
+                collection, exc, len(documents),
+            )
+        return documents
 
     @classmethod
     def from_qdrant(
@@ -187,38 +236,44 @@ class BM25Index:
             A built :class:`BM25Index`.
         """
         index = cls(k1=k1, b=b)
-        documents: list[dict[str, Any]] = []
-        offset: Any = None
-
-        try:
-            while True:
-                points, offset = qdrant_client.scroll(
-                    collection_name=collection,
-                    limit=batch_size,
-                    offset=offset,
-                    with_payload=True,
-                    with_vectors=False,
-                )
-                for point in points:
-                    payload: dict[str, Any] = dict(getattr(point, "payload", None) or {})
-                    text = payload.pop("text", "")
-                    chunk_id = payload.pop("chunk_id", str(getattr(point, "id", "")))
-                    documents.append({
-                        "chunk_id": chunk_id,
-                        "text": text,
-                        "metadata": payload,
-                    })
-                if offset is None:
-                    break
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "BM25Index.from_qdrant | scroll failed for collection=%r: %s "
-                "| building index from %d docs collected so far",
-                collection, exc, len(documents),
-            )
-
+        documents = cls._scroll_qdrant_documents(qdrant_client, collection, batch_size)
         index.build(documents)
         return index
+
+    def refresh_from_qdrant(
+        self,
+        qdrant_client: Any,
+        collection: str,
+        batch_size: int = 256,
+    ) -> None:
+        """
+        Rebuild this index IN PLACE from the current contents of a Qdrant
+        collection (Phase E7, RAG-6).
+
+        Reuses the exact scroll/payload-mapping path :meth:`from_qdrant`
+        uses at startup, so a runtime refresh is byte-identical in behavior
+        to a fresh cold build — the only difference is that this mutates
+        the existing instance rather than returning a new one, so every
+        holder of a reference to this index (e.g. the
+        :class:`HybridRetrievalPipeline` wrapping it) observes the refresh
+        immediately without any wiring change.
+
+        Never raises: a scroll failure degrades to rebuilding from whatever
+        was collected (down to empty), matching :meth:`from_qdrant`'s
+        resilience contract. Intended to be called from the ingestion
+        pipeline's job-completion hook after new content has been indexed.
+
+        Args:
+            qdrant_client: Connected ``QdrantClient``.
+            collection:    Collection name to scroll.
+            batch_size:    Scroll page size.
+        """
+        documents = self._scroll_qdrant_documents(qdrant_client, collection, batch_size)
+        self.build(documents)
+        logger.info(
+            "BM25Index.refresh_from_qdrant | collection=%s | docs=%d",
+            collection, self.size,
+        )
 
     # ------------------------------------------------------------------
     # Search
@@ -282,6 +337,16 @@ class BM25Index:
     def size(self) -> int:
         """Number of indexed documents."""
         return len(self._docs)
+
+    @property
+    def built_at(self) -> float | None:
+        """Unix timestamp of the last successful build, or ``None`` if never built."""
+        return self._built_at
+
+    @property
+    def age_seconds(self) -> float | None:
+        """Seconds since the last build (Phase E7, RAG-6), or ``None`` if never built."""
+        return (time.time() - self._built_at) if self._built_at is not None else None
 
     def __repr__(self) -> str:
         return f"BM25Index(docs={self.size}, k1={self._k1}, b={self._b})"

@@ -25,6 +25,7 @@ from typing import Any
 
 from aeam.agents.rag.rag_agent import parse_llm_json
 from aeam.monitoring.logging_config import get_logger
+from aeam.security.llm_guardrails import sanitize_input, validate_output
 
 logger = get_logger(__name__, agent="rag")
 
@@ -89,7 +90,12 @@ class QueryExpansionAgent:
         if not original_query or not original_query.strip():
             raise ValueError("original_query must be a non-empty string.")
 
-        original = original_query.strip()
+        # Phase E8 (AI-1): sanitize before this text enters a prompt. The
+        # query is normally deterministically formulated from event fields
+        # (RAGAgent._formulate_query), but those fields can carry
+        # attacker-influenced content via ingested dataset/event metadata —
+        # defense-in-depth at this boundary regardless of the caller.
+        original = sanitize_input(original_query.strip())
         queries: list[str] = [original]
 
         if self._query_count <= 1:
@@ -106,6 +112,18 @@ class QueryExpansionAgent:
             logger.warning(
                 "QueryExpansionAgent | LLM call failed (%s) — falling back to "
                 "original query only.", exc,
+            )
+            return queries
+
+        # Phase E8 (AI-1): validate_output before this text is parsed or
+        # ever surfaced (query variants are displayed in the Evidence
+        # panel's Retrieval Summary / query_attempts). A response matching
+        # a sensitive-data pattern degrades exactly like an unparsable one.
+        if not validate_output(raw):
+            logger.warning(
+                "QueryExpansionAgent | LLM output failed validate_output "
+                "(sensitive pattern detected) — falling back to original "
+                "query only."
             )
             return queries
 

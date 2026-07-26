@@ -41,6 +41,20 @@ services:
       ENVIRONMENT: "${ENVIRONMENT:-production}"
       LLM_ENABLED: "${LLM_ENABLED:-false}"
 
+      # E7 (SEC-8/PHIL-1): the sole, honest gate for the autonomous
+      # MonitorAgent polling loop — no environment backdoor. Defaults to
+      # true here so `docker compose up` reproduces the always-on
+      # autonomous behaviour this stack has always demonstrated; set to
+      # false in your .env to run trigger-only. See
+      # docs/autonomous_operations.md for the full posture matrix.
+      ENABLE_MONITOR_AGENT: "${ENABLE_MONITOR_AGENT:-true}"
+
+      # E8: coherent LLM defaults. USE_MOCK_LLM stays true here by
+      # default (safe, free local dev) even though LLM_ENABLED may be
+      # true — flip both explicitly in your .env to exercise real calls.
+      LLM_PROVIDER: "${LLM_PROVIDER:-groq}"
+      USE_MOCK_LLM: "${USE_MOCK_LLM:-true}"
+
       # E3: JWT public key + audit sink. When ENVIRONMENT!=development,
       # JWT_PUBLIC_KEY (or JWT_PUBLIC_KEY_PATH) MUST be set — the
       # container will refuse to start otherwise (SEC-4).

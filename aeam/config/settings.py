@@ -88,7 +88,46 @@ class Settings(BaseSettings):
 
     ENABLE_MONITOR_AGENT: bool = Field(
         default=False,
-        description="Feature flag to enable or disable the MonitorAgent.",
+        description=(
+            "Phase E7 (SEC-8/PHIL-1): sole, authoritative gate for the "
+            "autonomous MonitorAgent polling loop. No environment backdoor "
+            "in either direction -- this flag decides in every environment, "
+            "including 'development' and 'test'. Deployment artifacts "
+            "(docker-compose.yml, deploy/cloudrun.yaml) set this explicitly "
+            "per posture; see docs/autonomous_operations.md for the full "
+            "environment posture matrix."
+        ),
+    )
+
+    # --- Autonomous operations supervision (Phase E7, OBS-3/4) ---
+
+    HEARTBEAT_STALE_SECONDS: int = Field(
+        default=120,
+        ge=1,
+        description=(
+            "Phase E7: a background worker (MonitorAgent, IngestionWorker) "
+            "whose last heartbeat is older than this many seconds is "
+            "reported as 'stale' by GET /health (and the console StatusBar), "
+            "and flips overall health to 'degraded'. IngestionWorker's "
+            "default poll interval (2s) makes a 120s threshold generous "
+            "for it; a deliberately killed thread is still caught within "
+            "one interval either way -- MonitorAgent operators tuning "
+            "MONITOR_INTERVAL_SECONDS above this value should raise it "
+            "accordingly so a normal sleep is never mistaken for a dead "
+            "thread."
+        ),
+    )
+
+    BM25_STALE_SECONDS: int = Field(
+        default=3600,
+        ge=1,
+        description=(
+            "Phase E7 (RAG-6): informational staleness threshold for the "
+            "BM25 lexical index disclosed by GET /health. Does not affect "
+            "overall health status (a stale lexical index degrades "
+            "retrieval quality, not platform availability) -- it is a "
+            "disclosed freshness signal, never a fabricated 'fresh'."
+        ),
     )
 
     RAG_HYBRID_ENABLED: bool = Field(
@@ -306,8 +345,16 @@ class Settings(BaseSettings):
     )
 
     LLM_PROVIDER: str = Field(
-        default="gemini",
-        description="Which LLM backend to use: 'gemini', 'openai', etc.",
+        default="groq",
+        description=(
+            "Phase E8 (AI-1, coherent defaults): which LLM backend to use. "
+            "The default is 'groq' -- the ONLY provider LLMService actually "
+            "implements today. Configuring any other value while "
+            "LLM_ENABLED=true and USE_MOCK_LLM=false aborts startup with an "
+            "explicit message (LLMService's provider-truth check) rather "
+            "than silently promising a vendor the platform cannot reach. "
+            "See docs/ai_governance.md for the provider support statement."
+        ),
     )
 
     LLM_API_KEY: str = Field(
@@ -317,7 +364,54 @@ class Settings(BaseSettings):
 
     USE_MOCK_LLM: bool = Field(
         default=True,
-        description="When True, LLM calls return mock responses for tests/offline use.",
+        description=(
+            "When True, LLM calls return a mock response instead of "
+            "reaching a real provider. Phase E8: the safe default "
+            "everywhere except a deliberately configured production/staging "
+            "posture -- see docs/ai_governance.md's 'Environment posture' "
+            "table for what each environment should set. Every real call "
+            "made when this is False is metered (aeam.monitoring.metrics: "
+            "llm_calls_total{status='mock'} vs status='success'/'failure'), "
+            "so an operator can always tell from /metrics whether AEAM is "
+            "actually calling a real model."
+        ),
+    )
+
+    # --- AI Governance (Phase E8, AI-1..AI-7) ---
+
+    LLM_TIMEOUT_SECONDS: float = Field(
+        default=30.0,
+        gt=0.0,
+        description=(
+            "Phase E8 (AI-3): per-call timeout enforced at the LLM client "
+            "level for every call site (RAGAgent, QueryExpansionAgent, "
+            "PolicyExtractor, DecisionEngine, Orchestrator LLM reasoning, "
+            "ReportAgent) -- they all share one LLMService instance, so one "
+            "setting governs all six. See docs/ai_governance.md's call-site "
+            "register."
+        ),
+    )
+
+    LLM_COST_PER_1K_PROMPT_TOKENS_USD: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "Phase E8 (AI-6): USD price per 1,000 prompt tokens, used to "
+            "compute the llm_cost_usd_total Prometheus counter. Default 0.0 "
+            "means the metric is published with declared, honest semantics "
+            "(OBS-2) but reports zero cost until an operator configures the "
+            "real negotiated rate for their provider account -- never a "
+            "guessed number presented as fact."
+        ),
+    )
+
+    LLM_COST_PER_1K_COMPLETION_TOKENS_USD: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "Phase E8 (AI-6): USD price per 1,000 completion tokens. Same "
+            "honesty contract as LLM_COST_PER_1K_PROMPT_TOKENS_USD."
+        ),
     )
 
     # --- Forecast configuration (Phase 5) ---

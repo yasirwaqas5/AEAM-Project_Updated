@@ -93,6 +93,8 @@ class DocumentIngestJobProcessor:
         policy_extractor: PolicyExtractor | None = None,
         policy_extraction_enabled: bool = True,
         embedding_service: Any | None = None,
+        bm25_index: Any | None = None,
+        qdrant_client: Any | None = None,
     ) -> None:
         if blob_store is None:
             raise ValueError("blob_store must not be None.")
@@ -114,6 +116,14 @@ class DocumentIngestJobProcessor:
         # The SAME shared EmbeddingService already used by the ingestion
         # pipeline is passed here (no second model load).
         self._embedding_service = embedding_service
+        # Phase E7 (RAG-6): when both are provided, a successfully-indexed
+        # document triggers an in-place BM25 rebuild via the SAME
+        # from_qdrant scroll path used at startup — so a document ingested
+        # at runtime becomes lexically retrievable without a restart.
+        # Optional: absent (the pre-E7 default) reproduces pre-E7 behaviour
+        # exactly — the BM25 index only ever refreshes at next startup.
+        self._bm25_index = bm25_index
+        self._qdrant_client = qdrant_client
 
     # ------------------------------------------------------------------
     # JobProcessor protocol
@@ -215,6 +225,27 @@ class DocumentIngestJobProcessor:
             "chunks=%d | detail=%s",
             job.job_id, doc.doc_id, category, chunk_count, extracted.detail,
         )
+
+        # --- BM25 freshness refresh (Phase E7, RAG-6) ---------------------
+        # Runs AFTER indexing has already succeeded, mirroring the policy
+        # extraction step's placement below. A refresh failure is logged and
+        # swallowed — it must never fail an otherwise-successful ingestion
+        # job; the index simply stays at its previous (still usable) state
+        # and GET /health discloses the resulting staleness honestly.
+        if self._bm25_index is not None and self._qdrant_client is not None:
+            try:
+                self._bm25_index.refresh_from_qdrant(
+                    self._qdrant_client, self._pipeline.collection,
+                )
+                job_repo.update_progress(
+                    job.job_id, progress=97,
+                    stage=f"refreshed lexical index ({self._bm25_index.size} docs)",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "DocumentIngestJobProcessor | BM25 refresh failed | "
+                    "doc_id=%s | error=%s", doc.doc_id, exc,
+                )
 
         # --- Policy extraction (Phase C2) --------------------------------
         # Purely additive: runs after indexing has already succeeded, never

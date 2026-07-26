@@ -41,7 +41,7 @@ from aeam.core.deduplication import EventDeduplicator
 from aeam.core.event_bus import EventBus
 from aeam.core.event_models import Event
 from aeam.core.priority_queue import EventPriorityQueue
-from aeam.monitoring.metrics import agent_execution_time, end_timer, start_timer
+from aeam.monitoring.metrics import agent_execution_time, end_timer, heartbeat_tracker, start_timer
 from aeam.pipelines.structured_data_pipeline import StructuredDataPipeline
 
 # Type hint only – actual import will be resolved at runtime
@@ -211,6 +211,13 @@ class MonitorAgent:
             self._settings.MONITOR_INTERVAL_SECONDS,
         )
         while True:
+            # Phase E7 (OBS-3/4): record the heartbeat BEFORE the cycle body,
+            # unconditionally -- it proves the thread itself is alive, which
+            # is a strictly weaker (and more useful for supervision) claim
+            # than "the last cycle succeeded". A cycle-level exception is
+            # still caught and logged below exactly as before; it just no
+            # longer also silently un-proves liveness.
+            heartbeat_tracker.record("monitor")
             try:
                 self._run_cycle()
             except Exception as exc:  # noqa: BLE001

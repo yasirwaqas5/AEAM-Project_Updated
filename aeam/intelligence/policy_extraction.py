@@ -46,6 +46,7 @@ from typing import Any
 
 from aeam.agents.rag.chunking import TextChunker
 from aeam.agents.rag.rag_agent import parse_llm_json
+from aeam.security.llm_guardrails import sanitize_input, validate_output
 from aeam.services.llm_service import LLMService
 
 logger = logging.getLogger(__name__)
@@ -176,12 +177,30 @@ class PolicyExtractor:
         if not text or not text.strip():
             return []
 
-        prompt = _EXTRACTION_PROMPT_TEMPLATE.format(text=text.strip()[:_MAX_PROMPT_CHARS])
+        # Phase E8 (AI-1): this is THE canonical injection surface named by
+        # the roadmap — the full extracted text of an uploaded document,
+        # completely untrusted. sanitize_input runs before truncation so an
+        # injection phrase cannot dodge detection by falling exactly on the
+        # truncation boundary.
+        sanitized_text = sanitize_input(text.strip())
+        prompt = _EXTRACTION_PROMPT_TEMPLATE.format(text=sanitized_text[:_MAX_PROMPT_CHARS])
 
         try:
             raw_response = self._llm.query(prompt, temperature=0.0, max_tokens=1500)
         except Exception as exc:  # noqa: BLE001
             logger.error("PolicyExtractor | LLM call failed: %s", exc)
+            return []
+
+        # Phase E8 (AI-1): validate_output before this text is parsed,
+        # persisted to the policies table, or displayed in the Knowledge
+        # Center UI. A response matching a sensitive-data pattern is
+        # rejected exactly like an unparsable one — never fabricated,
+        # never silently passed through.
+        if not validate_output(raw_response):
+            logger.warning(
+                "PolicyExtractor | LLM output failed validate_output "
+                "(sensitive pattern detected) — rejecting extraction."
+            )
             return []
 
         parsed = parse_llm_json(raw_response)

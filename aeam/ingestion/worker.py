@@ -17,6 +17,7 @@ import logging
 import threading
 from typing import Protocol
 
+from aeam.monitoring.metrics import heartbeat_tracker
 from aeam.registry.models import IngestionJob, JobStatus
 from aeam.registry.repositories import IngestionJobRepository
 
@@ -120,6 +121,11 @@ class IngestionWorker:
         """
         logger.info("IngestionWorker started | poll_interval=%.1fs", self._poll_interval)
         while not self._stop_event.is_set():
+            # Phase E7 (OBS-3/4): heartbeat recorded unconditionally, before
+            # the cycle body — proves the poll thread is alive independent
+            # of whether the last claimed job (if any) succeeded. Same
+            # rationale as MonitorAgent's heartbeat placement.
+            heartbeat_tracker.record("ingestion")
             try:
                 self._run_cycle()
             except Exception as exc:  # noqa: BLE001

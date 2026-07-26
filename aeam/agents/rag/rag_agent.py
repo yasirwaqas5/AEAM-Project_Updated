@@ -34,6 +34,7 @@ from aeam.agents.rag.response_validator import RAGResponseValidator
 from aeam.agents.rag.retrieval_pipeline import RetrievalPipeline
 from aeam.core.event_models import Event
 from aeam.memory.short_term import ShortTermMemory
+from aeam.security.llm_guardrails import sanitize_input, validate_output
 
 logger = get_logger(__name__, agent="rag")
 
@@ -480,6 +481,22 @@ class RAGAgent:
                 query=query, attempt=attempt, strategy=strategy, threshold=threshold,
             )
 
+        # Step 4b (Phase E8, AI-1): validate_output before this text is
+        # parsed, persisted (findings/llm_response), or displayed (Evidence
+        # panel raw-response view). A response matching a sensitive-data
+        # pattern is rejected exactly like any other LLM failure mode —
+        # never silently passed through.
+        if not validate_output(raw_response):
+            logger.warning(
+                "RAGAgent | LLM output failed validate_output (sensitive "
+                "pattern detected) — rejecting | event_id=%s", event.event_id,
+            )
+            return self._error_result(
+                "LLM output failed safety validation (sensitive data pattern detected).",
+                raw_response=raw_response,
+                query=query, attempt=attempt, strategy=strategy, threshold=threshold,
+            )
+
         # Step 5: parse JSON response.
         parsed: dict[str, Any] | None = parse_llm_json(raw_response)
         if parsed is None:
@@ -692,7 +709,13 @@ class RAGAgent:
 
         for i, chunk in enumerate(chunks, start=1):
             chunk_id = chunk.get("chunk_id", f"unknown_{i}")
-            text = chunk.get("text", "").strip()
+            # Phase E8 (AI-1): retrieved chunk text originates from
+            # ingested documents — untrusted content that reaches this
+            # prompt verbatim otherwise. sanitize_input strips known
+            # injection patterns ("ignore previous instructions", etc.)
+            # before the text is embedded, at the exact boundary where
+            # untrusted content enters the prompt.
+            text = sanitize_input(chunk.get("text", "").strip())
             similarity = chunk.get("similarity", 0.0)
             source = chunk.get("metadata", {}).get("source", "unknown")
 

@@ -7,8 +7,15 @@ import { useToast } from "./ToastHost";
  * shares the result with the TopBar (system pill) and StatusBar (dependency
  * chips) — one poll, two consumers, no duplication.
  *
- *   /health                 → { status, checks:{ database, redis, queue } }
+ *   /health                 → { status, checks:{ database, redis, queue,
+ *                                monitor_agent, ingestion_worker, bm25_index } }
  *   /api/v1/system/status   → { status, active_incidents, agents_active, ... }
+ *
+ * Phase E7: monitor_agent / ingestion_worker are real heartbeat-backed
+ * supervision (OBS-3/4) — a "stale" value means the worker's thread has
+ * stopped updating its heartbeat (dead or wedged), surfaced as "degraded".
+ * bm25_index is informational lexical-index freshness (RAG-6); it never
+ * flips overall health.
  *
  * NOTE: Qdrant and LLM are intentionally reported as "unknown". No proxied
  * endpoint exposes their health today; the shell shows honest "n/a" chips
@@ -21,9 +28,13 @@ const POLL_MS = 15000;
 
 function normalize(raw) {
   // /health "checks" values look like "ok" | "error: ..." | "disabled ..."
+  // Phase E7 adds "stale (...)" (heartbeat/BM25 supervision) and
+  // "starting (...)" (thread alive, no heartbeat recorded yet) forms.
   const v = String(raw ?? "").toLowerCase();
   if (v.startsWith("ok")) return "ok";
-  if (v.startsWith("disabled")) return "disabled";
+  if (v.startsWith("disabled") || v.startsWith("not started")) return "disabled";
+  if (v.startsWith("stale")) return "degraded";
+  if (v.startsWith("starting") || v.startsWith("unbuilt")) return "pending";
   if (v === "healthy") return "ok";
   if (v === "degraded") return "degraded";
   if (v.startsWith("error")) return "error";
@@ -82,9 +93,15 @@ export function HealthProvider({ children }) {
       database: reachable ? normalize(checks.database) : "unknown",
       redis:    reachable ? normalize(checks.redis) : "unknown",
       queue:    reachable ? normalize(checks.queue) : "unknown",
+      // Phase E7: real heartbeat-backed worker supervision (OBS-3/4).
+      monitor:    reachable ? normalize(checks.monitor_agent) : "unknown",
+      ingestion:  reachable ? normalize(checks.ingestion_worker) : "unknown",
+      bm25:       reachable ? normalize(checks.bm25_index) : "unknown",
       qdrant:   "unknown", // not reported by /health — honest placeholder
       llm:      "unknown", // not reported by /health — honest placeholder
     },
+    // Raw text (e.g. "stale (last heartbeat 130s ago)") for tooltips.
+    checksRaw: checks,
     refresh: poll,
   };
 

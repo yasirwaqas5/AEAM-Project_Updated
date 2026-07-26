@@ -109,6 +109,7 @@ from aeam.core.idempotency import IdempotencyManager
 # Monitoring imports (Phase 6)
 from prometheus_client import generate_latest
 from aeam.monitoring.logging_config import get_logger
+from aeam.monitoring.metrics import heartbeat_tracker
 
 # API routers
 from aeam.api.incidents import router as incidents_router
@@ -330,10 +331,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         - Dispose of the database connection pool.
         - Close the Redis connection pool.
 
-    Autonomy note (Phase E1, ENG-8): there is no scheduler. Autonomous
-    detection is MonitorAgent's polling loop below; its production
-    enablement is Roadmap Phase E7. Events otherwise enter only via
-    ``POST /api/v1/trigger`` or ``run_simulation.py``.
+    Autonomy note (Phase E1 removal, Phase E7 production enablement,
+    ENG-8): there is no separate scheduler process. Autonomous detection
+    is MonitorAgent's own polling loop below, gated solely by
+    ``settings.ENABLE_MONITOR_AGENT`` (no environment backdoor — see the
+    gating comment at its construction site). When disabled, events enter
+    only via ``POST /api/v1/trigger`` or ``run_simulation.py``.
     """
     # --- Startup ---
     logger.info("AEAM starting up …")
@@ -474,6 +477,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             bm25_index = None
     else:
         logger.info("RAG hybrid retrieval DISABLED by configuration — dense-only.")
+
+    # Phase E7 (RAG-6): exposed on the container so (a) GET /health can
+    # disclose lexical-index freshness, and (b) DocumentIngestJobProcessor
+    # below can refresh it in place after a runtime ingestion completes.
+    # None when hybrid retrieval is disabled or failed to initialise.
+    container.bm25_index = bm25_index
 
     # Snapshot the pipeline reference at this exact point — either the real
     # HybridRetrievalPipeline or plain dense retrieval — for the retrieval
@@ -731,9 +740,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     container.rule_engine = composite_rule_engine
 
-    # --- Monitor Agent (Phase 2) ---
+    # --- Monitor Agent (Phase 2; gating made honest in Phase E7) ---
+    # Phase E7 (SEC-8, PHIL-1): ENABLE_MONITOR_AGENT is now the SOLE gate —
+    # no environment backdoor. Before this phase, the condition was
+    # `ENABLE_MONITOR_AGENT or ENVIRONMENT != "production"`, which meant
+    # (a) production could NEVER run the autonomous loop without the flag
+    # explicitly set (audit gate #4 — the exact "shipped production config
+    # disables MonitorAgent" finding), while (b) every non-production
+    # environment ran it unconditionally regardless of the flag. Both
+    # directions were dishonest gating. The flag alone decides now, in
+    # every environment; deployment artifacts (docker-compose.yml,
+    # deploy/cloudrun.yaml) set it explicitly per posture — see
+    # docs/autonomous_operations.md for the full matrix.
     monitor_agent = None
-    if settings.ENABLE_MONITOR_AGENT or settings.ENVIRONMENT != "production":
+    if settings.ENABLE_MONITOR_AGENT:
         logger.info("Creating MonitorAgent …")
         monitor_agent = MonitorAgent(
             event_bus=container.event_bus,
@@ -752,7 +772,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         monitor_thread.start()
         logger.info("MonitorAgent started in background thread.")
     else:
-        logger.info("MonitorAgent disabled by configuration.")
+        logger.info(
+            "MonitorAgent disabled by configuration (ENABLE_MONITOR_AGENT=false)."
+        )
+    # Phase E7: exposed on the container so GET /health can report
+    # "disabled" vs "supervised" honestly (None means never constructed).
+    container.monitor_agent = monitor_agent
 
     # --- Ingestion Worker (Phases B1.3 + B1.4) ---
     # Drains the ingestion_jobs queue created by POST /api/v1/ingest/upload.
@@ -778,6 +803,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Phase E6: reuse the SAME embedding model already loaded above so
         # each policy's embedding is computed once, at extraction time.
         embedding_service=embedding_service,
+        # Phase E7 (RAG-6): reuse the SAME bm25_index + qdrant_client
+        # already constructed above so a document ingested at runtime
+        # refreshes the lexical index in place — no restart required.
+        # bm25_index is None when hybrid retrieval is disabled, in which
+        # case the processor's refresh step is simply a no-op.
+        bm25_index=bm25_index,
+        qdrant_client=qdrant_client,
     )
     dataset_processor = DatasetIngestJobProcessor(
         blob_store=container.blob_store,
@@ -929,12 +961,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.warning("Redis connectivity: DEGRADED — ping failed.")
 
-    # Scheduler disposition (Phase E1, ENG-8): the APScheduler stub that
-    # previously lived here (constructed, never started, publishing a
-    # SYNTHETIC hardcoded SALES_DROP event) was removed. Autonomous
-    # detection is MonitorAgent's polling loop above — enabling it in the
-    # production posture is Roadmap Phase E7. A synthetic-event generator
-    # would violate PHIL-1 (honesty over capability) if ever re-enabled.
+    # Scheduler disposition (Phase E1 removal, Phase E7 completion, ENG-8):
+    # the APScheduler stub that previously lived here (constructed, never
+    # started, publishing a SYNTHETIC hardcoded SALES_DROP event) was
+    # removed in E1. Autonomous detection is MonitorAgent's own polling
+    # loop above — no separate scheduler process is needed or wanted. Its
+    # production enablement (honest, flag-only gating; no environment
+    # backdoor) landed in Phase E7. A synthetic-event generator would
+    # violate PHIL-1 (honesty over capability) if ever reintroduced.
 
     logger.info("AEAM startup complete.")
     yield
@@ -1027,6 +1061,122 @@ def _build_jwt_auth(settings: Settings) -> JWTAuth:
         issuer=settings.JWT_ISSUER,
         audience=settings.JWT_AUDIENCE,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase E7 — GET /health payload (OBS-3/4, RAG-6)
+# ---------------------------------------------------------------------------
+
+
+def build_health_payload(container: "AppContainer") -> dict:
+    """
+    Build the ``GET /health`` response body.
+
+    Extracted to a pure function (Phase E7) so it is directly unit-testable
+    against a stub container — no live DB/Redis/Qdrant required — while the
+    real route (below, in ``create_app``) calls this exact function, so
+    there is exactly one implementation of the health-check logic.
+
+    Args:
+        container: The application's :class:`AppContainer` (or any object
+                   exposing the same attributes — a test stub is fine).
+
+    Returns:
+        The full ``{"status": ..., "checks": {...}}`` dict. Callers decide
+        the HTTP status code from ``result["status"]``.
+    """
+    status = {
+        "status": "healthy",
+        "checks": {
+            "database": "unknown",
+            "redis": "unknown",
+            "queue": "unknown",
+            # Phase E7 (OBS-3/4): supervision for the two autonomous
+            # background workers, and freshness disclosure for the
+            # lexical retrieval index (RAG-6).
+            "monitor_agent": "unknown",
+            "ingestion_worker": "unknown",
+            "bm25_index": "unknown",
+        }
+    }
+    # Check database
+    try:
+        status["checks"]["database"] = "ok"
+    except Exception as e:
+        status["status"] = "degraded"
+        status["checks"]["database"] = f"error: {str(e)}"
+
+    # Check Redis only if URL is provided
+    if container.settings.REDIS_URL:
+        try:
+            container.redis.ping()
+            status["checks"]["redis"] = "ok"
+        except Exception as e:
+            status["status"] = "degraded"
+            status["checks"]["redis"] = f"error: {str(e)}"
+    else:
+        status["checks"]["redis"] = "disabled (no REDIS_URL)"
+
+    # Check queue
+    try:
+        size = container.queue.size()
+        status["checks"]["queue"] = f"ok (size={size})"
+    except Exception as e:
+        status["status"] = "degraded"
+        status["checks"]["queue"] = f"error: {str(e)}"
+
+    # Phase E7: MonitorAgent / IngestionWorker supervision via
+    # heartbeat age. A stale heartbeat means the thread stopped
+    # updating it — either it died, or it is wedged — and DOES flip
+    # overall status to "degraded", closing the "a dead thread is
+    # discovered, not detected" audit gap. "disabled" (flag off) is
+    # reported honestly and never counted against overall health.
+    stale_after = container.settings.HEARTBEAT_STALE_SECONDS
+    if getattr(container, "monitor_agent", None) is None:
+        status["checks"]["monitor_agent"] = "disabled (ENABLE_MONITOR_AGENT=false)"
+    else:
+        age = heartbeat_tracker.age_seconds("monitor")
+        if age is None:
+            status["checks"]["monitor_agent"] = "starting (no heartbeat yet)"
+        elif age > stale_after:
+            status["status"] = "degraded"
+            status["checks"]["monitor_agent"] = f"stale (last heartbeat {age:.0f}s ago)"
+        else:
+            status["checks"]["monitor_agent"] = f"ok (last heartbeat {age:.0f}s ago)"
+
+    if getattr(container, "ingestion_worker", None) is None:
+        status["checks"]["ingestion_worker"] = "not started"
+    else:
+        age = heartbeat_tracker.age_seconds("ingestion")
+        if age is None:
+            status["checks"]["ingestion_worker"] = "starting (no heartbeat yet)"
+        elif age > stale_after:
+            status["status"] = "degraded"
+            status["checks"]["ingestion_worker"] = f"stale (last heartbeat {age:.0f}s ago)"
+        else:
+            status["checks"]["ingestion_worker"] = f"ok (last heartbeat {age:.0f}s ago)"
+
+    # Phase E7 (RAG-6): informational only — staleness here degrades
+    # retrieval QUALITY, not platform availability, so it never flips
+    # overall `status`.
+    bm25_index = getattr(container, "bm25_index", None)
+    if bm25_index is None:
+        status["checks"]["bm25_index"] = "disabled (RAG_HYBRID_ENABLED=false or init failed)"
+    else:
+        bm25_age = bm25_index.age_seconds
+        bm25_stale_after = container.settings.BM25_STALE_SECONDS
+        if bm25_age is None:
+            status["checks"]["bm25_index"] = "unbuilt"
+        elif bm25_age > bm25_stale_after:
+            status["checks"]["bm25_index"] = (
+                f"stale (built {bm25_age:.0f}s ago, {bm25_index.size} docs)"
+            )
+        else:
+            status["checks"]["bm25_index"] = (
+                f"ok (built {bm25_age:.0f}s ago, {bm25_index.size} docs)"
+            )
+
+    return status
 
 
 # ---------------------------------------------------------------------------
@@ -1174,40 +1324,7 @@ def _register_routes(app: FastAPI) -> None:
     @app.get("/health", tags=["Operations"])
     def health():
         container: AppContainer = app.state.container
-        status = {
-            "status": "healthy",
-            "checks": {
-                "database": "unknown",
-                "redis": "unknown",
-                "queue": "unknown"
-            }
-        }
-        # Check database
-        try:
-            status["checks"]["database"] = "ok"
-        except Exception as e:
-            status["status"] = "degraded"
-            status["checks"]["database"] = f"error: {str(e)}"
-
-        # Check Redis only if URL is provided
-        if container.settings.REDIS_URL:
-            try:
-                container.redis.ping()
-                status["checks"]["redis"] = "ok"
-            except Exception as e:
-                status["status"] = "degraded"
-                status["checks"]["redis"] = f"error: {str(e)}"
-        else:
-            status["checks"]["redis"] = "disabled (no REDIS_URL)"
-
-        # Check queue
-        try:
-            size = container.queue.size()
-            status["checks"]["queue"] = f"ok (size={size})"
-        except Exception as e:
-            status["status"] = "degraded"
-            status["checks"]["queue"] = f"error: {str(e)}"
-
+        status = build_health_payload(container)
         return JSONResponse(status_code=200 if status["status"] == "healthy" else 503, content=status)
 
 
