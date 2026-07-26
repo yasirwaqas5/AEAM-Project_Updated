@@ -1,0 +1,44 @@
+{
+  "_about": {
+    "phase": "E12",
+    "purpose": "Golden query set for the retrieval evaluation harness (RAG-7). Each case names a query and the evidence that MUST come back for retrieval to be considered non-degraded. The harness scores recall@k and MRR against these expectations and fails the build when either drops below the declared threshold, so corpus drift and retrieval regressions stop being invisible.",
+    "methodology": "docs/KNOWLEDGE_GOVERNANCE.md#retrieval-evaluation-methodology",
+    "honesty_note": "expected_chunk_ids are the identifiers a correct retrieval returns. A case whose expected evidence is not present in the corpus under test is SKIPPED and reported as skipped — never silently scored as a pass, and never scored as a failure that would blame the retriever for a missing corpus."
+  },
+  "thresholds": {
+    "min_recall_at_k": 0.6,
+    "min_mrr": 0.5,
+    "k": 5,
+    "_rationale": "Set at the level the current pipeline clears with margin, not at the level it barely reaches: a threshold pinned to today's exact score turns every harmless ranking jitter into a red build. Raise these as retrieval genuinely improves; never lower them to make a failing change pass."
+  },
+  "cases": [
+    {
+      "id": "db-latency-runbook",
+      "query": "database latency spike investigation steps",
+      "expected_chunk_ids": ["startup_runbook::db_latency"],
+      "expected_doc_types": ["startup_runbook", "runbook", "sre_runbook"],
+      "rationale": "The canonical operational question. Must surface the runbook section that describes the DB-latency escalation procedure, not generic prose that merely mentions databases."
+    },
+    {
+      "id": "sales-drop-procedure",
+      "query": "what to do when sales drop below expected value",
+      "expected_chunk_ids": ["startup_runbook::sales_drop"],
+      "expected_doc_types": ["startup_runbook", "runbook"],
+      "rationale": "Business-metric anomaly. Verifies the retriever does not collapse every business query onto the same highest-similarity chunk regardless of metric."
+    },
+    {
+      "id": "escalation-policy",
+      "query": "when should an incident be escalated to a human reviewer",
+      "expected_chunk_ids": ["startup_runbook::escalation"],
+      "expected_doc_types": ["startup_runbook", "runbook", "policy"],
+      "rationale": "Governance question. Exercises the path that feeds the human-approval gate's evidence, where retrieving the wrong policy has real consequences."
+    },
+    {
+      "id": "authoritative-preference",
+      "query": "replica sync failure remediation",
+      "expected_chunk_ids": ["startup_runbook::db_latency"],
+      "expected_doc_types": ["startup_runbook", "runbook", "sre_runbook"],
+      "rationale": "RAG-7 regression: an authoritative runbook chunk must outrank a generic reference chunk that mentions the same words. Guards the Phase E12 semantic-doc-type fix against silent reversion."
+    }
+  ]
+}

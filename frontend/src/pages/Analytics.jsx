@@ -162,6 +162,141 @@ function ObservabilityRateRow({ label, metric }) {
   );
 }
 
+/* ─── Phase E11: measured investigation duration ─────────────────────────────
+ * The backend persists the duration it MEASURED at finalize; this renders
+ * exactly that. Incidents recorded before Phase E11 carry no measurement, and
+ * the count of those is displayed rather than hidden — an average that
+ * silently covers a subset would misrepresent the platform to the operator
+ * reading it (EXPL-3 mixed-history honesty).
+ * ────────────────────────────────────────────────────────────────────────── */
+function InvestigationDurationPanel({ duration }) {
+  if (!duration?.available) {
+    return (
+      <div style={{
+        display: "flex", alignItems: "flex-start", gap: "0.5rem",
+        padding: "0.55rem 0.8rem", border: "1px dashed var(--border)", borderRadius: 8,
+        color: "var(--muted)", fontSize: "0.7rem",
+      }}>
+        <Icon name="alert" size={12} color="var(--muted)" style={{ marginTop: "0.1rem", flexShrink: 0 }} />
+        <span>Investigation duration: {duration?.reason || "not available"}</span>
+      </div>
+    );
+  }
+
+  const stat = (label, value) => (
+    <div key={label}>
+      <div style={{ fontSize: "0.6rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>{label}</div>
+      <div style={{ fontFamily: "var(--font-mono)", fontSize: "0.95rem", fontWeight: 700, color: "var(--text)" }}>{value}</div>
+    </div>
+  );
+
+  return (
+    <div style={{ border: "1px solid var(--border)", borderRadius: 8, padding: "0.75rem 0.9rem" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "0.5rem", marginBottom: "0.6rem" }}>
+        <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>
+          Investigation Duration — measured
+        </span>
+        <Badge label={`${duration.sample_count} measured`} color="var(--ok)" />
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(90px, 1fr))", gap: "0.75rem" }}>
+        {stat("Average", `${duration.average}s`)}
+        {stat("Median", `${duration.median}s`)}
+        {stat("Fastest", `${duration.min}s`)}
+        {stat("Slowest", `${duration.max}s`)}
+      </div>
+
+      {duration.incidents_without_duration > 0 && (
+        <div style={{ marginTop: "0.6rem", fontSize: "0.68rem", color: "var(--warn)", display: "flex", gap: "0.4rem", alignItems: "flex-start" }}>
+          <Icon name="alert" size={11} color="var(--warn)" style={{ marginTop: "0.15rem", flexShrink: 0 }} />
+          <span>
+            {duration.incidents_without_duration} of {duration.total_investigations} incidents in this
+            window predate duration persistence and are excluded from these figures — they were
+            never measured, so no value is shown for them.
+          </span>
+        </div>
+      )}
+
+      <p style={{ marginTop: "0.5rem", fontSize: "0.64rem", color: "var(--faint)", lineHeight: 1.5 }}>
+        {duration.measurement}
+      </p>
+    </div>
+  );
+}
+
+/* ─── Phase E11: platform cost surface ───────────────────────────────────────
+ * Per-incident and per-window roll-up of what the platform costs to run:
+ * LLM spend, action executions, retrieval volume. Every window is disclosed
+ * (OBS-2/EXPL-5) and the cost basis is stated inline so a reader never has to
+ * guess whether the dollar figure is an estimate or an invoice.
+ * ────────────────────────────────────────────────────────────────────────── */
+function PlatformCostPanel({ cost, retention }) {
+  if (!cost?.available) {
+    return (
+      <div style={{
+        display: "flex", alignItems: "flex-start", gap: "0.5rem",
+        padding: "0.55rem 0.8rem", border: "1px dashed var(--border)", borderRadius: 8,
+        color: "var(--muted)", fontSize: "0.7rem",
+      }}>
+        <Icon name="alert" size={12} color="var(--muted)" style={{ marginTop: "0.1rem", flexShrink: 0 }} />
+        <span>Platform cost: {cost?.reason || "not available"}</span>
+      </div>
+    );
+  }
+
+  const t = cost.totals;
+  const avg = cost.per_incident_average;
+  const cell = (label, total, perIncident) => (
+    <div key={label} style={{ padding: "0.5rem 0", borderBottom: "1px solid var(--border)" }}>
+      <div style={{ fontSize: "0.6rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>{label}</div>
+      <div style={{ fontFamily: "var(--font-mono)", fontSize: "0.95rem", fontWeight: 700, color: "var(--text)" }}>{total}</div>
+      <div style={{ fontSize: "0.62rem", color: "var(--faint)" }}>{perIncident} per incident</div>
+    </div>
+  );
+
+  return (
+    <div style={{ border: "1px solid var(--border)", borderRadius: 8, padding: "0.75rem 0.9rem" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "0.5rem", marginBottom: "0.4rem" }}>
+        <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>
+          Platform Cost — what this platform costs to run
+        </span>
+        <Badge label={`${cost.incidents_with_cost} attributed`} color="var(--c-plan)" />
+      </div>
+
+      {retention && (
+        <div style={{ fontSize: "0.64rem", color: "var(--faint)", marginBottom: "0.5rem", fontFamily: "var(--font-mono)" }}>
+          window: most recent {retention.window} incidents ({retention.source})
+          {retention.windowed ? ` · ${retention.incidents_available} available, ${retention.incidents_considered} considered` : " · full history"}
+        </div>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: "0 1rem" }}>
+        {cell("LLM Spend (est.)", `$${t.llm_cost_usd.toFixed(4)}`, `$${avg.llm_cost_usd.toFixed(6)}`)}
+        {cell("LLM Tokens", t.llm_total_tokens.toLocaleString(), avg.llm_total_tokens)}
+        {cell("LLM Calls", t.llm_calls.toLocaleString(), avg.llm_calls)}
+        {cell("Retrieval Chunks", t.retrieval_chunks.toLocaleString(), avg.retrieval_chunks)}
+        {cell("Actions Executed", t.actions_executed.toLocaleString(), avg.actions_executed)}
+        {cell("Actions Withheld", t.actions_withheld.toLocaleString(), "—")}
+      </div>
+
+      {cost.incidents_without_cost > 0 && (
+        <div style={{ marginTop: "0.6rem", fontSize: "0.68rem", color: "var(--warn)", display: "flex", gap: "0.4rem", alignItems: "flex-start" }}>
+          <Icon name="alert" size={11} color="var(--warn)" style={{ marginTop: "0.15rem", flexShrink: 0 }} />
+          <span>
+            {cost.incidents_without_cost} of {cost.total_investigations} incidents in this window
+            predate cost attribution. They are excluded, not counted as zero-cost — including them
+            would understate the per-incident averages above.
+          </span>
+        </div>
+      )}
+
+      <p style={{ marginTop: "0.5rem", fontSize: "0.64rem", color: "var(--faint)", lineHeight: 1.5 }}>
+        {cost.cost_basis}
+      </p>
+    </div>
+  );
+}
+
 // ─── Page ───────────────────────────────────────────────────────────────────
 
 export default function Analytics() {
@@ -421,18 +556,16 @@ export default function Analytics() {
                 </div>
               </div>
 
-              <div style={{
-                display: "flex", alignItems: "flex-start", gap: "0.5rem",
-                padding: "0.55rem 0.8rem", border: "1px dashed var(--border)", borderRadius: 8,
-                color: "var(--muted)", fontSize: "0.7rem",
-              }}>
-                <Icon name="alert" size={12} color="var(--muted)" style={{ marginTop: "0.1rem", flexShrink: 0 }} />
-                <span>
-                  {observability.investigation_duration?.available
-                    ? `Investigation duration: ${observability.investigation_duration.average}s average.`
-                    : `Investigation duration: ${observability.investigation_duration?.reason || "not available"}`}
-                </span>
-              </div>
+              {/* Phase E11: real, measured per-incident duration — with the
+                  mixed-history disclosure the backend supplies verbatim, so
+                  the console never implies the average covers incidents it
+                  could not measure. */}
+              <InvestigationDurationPanel duration={observability.investigation_duration} />
+
+              {/* Phase E11: platform cost surface. Same mixed-history
+                  contract: measured for post-phase incidents, honestly
+                  unavailable for older ones. */}
+              <PlatformCostPanel cost={observability.platform_cost} retention={observability.retention} />
             </div>
           )}
         </Panel>

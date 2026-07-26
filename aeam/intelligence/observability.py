@@ -42,15 +42,24 @@ Design rationale (Architecture Gate conclusion):
   never touches Prometheus, and is not a second metrics system: it is the
   same read pattern as C7/D1/D2, applied across many incidents instead of
   one.
-- Investigation duration honesty: no per-incident duration is persisted
-  ANYWHERE (not in ``incidents``, not in ``findings``, not in
-  ``audit_summary``) -- only Prometheus's process-lifetime aggregate mean
-  exists, in a completely different data source this engine deliberately
-  does not merge in (mixing a point-in-time incident-table snapshot with a
-  live, resettable, unlabelled process metric would misrepresent both). This
-  metric is honestly reported as unavailable at the per-incident level, with
-  the real reason stated -- exactly the same honesty precedent
-  Analytics.jsx already set for "Forecast vs Actual."
+- Investigation duration honesty (UPDATED in Phase E11): the Orchestrator now
+  persists the measured per-incident duration into ``audit_summary`` at
+  finalize (``investigation_duration_seconds``), so this engine reports a
+  REAL duration for every incident recorded after that phase. It still never
+  merges in Prometheus's process-lifetime aggregate — the number reported
+  here is only ever the measurement actually persisted on the incident.
+  Incidents recorded BEFORE E11 carry no such field, and this engine says so
+  explicitly (``incidents_without_duration`` + a stated reason) rather than
+  silently averaging over a smaller population or backfilling a value it
+  never measured — the same mixed-history honesty (COMPAT-1 / EXPL-3) the
+  rest of the platform applies.
+- Platform cost (Phase E11): the same read, applied to ``audit_summary.cost``
+  — LLM spend/tokens, action-execution counts, and retrieval volume that the
+  Orchestrator attributed to each incident. Reported per-window with the
+  window fully disclosed by the API layer, and with the identical
+  mixed-history disclosure as duration. No second cost store exists; this is
+  a reduction over already-persisted findings, exactly like every other
+  metric in this module.
 """
 
 from __future__ import annotations
@@ -159,20 +168,17 @@ class ObservabilityEngine:
 
         success_rate = _investigation_success_rate(incidents)
 
-        duration = {
-            "available": False,
-            "reason": (
-                "Per-incident investigation duration is not persisted in the incidents table, "
-                "findings, or audit_summary -- only a global, unlabeled, process-lifetime "
-                "aggregate exists via the investigation_duration Prometheus histogram (see "
-                "/metrics), which this engine deliberately does not merge in as a second, "
-                "differently-shaped data source. The Dashboard/Analytics pages already surface "
-                "that Prometheus aggregate directly."
-            ),
-        }
+        # Phase E11: real, measured duration for post-phase incidents; an
+        # honest, stated reason for the pre-phase ones (never backfilled).
+        duration = _investigation_duration(incidents, self._trend_window)
+
+        # Phase E11: the platform cost surface, reduced from the same
+        # already-persisted audit_summary entries.
+        cost = _platform_cost(incidents)
 
         metrics: dict[str, dict[str, Any]] = {
             "investigation_duration": duration,
+            "platform_cost": cost,
             "memory_hit_rate": memory_hit,
             "policy_hit_rate": policy_hit,
             "retrieval_success_rate": retrieval_success,
@@ -308,6 +314,157 @@ def _numeric_trend(
     }
 
 
+def _audit_summary(incident: dict[str, Any]) -> dict[str, Any] | None:
+    """Last ``audit_summary`` findings entry for an incident, or ``None``.
+
+    Note the shape difference from :func:`_latest_finding_data`: the
+    Orchestrator writes ``audit_summary`` fields at the TOP level of the
+    findings entry (not nested under ``data``), which is why this has its
+    own accessor rather than reusing the generic one.
+    """
+    latest: dict[str, Any] | None = None
+    for entry in _incident_findings(incident):
+        if isinstance(entry, dict) and entry.get("type") == "audit_summary":
+            latest = entry
+    return latest
+
+
+def _investigation_duration(
+    incidents: list[dict[str, Any]],
+    trend_window: int = _TREND_WINDOW,
+) -> dict[str, Any]:
+    """
+    Real per-incident investigation duration (Phase E11).
+
+    Reads ``audit_summary.investigation_duration_seconds`` — the value the
+    Orchestrator MEASURED at finalize, not a Prometheus aggregate. Incidents
+    recorded before Phase E11 have no such field; they are counted and
+    disclosed separately rather than dropped silently or backfilled
+    (COMPAT-1 / EXPL-3).
+    """
+    values: list[float] = []
+    missing = 0
+    for incident in reversed(incidents):  # oldest first, matching _numeric_trend
+        audit = _audit_summary(incident)
+        if audit is None:
+            missing += 1
+            continue
+        value = audit.get("investigation_duration_seconds")
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+        else:
+            missing += 1
+
+    if not values:
+        return {
+            "available": False,
+            "reason": (
+                f"None of the {len(incidents)} recorded investigation(s) carry a measured "
+                "audit_summary.investigation_duration_seconds. Per-incident duration is "
+                "persisted only for incidents finalized after Phase E11; this engine reports "
+                "what was measured and never merges in the global, process-lifetime "
+                "investigation_duration Prometheus histogram as a substitute."
+            ),
+            "incidents_without_duration": missing,
+        }
+
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    median = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
+
+    return {
+        "available": True,
+        "unit": "seconds",
+        "average": round(sum(values) / len(values), 4),
+        "median": round(median, 4),
+        "min": round(ordered[0], 4),
+        "max": round(ordered[-1], 4),
+        "sample_count": len(values),
+        # Mixed-history disclosure: how many incidents in this window predate
+        # duration persistence and therefore contribute nothing above.
+        "incidents_without_duration": missing,
+        "total_investigations": len(incidents),
+        "measurement": (
+            "Wall-clock seconds from Orchestrator.handle_event() to "
+            "finalize_incident(), measured per incident and persisted into "
+            "audit_summary.investigation_duration_seconds."
+        ),
+        "recent_values": [round(v, 4) for v in values[-trend_window:]],
+    }
+
+
+def _platform_cost(incidents: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Platform cost roll-up across the supplied window (Phase E11).
+
+    Sums the per-incident ``audit_summary.cost`` blocks the Orchestrator
+    attributed at finalize. Every component is a real measurement: LLM tokens
+    are provider-reported, spend is those tokens at the operator-configured
+    rate, and action/retrieval counts are what actually happened. Incidents
+    predating cost attribution carry no block and are disclosed as such
+    instead of being treated as zero-cost (which would understate the
+    average).
+    """
+    with_cost = 0
+    totals = {
+        "llm_calls": 0,
+        "llm_prompt_tokens": 0,
+        "llm_completion_tokens": 0,
+        "llm_total_tokens": 0,
+        "llm_cost_usd": 0.0,
+        "retrieval_chunks": 0,
+        "actions_executed": 0,
+        "actions_skipped": 0,
+        "actions_withheld": 0,
+    }
+
+    for incident in incidents:
+        audit = _audit_summary(incident)
+        cost = (audit or {}).get("cost")
+        if not isinstance(cost, dict):
+            continue
+        with_cost += 1
+        for key in totals:
+            value = cost.get(key)
+            if isinstance(value, (int, float)):
+                totals[key] += value
+
+    if with_cost == 0:
+        return {
+            "available": False,
+            "reason": (
+                f"None of the {len(incidents)} recorded investigation(s) carry an "
+                "audit_summary.cost block. Per-incident cost attribution exists only for "
+                "incidents finalized after Phase E11; older incidents are reported as "
+                "unavailable rather than counted as zero-cost."
+            ),
+            "incidents_without_cost": len(incidents),
+        }
+
+    totals["llm_cost_usd"] = round(totals["llm_cost_usd"], 6)
+    return {
+        "available": True,
+        "totals": totals,
+        "per_incident_average": {
+            "llm_calls": round(totals["llm_calls"] / with_cost, 4),
+            "llm_total_tokens": round(totals["llm_total_tokens"] / with_cost, 4),
+            "llm_cost_usd": round(totals["llm_cost_usd"] / with_cost, 6),
+            "retrieval_chunks": round(totals["retrieval_chunks"] / with_cost, 4),
+            "actions_executed": round(totals["actions_executed"] / with_cost, 4),
+        },
+        "incidents_with_cost": with_cost,
+        # Mixed-history disclosure, same contract as duration above.
+        "incidents_without_cost": len(incidents) - with_cost,
+        "total_investigations": len(incidents),
+        "cost_basis": (
+            "LLM spend is provider-reported token counts priced at the operator-configured "
+            "LLM_COST_PER_1K_* rates (0.0 when unconfigured) — informational, never an "
+            "invoiced total. Action and retrieval counts are measured, not estimated. "
+            "The window these totals cover is disclosed by the API layer's 'retention' block."
+        ),
+    }
+
+
 def _investigation_success_rate(incidents: list[dict[str, Any]]) -> dict[str, Any]:
     statuses: list[str] = []
     for incident in incidents:
@@ -348,7 +505,8 @@ def _compute_overall_health(metrics: dict[str, dict[str, Any]]) -> tuple[dict[st
     formula = (
         f"Unweighted mean of {len(used)}/{len(_HEALTH_SCORE_TERMS)} computable rate/score components "
         f"({', '.join(used) if used else 'none available'}), clamped to [0, 1]. "
-        "investigation_duration is intentionally excluded (not a [0,1] rate)."
+        "investigation_duration and platform_cost are intentionally excluded "
+        "(neither is a [0,1] rate; a cost is not a quality score)."
     )
     if not terms:
         return {"available": False, "reason": "No component metric was computable across the recorded investigations."}, formula

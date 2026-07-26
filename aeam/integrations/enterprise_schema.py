@@ -70,7 +70,11 @@ CREATE TABLE IF NOT EXISTS documents (
     source_id        TEXT,               -- -> sources.source_id (unenforced)
     title            TEXT,
     origin_path      TEXT,               -- filename / page URL of origin
-    doc_type         TEXT,               -- 'runbook'|'incident_report'|'wiki'|'api_doc'|...
+    doc_type         TEXT,               -- FORMAT category as detected at upload ('markdown'|'pdf'|...)
+    semantic_type    TEXT,               -- Phase E12 (MOD-4/RAG-7): DECLARED semantic type
+                                         -- ('runbook'|'incident_report'|'post_mortem'|...), separate
+                                         -- from the format above. NULL until declared; retrieval
+                                         -- falls back to doc_type so pre-E12 rows are unchanged.
     current_version  INTEGER,            -- -> versions.version (active)
     content_hash     TEXT,               -- hash of active version bytes (idempotent re-ingest)
     chunk_count      INTEGER,            -- chunks currently in Qdrant for active version
@@ -160,7 +164,14 @@ CREATE TABLE IF NOT EXISTS policies (
     related_metrics   JSONB,              -- list of metric name strings
     extracted_at      TIMESTAMP,
     embedding         JSONB,              -- Phase E6: stored policy embedding (list[float]); NULL until computed
-    embedding_model   TEXT                -- Phase E6: model id the embedding was produced with (TECH-6 invalidation)
+    embedding_model   TEXT,               -- Phase E6: model id the embedding was produced with (TECH-6 invalidation)
+    -- Phase E12 (COMPAT-6): lifecycle status. 'active'|'pending_review'|'retired'.
+    -- PolicyRegistry matches ACTIVE policies only; the 'active' default means
+    -- every pre-E12 row keeps matching exactly as it did before this phase.
+    status            TEXT DEFAULT 'active',
+    status_changed_at TIMESTAMP,          -- when status last transitioned
+    status_changed_by TEXT,               -- acting principal (SEC-7: curation is attributable)
+    status_reason     TEXT                -- why, recorded verbatim
 );
 """
 

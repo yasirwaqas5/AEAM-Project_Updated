@@ -102,6 +102,14 @@ _ENDPOINT_RBAC_MAP: list[tuple[str, str, str]] = [
     # the broader /knowledge entry so they resolve first.
     ("/api/v1/knowledge/delete",  "admin",     "config"),
     ("/api/v1/knowledge/reindex", "admin",     "config"),
+    # Phase E12 (SEC-7): knowledge CURATION is privileged. Policy lifecycle
+    # transitions, Enterprise Memory expunge/correct, and semantic-type
+    # declarations all live under this one namespace precisely so a single
+    # longest-prefix-first entry guards every one of them — a curation
+    # endpoint added later cannot accidentally land outside the guard by
+    # being registered at a path nobody remembered to map. Reads
+    # (GET /knowledge/policies) stay on documents:search below.
+    ("/api/v1/knowledge/curate",  "admin",     "config"),
     ("/api/v1/knowledge",         "documents", "search"),
 
     # --- Data Center: activating/deactivating datasets is configuration.
@@ -120,6 +128,15 @@ _ENDPOINT_RBAC_MAP: list[tuple[str, str, str]] = [
     ("/api/v1/logs",              "logs",      "view"),
     ("/api/v1/observability",     "logs",      "view"),
     ("/api/v1/system",            "logs",      "view"),
+
+    # --- Audit query surface (Phase E11, SEC-6). Read-only queries over the
+    # durable E3 audit_logs table. Mapped to logs:view because that is the
+    # grant the 'auditor' role holds — the role the phase requires to be able
+    # to query audit history by principal and time window. No new permission
+    # verb is invented for it (ENG-6: one permission vocabulary); the
+    # existing read-only-observability tier is exactly the right tier, and
+    # the router itself can only ever read.
+    ("/api/v1/audit",             "logs",      "view"),
 ]
 
 # Rate limit configuration applied to all authenticated requests.

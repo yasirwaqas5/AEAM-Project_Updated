@@ -1,0 +1,70 @@
+# ============================================================
+# AEAM — Prometheus scrape configuration (Phase E11, OBS-1/OBS-6)
+# ============================================================
+#
+# The audit's finding was blunt: "nothing scrapes /metrics." AEAM has
+# published a Prometheus exposition at GET /metrics since Phase 6, but no
+# deployment artifact ever told a Prometheus server to read it, and no rule
+# ever alerted on it. This file, together with alerts.yml alongside it, is
+# that missing half.
+#
+# OBS-1 is preserved exactly: this introduces NO second metrics pipeline.
+# It is scrape *configuration* for the pipeline AEAM already publishes.
+# Every series referenced here is defined in aeam/monitoring/metrics.py.
+#
+# Usage:
+#   prometheus --config.file=deploy/prometheus.yml
+#
+# Or mount both files into an existing Prometheus deployment:
+#   - this file's `scrape_configs` entry merged into yours
+#   - alerts.yml added to your `rule_files`
+#
+# NOTE ON AUTH: /metrics is NOT in SecurityMiddleware's _PUBLIC_PATHS, so in
+# any non-development environment a scrape needs a bearer token. Set it via
+# the `authorization` block below (Prometheus reads the token from a file so
+# the credential never lives in this tracked artifact — SEC-5).
+
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  external_labels:
+    platform: aeam
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: aeam
+    metrics_path: /metrics
+    scheme: http
+    # Bearer token for SecurityMiddleware. Point `credentials_file` at a
+    # mounted secret; never inline the token here.
+    # authorization:
+    #   type: Bearer
+    #   credentials_file: /etc/prometheus/secrets/aeam-scrape-token
+    static_configs:
+      - targets:
+          # Replace with the real service address for your environment.
+          # Cloud Run: use the service URL with scheme: https.
+          - aeam:8080
+        labels:
+          service: aeam
+
+  # Liveness of the platform's own HTTP surface. GET /health is public
+  # (see SecurityMiddleware._PUBLIC_PATHS), so this probe needs no token.
+  # Requires the Prometheus blackbox_exporter; drop this job if you do not
+  # run one — the `up` metric from the job above already covers hard-down.
+  - job_name: aeam-health
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets:
+          - http://aeam:8080/health
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115

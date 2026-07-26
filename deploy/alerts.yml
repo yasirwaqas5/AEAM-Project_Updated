@@ -1,0 +1,182 @@
+# ============================================================
+# AEAM — Prometheus alerting rules (Phase E11, OBS-1/OBS-3/OBS-4/OBS-6)
+# ============================================================
+#
+# Every rule below fires on a series AEAM ALREADY publishes from
+# aeam/monitoring/metrics.py — no metric was invented to make an alert
+# possible, and no second metrics pipeline exists (OBS-1).
+#
+# Each rule declares its semantics in annotations rather than leaving an
+# on-call engineer to reverse-engineer the expression: `summary` says what
+# broke, `description` says what the number means, and `runbook` points at
+# the exact section of docs/SRE_RUNBOOK.md that says what to do about it.
+# The full catalogue with declared semantics lives in docs/ALERT_CATALOG.md.
+#
+# Severity vocabulary:
+#   critical — the platform is not performing its core function; page.
+#   warning  — degraded or trending badly; investigate within the hour.
+
+groups:
+  # ----------------------------------------------------------------
+  - name: aeam.availability
+    rules:
+      - alert: AEAMDown
+        expr: up{job="aeam"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AEAM is not scrapeable"
+          description: >-
+            Prometheus has failed to scrape AEAM's /metrics endpoint for 2
+            minutes. Either the process is down, the port is unreachable, or
+            the scrape credential was rejected by SecurityMiddleware.
+          runbook: "docs/SRE_RUNBOOK.md#aeam-is-down"
+
+  # ----------------------------------------------------------------
+  # Phase E7 shipped heartbeat instrumentation for the two autonomous
+  # background workers precisely so a dead thread is DETECTED rather than
+  # discovered. worker_heartbeat_timestamp_seconds is the Prometheus view of
+  # HeartbeatTracker; `time() - <gauge>` is the worker's heartbeat age.
+  - name: aeam.autonomy
+    rules:
+      - alert: AEAMMonitorAgentHeartbeatStale
+        expr: time() - worker_heartbeat_timestamp_seconds{worker="monitor"} > 180
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MonitorAgent heartbeat is stale ({{ $value | humanizeDuration }} old)"
+          description: >-
+            The MonitorAgent thread has not recorded a heartbeat for over 3
+            minutes. Autonomous detection has stopped: no KPI anomaly will be
+            detected until the thread recovers. Events can still enter via
+            POST /api/v1/trigger. Confirm with GET /health, whose
+            checks.monitor_agent reports the same fact.
+          runbook: "docs/SRE_RUNBOOK.md#monitoragent-heartbeat-is-stale"
+
+      - alert: AEAMIngestionWorkerHeartbeatStale
+        expr: time() - worker_heartbeat_timestamp_seconds{worker="ingestion"} > 300
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "IngestionWorker heartbeat is stale ({{ $value | humanizeDuration }} old)"
+          description: >-
+            The IngestionWorker thread has not recorded a heartbeat for over 5
+            minutes. Queued ingestion jobs are not being claimed, so uploaded
+            documents will stay QUEUED and never become retrievable. Existing
+            retrieval is unaffected.
+          runbook: "docs/SRE_RUNBOOK.md#ingestionworker-heartbeat-is-stale"
+
+  # ----------------------------------------------------------------
+  - name: aeam.actions
+    rules:
+      - alert: AEAMActionFailureRateHigh
+        expr: >-
+          sum(rate(action_failure_total[10m]))
+            /
+          clamp_min(sum(rate(action_success_total[10m])) + sum(rate(action_failure_total[10m])), 0.001)
+            > 0.25
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 25% of AEAM actions are failing"
+          description: >-
+            Over the last 10 minutes, more than a quarter of ActionAgent
+            executions ended in failure across all action types. Investigations
+            are still completing and recording evidence; it is the OUTPUT side
+            (Slack/Jira/email/webhook) that is degraded. The clamp_min guard
+            keeps this expression defined when no actions ran at all.
+          runbook: "docs/SRE_RUNBOOK.md#action-failure-rate-is-high"
+
+      - alert: AEAMNoActionsExecuted
+        expr: sum(increase(action_executions_total{outcome="executed"}[1h])) == 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "AEAM has executed no actions for an hour"
+          description: >-
+            No investigation caused a successful action execution in the last
+            hour. Expected when the platform is genuinely idle; suspicious when
+            incidents_total is still climbing, which would mean investigations
+            are completing but every action is being withheld or skipped —
+            check whether the Phase E9 approval gate is holding a queue.
+          runbook: "docs/SRE_RUNBOOK.md#no-actions-executed"
+
+  # ----------------------------------------------------------------
+  - name: aeam.investigations
+    rules:
+      - alert: AEAMInvestigationDurationHigh
+        expr: >-
+          rate(investigation_duration_seconds_sum[15m])
+            /
+          clamp_min(rate(investigation_duration_seconds_count[15m]), 0.001)
+            > 120
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mean investigation duration exceeds 2 minutes"
+          description: >-
+            The rolling mean of end-to-end investigation wall-clock time is
+            above 120s. Usual causes are LLM provider latency (see
+            llm_call_duration_seconds), Qdrant slowness, or retrieval pool
+            growth. The same measurement is persisted per incident into
+            audit_summary.investigation_duration_seconds and rendered on the
+            Analytics page.
+          runbook: "docs/SRE_RUNBOOK.md#investigations-are-slow"
+
+      - alert: AEAMActiveIncidentsStuck
+        expr: active_incidents > 0 and changes(active_incidents[30m]) == 0
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "active_incidents has been stuck at {{ $value }} for 30 minutes"
+          description: >-
+            The active-incident gauge is non-zero and has not changed in 30
+            minutes. An investigation started and never reached
+            finalize_incident(), which decrements the gauge — likely a wedged
+            agent call or an unreleased external dependency.
+          runbook: "docs/SRE_RUNBOOK.md#active-incidents-stuck"
+
+  # ----------------------------------------------------------------
+  # Phase E8 shipped LLM call/token/cost metering; these alert on it.
+  - name: aeam.ai
+    rules:
+      - alert: AEAMLLMFailureRateHigh
+        expr: >-
+          sum(rate(llm_calls_total{status="failure"}[10m]))
+            /
+          clamp_min(sum(rate(llm_calls_total[10m])), 0.001)
+            > 0.20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 20% of LLM calls are failing"
+          description: >-
+            Over a fifth of LLM calls failed in the last 10 minutes. AEAM
+            degrades honestly here — investigations continue on the
+            deterministic path and record the failure — but grounded root-cause
+            quality drops. Check provider status, the configured timeout
+            (LLM_TIMEOUT_SECONDS), and credentials.
+          runbook: "docs/SRE_RUNBOOK.md#llm-failure-rate-is-high"
+
+      - alert: AEAMLLMSpendSpike
+        expr: sum(rate(llm_cost_usd_total[1h])) * 3600 > 5
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Estimated LLM spend exceeds $5/hour"
+          description: >-
+            Estimated hourly LLM spend, computed from provider-reported token
+            counts at the operator-configured LLM_COST_PER_1K_* rates, is above
+            $5/hour. This is informational pricing, never an invoiced total,
+            and reads 0 whenever no rate is configured — in that case this
+            alert cannot fire and its silence means nothing.
+          runbook: "docs/SRE_RUNBOOK.md#llm-spend-spike"

@@ -187,11 +187,27 @@ class DocumentIngestJobProcessor:
             stage="chunking, embedding, indexing",
         )
 
+        # Phase E12 (MOD-4/RAG-7): the retrieval-time `doc_type` payload key
+        # is read by BusinessRelevanceScorer to decide whether a chunk came
+        # from authoritative, actionable material (a runbook) or generic
+        # reference text. Before this phase it received the FORMAT category
+        # ("markdown"), so an uploaded runbook could never earn that bonus.
+        # The DECLARED semantic type now wins when one was declared; a
+        # document with no declaration falls back to the format exactly as
+        # before (COMPAT-1). The format is preserved alongside under its own
+        # key, so nothing that needs it has to parse it back out.
+        semantic_type = getattr(doc, "semantic_type", None)
+        retrieval_doc_type = semantic_type or category or "document"
+
         metadata: dict[str, Any] = {
             # Required by IngestionPipeline.ingest_document.
             "source": doc.origin_path or doc.title or "upload",
             "date": doc.created_at,
-            "doc_type": category or "document",
+            "doc_type": retrieval_doc_type,
+            # The detected file format, kept distinct from the semantic type
+            # above so neither has to stand in for the other.
+            "format": category or None,
+            "semantic_type": semantic_type,
             # Traceability + future filtered delete/reindex by document.
             "doc_id": doc.doc_id,
             "version_id": version_id,

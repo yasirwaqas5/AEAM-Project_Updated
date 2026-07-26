@@ -51,6 +51,17 @@ cryptography
 structlog
 prometheus-client
 
+# --- Distributed tracing (Phase E11, OBS-6 / TECH-1) ---
+# COMPLEMENTARY to prometheus-client, never a replacement: metrics stay the
+# single metrics pipeline (OBS-1); these emit incident-scoped spans over the
+# OTLP standard so any enterprise tracing backend can consume them. Justified
+# under TECH-1 because it retires the "no request/investigation tracing"
+# audit gap and nothing already installed can produce a span tree.
+# Optional at runtime: aeam/monitoring/tracing.py degrades to a no-op with a
+# loud warning when these are absent, so an install without them still runs.
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http
+
 # --- Enterprise Ingress (Phase B1.2) — required by FastAPI for UploadFile/multipart uploads ---
 python-multipart
 

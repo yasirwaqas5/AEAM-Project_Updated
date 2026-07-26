@@ -57,6 +57,65 @@ class AssetStatus:
     ALL = {PENDING, PROCESSING, INDEXED, STALE, ARCHIVED, DELETED, ERROR}
 
 
+class PolicyStatus:
+    """
+    Lifecycle of an extracted policy (Phase E12, COMPAT-6).
+
+    Deliberately SEPARATE from :class:`AssetStatus`: a policy's lifecycle is
+    a governance decision (is this rule still in force?), not an ingestion
+    lifecycle (has this file been indexed?). Conflating them would make
+    "retired" and "archived" mean the same thing in one vocabulary and
+    different things in another.
+
+    ``ACTIVE`` is the default for every row, including every row that
+    predates this phase, so policy matching is unchanged until an operator
+    deliberately transitions something.
+    """
+    ACTIVE = "active"
+    #: Flagged for human review — still matches, but visibly queued for a
+    #: decision. Matching is unchanged so a review backlog never silently
+    #: degrades investigation quality.
+    PENDING_REVIEW = "pending_review"
+    #: Withdrawn from force. NEVER matches a new investigation. The row is
+    #: retained (not deleted) so historical incidents that cited it stay
+    #: explainable.
+    RETIRED = "retired"
+    ALL = {ACTIVE, PENDING_REVIEW, RETIRED}
+    #: Statuses a policy must hold to participate in matching.
+    MATCHABLE = {ACTIVE, PENDING_REVIEW}
+
+
+class SemanticDocType:
+    """
+    DECLARED semantic document type (Phase E12, MOD-4 / RAG-7).
+
+    Distinct from ``Document.doc_type``, which holds the FORMAT category the
+    upload validator detected ("markdown", "pdf", "docx"). Storing a format
+    where retrieval expects a semantic type is the contract defect this
+    phase fixes: an uploaded runbook could never earn
+    :class:`~aeam.agents.rag.advanced_retrieval.BusinessRelevanceScorer`'s
+    authoritative-source bonus, because its ``doc_type`` said "markdown".
+
+    The values below are the ones the scorer's
+    ``DEFAULT_ACTIONABLE_DOC_TYPES`` allowlist already recognises, plus the
+    non-actionable ones an operator legitimately needs to declare. Declaring
+    a type is always OPTIONAL — an undeclared document falls back to its
+    format exactly as before (COMPAT-1).
+    """
+    RUNBOOK = "runbook"
+    SRE_RUNBOOK = "sre_runbook"
+    INCIDENT_REPORT = "incident_report"
+    POST_MORTEM = "post_mortem"
+    POLICY = "policy"
+    WIKI = "wiki"
+    API_DOC = "api_doc"
+    REFERENCE = "reference"
+    ALL = {
+        RUNBOOK, SRE_RUNBOOK, INCIDENT_REPORT, POST_MORTEM,
+        POLICY, WIKI, API_DOC, REFERENCE,
+    }
+
+
 class JobType:
     INGEST = "ingest"
     REINDEX = "reindex"
@@ -239,7 +298,13 @@ class Document(_Asset):
     doc_id: str = field(default_factory=_new_id)
     source_id: str | None = None
     origin_path: str | None = None
+    #: FORMAT category detected at upload ("markdown", "pdf", …) — NOT a
+    #: semantic type. See ``semantic_type`` below and :class:`SemanticDocType`.
     doc_type: str | None = None
+    #: Phase E12 (MOD-4/RAG-7): the DECLARED semantic type, one of
+    #: :data:`SemanticDocType.ALL`. ``None`` until declared, in which case
+    #: retrieval falls back to ``doc_type`` exactly as it did pre-E12.
+    semantic_type: str | None = None
     current_version: int = 1
     content_hash: str | None = None
     chunk_count: int = 0
@@ -359,10 +424,24 @@ class Policy(_Asset):
     # embedding for those, so behaviour is unchanged until backfilled.
     embedding: list[float] | None = None
     embedding_model: str | None = None
+    # Phase E12 (COMPAT-6): governance lifecycle. Defaults to ACTIVE, which
+    # is precisely the behaviour every pre-E12 row already had, so adopting
+    # the lifecycle changes no investigation's policy matching until an
+    # operator deliberately transitions a policy.
+    status: str = PolicyStatus.ACTIVE
+    status_changed_at: str | None = None
+    status_changed_by: str | None = None
+    status_reason: str | None = None
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "Policy":
         policy = _Asset._base_from_row(cls, row, ("actions", "related_metrics"))
+        # Phase E12: a row written before this phase (or by a path that never
+        # set the column) reads back as ACTIVE — the status it effectively
+        # had. Never None: PolicyRegistry must never have to guess whether an
+        # unstatused policy is in force.
+        if not policy.status:
+            policy.status = PolicyStatus.ACTIVE
         # Decode embedding with a None default so "never computed" (NULL)
         # stays distinguishable from an (invalid) empty vector. A stored
         # vector is a JSON list; NULL/blank stays None.

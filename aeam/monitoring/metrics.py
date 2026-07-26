@@ -223,6 +223,166 @@ Usage::
 """
 
 
+retrieval_chunks_total: Counter = Counter(
+    "retrieval_chunks_total",
+    "Total evidence chunks returned by retrieval, by stage",
+    ["stage"],
+)
+"""
+Counter accumulating retrieval VOLUME (Phase E11) — the third cost axis
+alongside LLM spend and action executions. Published through the SAME
+Prometheus pipeline as every other metric (OBS-1: no second metrics store).
+
+Labels:
+    stage: Where the chunks were counted, e.g. ``"investigation"`` (chunks
+           handed to an incident's RAG evidence stage).
+
+Usage::
+
+    retrieval_chunks_total.labels(stage="investigation").inc(5)
+"""
+
+action_executions_total: Counter = Counter(
+    "action_executions_total",
+    "Total action executions attributed to an investigation, by outcome",
+    ["outcome"],
+)
+"""
+Counter of action executions attributed to an investigation (Phase E11).
+
+Distinct from ``action_success_total``/``action_failure_total``, which
+:class:`~aeam.agents.action.action_agent.ActionAgent` increments per action
+TYPE at the execution boundary. This counter is the cost-surface view: how
+many actions an investigation caused, regardless of which integration ran
+them, so the cost roll-up and the action-outcome metrics never have to be
+reconciled against each other.
+
+Labels:
+    outcome: ``"executed"``, ``"skipped"``, or ``"withheld"`` (held back by
+             the Phase E9 human-approval gate).
+"""
+
+
+class IncidentCostScope:
+    """
+    Per-incident cost accumulator (Phase E11, OBS-2 / EXPL-5).
+
+    E8 gave the platform global LLM token/cost counters. A global counter
+    cannot answer "what did *this* incident cost", which is exactly the
+    question the cost surface must answer. This class is the missing
+    per-incident attribution, and it is deliberately the thinnest thing that
+    works: a thread-local accumulator opened by
+    ``Orchestrator.handle_event`` and read once at finalization.
+
+    Thread-local rather than global because ``handle_event`` is reentrant
+    since Phase E2 — two concurrent investigations must accumulate into
+    separate buckets, exactly as they already keep separate
+    :class:`~aeam.agents.orchestrator.incident_context.IncidentContext`
+    state. Every LLM call an investigation makes happens on that
+    investigation's own thread (RAGAgent/policy extraction/query expansion
+    are all called synchronously from the orchestrator's stack), so the
+    thread is the correct attribution boundary.
+
+    Recording outside any open scope is a silent no-op — a background
+    worker's LLM call is not attributable to an incident, and inventing an
+    attribution for it would be dishonest. Those calls are still counted by
+    the global E8 counters, which is where they belong.
+    """
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def start(self, incident_id: str) -> None:
+        """Open a fresh accumulation scope for ``incident_id`` on this thread."""
+        self._local.scope = {
+            "incident_id": incident_id,
+            "llm_calls": 0,
+            "llm_prompt_tokens": 0,
+            "llm_completion_tokens": 0,
+            "llm_cost_usd": 0.0,
+            "retrieval_chunks": 0,
+            "actions_executed": 0,
+            "actions_skipped": 0,
+            "actions_withheld": 0,
+        }
+
+    def _scope(self) -> dict[str, Any] | None:
+        return getattr(self._local, "scope", None)
+
+    def record_llm(
+        self,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        cost_usd: float = 0.0,
+    ) -> None:
+        """
+        Attribute one LLM call's usage to the open scope.
+
+        Token counts are whatever the provider actually reported — this
+        never estimates. A provider that omits usage data contributes a
+        call with zero tokens, which the cost block discloses rather than
+        filling in with a guess.
+        """
+        scope = self._scope()
+        if scope is None:
+            return
+        scope["llm_calls"] += 1
+        scope["llm_prompt_tokens"] += int(prompt_tokens or 0)
+        scope["llm_completion_tokens"] += int(completion_tokens or 0)
+        scope["llm_cost_usd"] += float(cost_usd or 0.0)
+
+    def record_retrieval(self, chunk_count: int) -> None:
+        """Attribute ``chunk_count`` retrieved evidence chunks to the open scope."""
+        scope = self._scope()
+        if scope is None:
+            return
+        count = max(0, int(chunk_count or 0))
+        scope["retrieval_chunks"] += count
+        if count:
+            retrieval_chunks_total.labels(stage="investigation").inc(count)
+
+    def record_action(self, outcome: str) -> None:
+        """Attribute one action ``outcome`` (executed/skipped/withheld) to the open scope."""
+        scope = self._scope()
+        key = {
+            "executed": "actions_executed",
+            "skipped": "actions_skipped",
+            "withheld": "actions_withheld",
+        }.get(outcome)
+        if key is None:
+            return
+        action_executions_total.labels(outcome=outcome).inc()
+        if scope is None:
+            return
+        scope[key] += 1
+
+    def snapshot(self) -> dict[str, Any] | None:
+        """
+        The open scope's accumulated totals, or ``None`` when no scope is
+        open on this thread. Costs are rounded to 6 decimal places — enough
+        precision for per-1K-token rates without implying invoice accuracy.
+        """
+        scope = self._scope()
+        if scope is None:
+            return None
+        return {
+            **scope,
+            "llm_cost_usd": round(scope["llm_cost_usd"], 6),
+            "llm_total_tokens": scope["llm_prompt_tokens"] + scope["llm_completion_tokens"],
+        }
+
+    def clear(self) -> None:
+        """Close this thread's scope. Safe to call when none is open."""
+        if hasattr(self._local, "scope"):
+            del self._local.scope
+
+
+incident_cost_scope: IncidentCostScope = IncidentCostScope()
+"""Module-level shared :class:`IncidentCostScope` (Phase E11). Import this,
+never construct a second instance — one accumulator, one attribution rule.
+Mirrors the :data:`heartbeat_tracker` singleton pattern above."""
+
+
 class HeartbeatTracker:
     """
     Thread-safe last-seen tracker for autonomous background workers

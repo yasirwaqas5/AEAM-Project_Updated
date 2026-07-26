@@ -114,6 +114,7 @@ from aeam.core.idempotency import IdempotencyManager
 from prometheus_client import generate_latest
 from aeam.monitoring.logging_config import get_logger
 from aeam.monitoring.metrics import heartbeat_tracker
+from aeam.monitoring.tracing import configure_tracing
 
 # API routers
 from aeam.api.incidents import router as incidents_router
@@ -128,6 +129,7 @@ from aeam.api.observability import router as observability_router
 from aeam.api.administration import router as administration_router
 from aeam.api.review import router as review_router
 from aeam.api.auth import router as auth_router
+from aeam.api.audit import router as audit_router
 
 # ---------------------------------------------------------------------------
 # Logging bootstrap
@@ -349,6 +351,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     settings = Settings()  # pyright: ignore[reportCallIssue]
     logger.info("Settings loaded | environment=%r", settings.ENVIRONMENT)
+
+    # Phase E11 (OBS-6): configure OTLP tracing before any investigation can
+    # run. A no-op unless OTEL_TRACING_ENABLED is set with a real endpoint AND
+    # the optional OpenTelemetry SDK is installed — never a startup failure,
+    # because a telemetry backend must not be able to stop the platform.
+    configure_tracing(settings)
 
     container = _build_container(settings)
     app.state.container = container
@@ -1314,6 +1322,7 @@ def create_app() -> FastAPI:
     application.include_router(administration_router)
     application.include_router(review_router)
     application.include_router(auth_router)
+    application.include_router(audit_router)
 
     _register_routes(application)
     _mount_frontend_build(application)

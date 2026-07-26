@@ -30,6 +30,7 @@ import logging
 from aeam.config.settings import Settings
 from aeam.monitoring.metrics import (
     end_timer,
+    incident_cost_scope,
     llm_call_duration_seconds,
     llm_calls_total,
     llm_cost_usd_total,
@@ -183,5 +184,16 @@ class LLMService:
             cost = (prompt_tokens / 1000.0) * prompt_rate + (completion_tokens / 1000.0) * completion_rate
             if cost:
                 llm_cost_usd_total.labels(provider=provider).inc(cost)
+
+            # Phase E11: attribute this call's usage to the investigation that
+            # caused it, when one is in flight on this thread. A no-op outside
+            # an investigation (background/manual calls stay counted only by
+            # the global E8 counters above — inventing an incident attribution
+            # for them would be dishonest).
+            incident_cost_scope.record_llm(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cost_usd=cost,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.debug("LLMService | usage metering skipped: %s", exc)

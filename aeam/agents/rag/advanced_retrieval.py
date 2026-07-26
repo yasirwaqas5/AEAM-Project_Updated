@@ -267,7 +267,20 @@ class BusinessRelevanceScorer:
         doc_type = metadata.get("doc_type")
         if isinstance(doc_type, str) and doc_type.strip().lower() in self._actionable_doc_types:
             bonus += self._doc_type_bonus
-            reasons.append(f"authoritative source (doc_type={doc_type})")
+            # Phase E12 (RAG-7): state WHERE the type came from. A declared
+            # semantic type is an operator's explicit classification; a
+            # format-derived one is the pre-E12 fallback. Both can legitimately
+            # earn the bonus, but an explanation that hides which one applied
+            # would leave the operator unable to tell a classified corpus from
+            # a coincidentally-named one.
+            provenance = (
+                "declared at upload"
+                if metadata.get("semantic_type")
+                else "derived from the document's stored type"
+            )
+            reasons.append(
+                f"authoritative source (doc_type={doc_type}, {provenance})"
+            )
 
         if self._is_recent(metadata.get("date")):
             bonus += self._recency_bonus

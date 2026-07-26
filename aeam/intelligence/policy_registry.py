@@ -14,6 +14,11 @@ Reuses, unmodified:
 - :class:`~aeam.registry.repositories.PolicyRepository` (Phase C2) — the
   registry loads policies straight from the existing ``policies`` table.
   No second policy store, no new schema.
+  Phase E12 (COMPAT-6): the load is now ``list_matchable()`` rather than
+  ``list_all()``, so a **RETIRED policy never matches a new investigation**.
+  The filter lives in SQL, and a policy with no recorded status reads back as
+  ACTIVE — so every policy that matched before this phase still matches,
+  until an operator deliberately retires it.
 - :class:`~aeam.agents.kpi.rule_engine.RuleEngine` — read-only, exactly the
   same "construct a fresh instance, read ``loaded_domains``" pattern already
   used by ``aeam/api/data_center.py``'s dataset-profile endpoint. Used ONLY
@@ -155,8 +160,23 @@ class PolicyRegistry:
         """
         k = max(1, int(top_k or self._top_k))
 
+        # Phase E12 (COMPAT-6): load only policies whose lifecycle status
+        # permits matching — a RETIRED policy never matches a new
+        # investigation. Filtered in SQL so a large retired corpus costs
+        # nothing per incident. Rows predating the lifecycle read back as
+        # ACTIVE, so behaviour is unchanged until an operator retires
+        # something deliberately.
+        #
+        # The method is resolved BEFORE the try block so that a repository
+        # without it (an older duck-typed double) falls back to the pre-E12
+        # read, while a repository that HAS it and then fails still lands in
+        # the same never-break-the-investigation handler below.
+        load_policies = getattr(self._policies, "list_matchable", None)
+        if load_policies is None:
+            load_policies = self._policies.list_all
+
         try:
-            policies = self._policies.list_all()
+            policies = load_policies()
         except Exception as exc:  # noqa: BLE001
             logger.error("PolicyRegistry | failed to load policies: %s", exc)
             return []
@@ -256,6 +276,11 @@ class PolicyRegistry:
             "priority": policy.priority,
             "related_metrics": policy.related_metrics,
             "match_reason": reason,
+            # Phase E12: the lifecycle status the policy held when it matched,
+            # so an investigation's evidence trail records that a
+            # pending-review policy contributed — visible in the console
+            # rather than silently indistinguishable from a fully active one.
+            "status": getattr(policy, "status", None),
         }
         if similarity is not None:
             match["similarity"] = similarity

@@ -1,8 +1,10 @@
 import { useState, useEffect, useCallback, useMemo, lazy, Suspense } from "react";
 import { Link } from "react-router-dom";
-import { PageHeader, Badge, Button, fmtRelative, getMemoryMatches, getMemoryData } from "../components/ui";
+import { PageHeader, Badge, Button, Modal, Icon, fmtRelative, getMemoryMatches, getMemoryData } from "../components/ui";
 import { PageContainer, Panel, DataTable, MetricCard, EmptyState, LoadingState, ErrorState } from "../components/library";
 import { CountUp } from "../components/charts";
+import { useAuth } from "../layout/AuthProvider";
+import { useToast } from "../layout/ToastHost";
 
 const NodeGraph = lazy(() => import("../components/three/NodeGraph"));
 
@@ -18,11 +20,144 @@ const NodeGraph = lazy(() => import("../components/three/NodeGraph"));
  * (listed honestly below).
  * ────────────────────────────────────────────────────────────────────────── */
 
+/* ─── Phase E12 (MEM-4): memory curation ────────────────────────────────────
+ * Organizational memory had no correction path: a memory recorded from a
+ * wrong root cause kept surfacing as evidence in every future investigation,
+ * with no way to withdraw or fix it. This modal is that path.
+ *
+ * Both operations REQUIRE a reason — the control will not submit without one,
+ * because an unattributed, unexplained deletion from an audited store is
+ * exactly what MEM-4 exists to prevent. The acting principal comes from the
+ * session, server-side; nothing here can spoof it.
+ * ────────────────────────────────────────────────────────────────────────── */
+function CurateMemoryModal({ incidentId, currentRootCause, onClose, onDone }) {
+  const [mode, setMode] = useState("correct");   // 'correct' | 'expunge'
+  const [rootCause, setRootCause] = useState(currentRootCause || "");
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const toast = useToast();
+
+  async function submit() {
+    if (!reason.trim()) {
+      setError("A reason is required — memory corrections are never unexplained.");
+      return;
+    }
+    if (mode === "correct" && !rootCause.trim()) {
+      setError("Enter the corrected root cause.");
+      return;
+    }
+    setBusy(true); setError(null);
+    try {
+      const path = mode === "expunge"
+        ? "/api/v1/knowledge/curate/memory/expunge"
+        : "/api/v1/knowledge/curate/memory/correct";
+      const body = mode === "expunge"
+        ? { incident_id: incidentId, reason: reason.trim() }
+        : { incident_id: incidentId, corrections: { root_cause: rootCause.trim() }, reason: reason.trim() };
+
+      const res = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail.detail || `HTTP ${res.status}`);
+      }
+      toast.success(
+        mode === "expunge" ? "Memory withdrawn" : "Memory corrected",
+        mode === "expunge"
+          ? "This incident no longer surfaces as evidence in new investigations."
+          : "Re-embedded from the corrected text, so recall now matches the corrected wording.",
+      );
+      onDone?.();
+      onClose();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal title="Curate organizational memory" icon="shield" onClose={onClose} maxWidth={560}>
+      <div style={{ display: "flex", flexDirection: "column", gap: "0.9rem" }}>
+        <div style={{ fontSize: "0.7rem", color: "var(--muted)", fontFamily: "var(--font-mono)" }}>
+          incident {incidentId}
+        </div>
+
+        <div style={{ display: "flex", gap: "0.4rem" }}>
+          {[["correct", "Correct"], ["expunge", "Withdraw"]].map(([key, label]) => (
+            <button key={key} type="button" onClick={() => { setMode(key); setError(null); }} style={{
+              fontSize: "0.7rem", letterSpacing: "0.06em", textTransform: "uppercase",
+              background: mode === key ? "var(--accent-dim)" : "none",
+              border: `1px solid ${mode === key ? "var(--accent-border)" : "var(--border)"}`,
+              color: mode === key ? "var(--accent)" : "var(--muted)",
+              borderRadius: 6, padding: "0.32rem 0.75rem", cursor: "pointer",
+            }}>{label}</button>
+          ))}
+        </div>
+
+        <p style={{ fontSize: "0.68rem", color: "var(--muted)", lineHeight: 1.5 }}>
+          {mode === "correct"
+            ? "The memory is rewritten and re-embedded from the corrected text — not merely relabelled — so future recall matches the corrected wording rather than the original. The correction is stored with the entry, so anyone who recalls it later can see it was corrected, by whom, and why."
+            : "The memory is permanently removed from recall. Future investigations will not surface this incident as evidence. The incident record itself is untouched — only its organizational-memory entry is withdrawn."}
+        </p>
+
+        {mode === "correct" && (
+          <label style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
+            <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>
+              Corrected root cause
+            </span>
+            <textarea value={rootCause} onChange={(e) => setRootCause(e.target.value)} rows={2}
+              style={{
+                width: "100%", resize: "vertical", fontSize: "var(--fs-xs)",
+                background: "var(--surface-2)", color: "var(--text)",
+                border: "1px solid var(--border)", borderRadius: "var(--r-md)", padding: "var(--sp-2)",
+              }} />
+          </label>
+        )}
+
+        <label style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
+          <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>
+            Reason (required)
+          </span>
+          <textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={3}
+            placeholder="Why is this memory being changed? Recorded verbatim in the audit trail with your identity."
+            style={{
+              width: "100%", resize: "vertical", fontSize: "var(--fs-xs)",
+              background: "var(--surface-2)", color: "var(--text)",
+              border: "1px solid var(--border)", borderRadius: "var(--r-md)", padding: "var(--sp-2)",
+            }} />
+        </label>
+
+        {error && (
+          <div role="alert" style={{ color: "var(--err)", fontSize: "0.7rem", display: "flex", gap: "0.4rem", alignItems: "center" }}>
+            <Icon name="alert" size={12} color="var(--err)" /> {error}
+          </div>
+        )}
+
+        <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end" }}>
+          <Button onClick={onClose} disabled={busy}>Cancel</Button>
+          <Button variant="primary" onClick={submit} disabled={busy}>
+            {busy ? "Working…" : mode === "expunge" ? "Withdraw memory" : "Apply correction"}
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 export default function Memory() {
   const [incidents, setIncidents] = useState([]);
   const [obs, setObs] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  // Phase E12: the memory entry currently being curated, if any.
+  const [curating, setCurating] = useState(null);
+  const { hasPermission } = useAuth();
+  const canCurate = hasPermission("admin", "config");
 
   const load = useCallback(async () => {
     setLoading(true); setError(null);
@@ -171,10 +306,34 @@ export default function Memory() {
                     ? <Badge label={r.resolution_status} color={r.resolution_status === "RESOLVED" ? "var(--ok)" : "var(--warn)"} />
                     : "—",
                 },
+                // Phase E12 (MEM-4): the correction path. Only rendered for a
+                // session holding admin:config — the backend enforces that
+                // regardless; hiding it just avoids offering a 403.
+                ...(canCurate ? [{
+                  key: "curate", label: "Curate",
+                  render: (r) => (
+                    <Button size="sm" icon="shield"
+                      title="Correct or withdraw this memory"
+                      onClick={() => setCurating({
+                        incidentId: r.recalled_id, rootCause: r.past_root_cause,
+                      })}>
+                      Curate
+                    </Button>
+                  ),
+                }] : []),
               ]}
               rows={recalls}
             />
           </Panel>
+
+          {curating && (
+            <CurateMemoryModal
+              incidentId={curating.incidentId}
+              currentRootCause={curating.rootCause}
+              onClose={() => setCurating(null)}
+              onDone={load}
+            />
+          )}
 
           {recalls.length === 0 && consultedCount > 0 && (
             <div style={{ marginTop: "1rem" }}>
@@ -187,6 +346,9 @@ export default function Memory() {
             Direct browsing of the underlying vector collection (aeam_incident_memories) requires a
             dedicated backend endpoint that does not exist yet — everything above is real recall
             activity read from persisted investigations.
+            {canCurate
+              ? " Memory entries surfaced above can be corrected or withdrawn; every curation records who acted, why, and when in the audit trail."
+              : " Correcting or withdrawing a memory entry is an administrator action and is not available to your role."}
           </p>
         </>
       )}

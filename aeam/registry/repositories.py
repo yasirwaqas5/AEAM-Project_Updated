@@ -28,6 +28,7 @@ from aeam.registry.models import (
     JobStatus,
     ParentType,
     Policy,
+    PolicyStatus,
     ReviewVerdict,
     Schema,
     Source,
@@ -273,6 +274,72 @@ class PolicyRepository(BaseRepository):
 
     def list_by_document(self, doc_id: str) -> list[Policy]:
         return self._query("doc_id = :doc_id", {"doc_id": doc_id})
+
+    # ---- Phase E12: policy lifecycle (COMPAT-6, SEC-7) -----------------
+
+    def list_matchable(self) -> list[Policy]:
+        """
+        Every policy eligible to match an investigation.
+
+        Excludes RETIRED policies at the DATABASE, not in Python, so a large
+        retired corpus costs nothing per investigation. Rows written before
+        this phase have ``status`` NULL and are treated as matchable — that
+        is the behaviour they already had, and the E12 migration backfills
+        them to ``'active'`` anyway (COMPAT-6).
+        """
+        placeholders = ", ".join(f":s{i}" for i in range(len(PolicyStatus.MATCHABLE)))
+        params = {f"s{i}": s for i, s in enumerate(sorted(PolicyStatus.MATCHABLE))}
+        return self._query(
+            f"status IS NULL OR status IN ({placeholders})", params
+        )
+
+    def list_by_status(self, status: str) -> list[Policy]:
+        """Policies in exactly ``status`` (the Knowledge Center's filter)."""
+        return self._query("status = :s", {"s": status})
+
+    def set_status(
+        self,
+        policy_id: str,
+        status: str,
+        *,
+        changed_by: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """
+        Transition one policy's lifecycle status, recording attribution.
+
+        ``changed_by``/``reason`` are stored verbatim so the row itself
+        answers "who retired this policy, and why" without a join to the
+        audit trail — the audit record written alongside by the API layer is
+        the tamper-evident copy, this is the queryable one.
+
+        Raises:
+            ValueError: If ``status`` is not a member of
+                        :data:`~aeam.registry.models.PolicyStatus.ALL`.
+        """
+        if status not in PolicyStatus.ALL:
+            raise ValueError(
+                f"invalid policy status {status!r}; must be one of {sorted(PolicyStatus.ALL)}."
+            )
+        self.update(policy_id, {
+            "status": status,
+            "status_changed_at": _now_iso(),
+            "status_changed_by": changed_by,
+            "status_reason": reason,
+        })
+
+    def count_by_status(self) -> dict[str, int]:
+        """``{status: count}`` across the whole policy corpus, aggregated in SQL."""
+        rows = self._db.fetch_all(
+            "SELECT status, COUNT(*) AS n FROM policies GROUP BY status", {}
+        )
+        counts: dict[str, int] = {}
+        for row in rows:
+            # NULL status (pre-E12 rows) reports under 'active', matching how
+            # from_row() and list_matchable() already treat it.
+            key = row.get("status") or PolicyStatus.ACTIVE
+            counts[key] = counts.get(key, 0) + int(row.get("n") or 0)
+        return counts
 
 
 # ---------------------------------------------------------------------------

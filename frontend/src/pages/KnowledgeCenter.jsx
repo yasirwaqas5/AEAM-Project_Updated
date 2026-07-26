@@ -2,6 +2,10 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { Link } from "react-router-dom";
 import { PageHeader, Badge, Modal, Field, Skeleton, Button, Icon, fmtTime, fmtRelative } from "../components/ui";
 import { PageContainer, MetricCard, Panel, DataTable, LoadingState, ErrorState, EmptyState } from "../components/library";
+import { useAuth } from "../layout/AuthProvider";
+import {
+  POLICY_STATUSES, SEMANTIC_DOC_TYPES, AUTHORITATIVE_DOC_TYPES, policyStatusMeta,
+} from "../lib/governance";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * pages/KnowledgeCenter.jsx  (Enterprise Knowledge Center)
@@ -52,6 +56,25 @@ const reindexDocument = (id) => fetchJSON(`/api/v1/knowledge/documents/${id}/rei
 export const reindexDataset = (id) => fetchJSON(`/api/v1/knowledge/datasets/${id}/reindex`, { method: "POST" });
 const deleteDocument = (id, purge) =>
   fetchJSON(`/api/v1/knowledge/documents/${id}${purge ? "?purge=true" : ""}`, { method: "DELETE" });
+
+/* Phase E12 — knowledge governance writes. All live under /curate, which the
+ * security middleware guards with admin:config; a non-admin session never
+ * sees the controls that call them (and would get a 403 if it did). */
+const setPolicyStatus = (policyId, status, reason) =>
+  fetchJSON(`/api/v1/knowledge/curate/policies/${policyId}/status`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status, reason }),
+  });
+const setDocumentSemanticType = (docId, semanticType) =>
+  fetchJSON(
+    `/api/v1/knowledge/curate/documents/${docId}/semantic-type?semantic_type=${encodeURIComponent(semanticType)}`,
+    { method: "POST" },
+  );
+
+/* Lifecycle + semantic-type vocabularies live in lib/governance.js — one
+ * definition, shared with any other page that needs them and pinned against
+ * their backend counterparts by the frontend test suite. */
 export const deleteDataset = (id, purge) =>
   fetchJSON(`/api/v1/knowledge/datasets/${id}${purge ? "?purge=true" : ""}`, { method: "DELETE" });
 
@@ -365,6 +388,200 @@ export function PreviewPanel({ kind, id }) {
 // distinct kind of artifact (condition/actions/department/etc.), not raw
 // document text.
 
+/* Phase E12 — the lifecycle control for one policy.
+ *
+ * A transition always requires a reason; the control refuses to submit
+ * without one rather than sending a blank string the backend would reject,
+ * so the operator sees why nothing happened. Only rendered for a session
+ * holding admin:config — the backend enforces that regardless, this just
+ * avoids showing a button that would 403. */
+function PolicyLifecycleControl({ policy, onChanged }) {
+  const { hasPermission } = useAuth();
+  const [open, setOpen] = useState(false);
+  const [target, setTarget] = useState(policy.status || "active");
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  const current = policyStatusMeta(policy.status);
+  const canCurate = hasPermission("admin", "config");
+
+  async function submit() {
+    if (!reason.trim()) { setError("A reason is required — governance changes are never unexplained."); return; }
+    setBusy(true); setError(null);
+    try {
+      await setPolicyStatus(policy.policy_id, target, reason.trim());
+      setOpen(false); setReason("");
+      onChanged?.();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <span style={{ display: "inline-flex", alignItems: "center", gap: "0.4rem" }}>
+        <Badge label={current.label} color={current.color} />
+        {policy.matchable === false && (
+          <span style={{ fontSize: "0.62rem", color: "var(--muted)" }} title={current.hint}>
+            never matches new investigations
+          </span>
+        )}
+        {canCurate && (
+          <Button size="sm" icon="shield" onClick={() => { setTarget(policy.status || "active"); setOpen(true); }}>
+            Change
+          </Button>
+        )}
+      </span>
+
+      {open && (
+        <Modal title="Change policy lifecycle status" icon="shield" onClose={() => setOpen(false)} maxWidth={520}>
+          <div style={{ display: "flex", flexDirection: "column", gap: "0.9rem" }}>
+            <div style={{ fontSize: "0.76rem", color: "var(--muted)", fontStyle: "italic", lineHeight: 1.45 }}>
+              "{policy.business_rule || policy.raw_text}"
+            </div>
+
+            <div>
+              <div style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)", marginBottom: "0.4rem" }}>
+                New status
+              </div>
+              {POLICY_STATUSES.map((s) => (
+                <label key={s.value} style={{
+                  display: "flex", gap: "0.5rem", alignItems: "flex-start",
+                  padding: "0.45rem 0.55rem", borderRadius: 8, cursor: "pointer",
+                  border: `1px solid ${target === s.value ? "var(--accent-border)" : "var(--border)"}`,
+                  background: target === s.value ? "var(--accent-dim)" : "transparent",
+                  marginBottom: "0.35rem",
+                }}>
+                  <input type="radio" name="policy-status" value={s.value}
+                    checked={target === s.value} onChange={() => setTarget(s.value)}
+                    style={{ marginTop: "0.2rem" }} />
+                  <span>
+                    <span style={{ fontSize: "0.78rem", color: "var(--text)", fontWeight: 600 }}>{s.label}</span>
+                    <span style={{ display: "block", fontSize: "0.66rem", color: "var(--muted)", lineHeight: 1.45 }}>{s.hint}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+
+            <label style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
+              <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>
+                Reason (required)
+              </span>
+              <textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={3}
+                placeholder="Why is this policy changing status? Recorded verbatim in the audit trail."
+                style={{
+                  width: "100%", resize: "vertical", fontSize: "var(--fs-xs)",
+                  background: "var(--surface-2)", color: "var(--text)",
+                  border: "1px solid var(--border)", borderRadius: "var(--r-md)", padding: "var(--sp-2)",
+                }} />
+            </label>
+
+            {error && (
+              <div role="alert" style={{ color: "var(--err)", fontSize: "0.7rem", display: "flex", gap: "0.4rem", alignItems: "center" }}>
+                <Icon name="alert" size={12} color="var(--err)" /> {error}
+              </div>
+            )}
+
+            <div style={{ display: "flex", gap: "0.5rem", justifyContent: "flex-end" }}>
+              <Button onClick={() => setOpen(false)} disabled={busy}>Cancel</Button>
+              <Button variant="primary" onClick={submit} disabled={busy}>
+                {busy ? "Saving…" : "Apply"}
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </>
+  );
+}
+
+/* Phase E12 — declare a document's SEMANTIC type, distinct from its format.
+ *
+ * Before this phase the upload path stored the format ("markdown") where
+ * retrieval expects a semantic type, so an uploaded runbook could never earn
+ * the authoritative-source bonus. This control is how an operator fixes that
+ * for an already-ingested corpus. It states plainly that the change reaches
+ * retrieval on the next re-index, rather than implying an immediacy it does
+ * not have. */
+function SemanticTypeControl({ doc, onChanged }) {
+  const { hasPermission } = useAuth();
+  const [value, setValue] = useState(doc.semantic_type || "");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+
+  const canCurate = hasPermission("admin", "config");
+  const declared = doc.semantic_type;
+  const authoritative = declared && AUTHORITATIVE_DOC_TYPES.has(declared);
+
+  async function submit() {
+    if (!value) { setError("Choose a semantic type."); return; }
+    setBusy(true); setError(null); setResult(null);
+    try {
+      const body = await setDocumentSemanticType(doc.doc_id, value);
+      setResult(body);
+      onChanged?.();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div style={{ border: "1px solid var(--border)", borderRadius: 10, padding: "0.75rem 0.9rem" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "0.5rem" }}>
+        <span style={{ fontSize: "0.62rem", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>
+          Semantic Type — how retrieval classifies this document
+        </span>
+        {declared
+          ? <Badge label={declared} color={authoritative ? "var(--ok)" : "var(--muted)"} />
+          : <Badge label="not declared" color="var(--warn)" />}
+      </div>
+
+      <p style={{ fontSize: "0.68rem", color: "var(--muted)", lineHeight: 1.5, marginTop: "0.4rem" }}>
+        {declared
+          ? (authoritative
+            ? "Declared as an authoritative source — chunks from this document receive the business-relevance bonus during retrieval, with the reason recorded on every ranked result."
+            : "Declared, but not an authoritative type — no retrieval bonus applies. That is correct for reference material.")
+          : "No semantic type declared, so retrieval falls back to this document's file format. A runbook stored only as “markdown” never earns the authoritative-source bonus — declare its type to fix that."}
+      </p>
+
+      {canCurate && (
+        <div style={{ display: "flex", gap: "0.5rem", alignItems: "center", marginTop: "0.5rem", flexWrap: "wrap" }}>
+          <select value={value} onChange={(e) => setValue(e.target.value)}
+            aria-label="Semantic document type"
+            style={{
+              fontSize: "var(--fs-xs)", background: "var(--surface-2)", color: "var(--text)",
+              border: "1px solid var(--border)", borderRadius: "var(--r-sm)", padding: "0.32rem 0.5rem",
+            }}>
+            <option value="">— choose —</option>
+            {SEMANTIC_DOC_TYPES.map((t) => (
+              <option key={t} value={t}>{t}{AUTHORITATIVE_DOC_TYPES.has(t) ? " (authoritative)" : ""}</option>
+            ))}
+          </select>
+          <Button size="sm" icon="shield" onClick={submit} disabled={busy}>
+            {busy ? "Saving…" : "Declare"}
+          </Button>
+        </div>
+      )}
+
+      {error && (
+        <div role="alert" style={{ color: "var(--err)", fontSize: "0.7rem", marginTop: "0.4rem" }}>{error}</div>
+      )}
+      {result && (
+        <div style={{ color: "var(--warn)", fontSize: "0.68rem", marginTop: "0.4rem", display: "flex", gap: "0.4rem", alignItems: "flex-start" }}>
+          <Icon name="alert" size={11} color="var(--warn)" style={{ marginTop: "0.15rem", flexShrink: 0 }} />
+          <span>Takes effect {result.takes_effect}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function PolicyPanel({ id }) {
   const [state, setState] = useState({ loading: true, error: null, data: null });
 
@@ -400,9 +617,13 @@ export function PolicyPanel({ id }) {
           background: "rgba(255,255,255,0.015)", padding: "0.85rem 1rem",
           display: "flex", flexDirection: "column", gap: "0.6rem",
         }}>
-          {p.business_rule && (
-            <div style={{ fontSize: "0.82rem", color: "var(--text)", fontWeight: 600 }}>{p.business_rule}</div>
-          )}
+          <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "0.6rem", flexWrap: "wrap" }}>
+            {p.business_rule && (
+              <div style={{ fontSize: "0.82rem", color: "var(--text)", fontWeight: 600, flex: 1, minWidth: 200 }}>{p.business_rule}</div>
+            )}
+            {/* Phase E12: lifecycle status + the privileged transition control. */}
+            <PolicyLifecycleControl policy={p} onChanged={load} />
+          </div>
           <div style={{ fontSize: "0.76rem", color: "var(--muted)", fontStyle: "italic", lineHeight: 1.45 }}>
             "{p.raw_text}"
           </div>
@@ -420,10 +641,19 @@ export function PolicyPanel({ id }) {
             } />} />}
             {p.related_metrics?.length > 0 && <Field label="Related Metrics" value={p.related_metrics.join(", ")} mono />}
           </div>
-          <div style={{ display: "flex", gap: "1rem", fontSize: "0.66rem", color: "var(--muted)", paddingTop: "0.4rem", borderTop: "1px solid var(--border)" }}>
+          <div style={{ display: "flex", gap: "1rem", fontSize: "0.66rem", color: "var(--muted)", paddingTop: "0.4rem", borderTop: "1px solid var(--border)", flexWrap: "wrap" }}>
             <span>Source: {p.source_document || "—"}</span>
             {p.source_chunk && <span title={p.source_chunk}>Chunk: {p.source_chunk.slice(0, 12)}…</span>}
             <span>{fmtTime(p.extracted_at)}</span>
+            {/* Phase E12: who changed this policy's status, when, and why —
+                shown inline so the governance history is visible without
+                cross-referencing the audit trail. */}
+            {p.status_changed_by && (
+              <span title={p.status_reason || undefined}>
+                Status set by {p.status_changed_by} {fmtRelative(p.status_changed_at)}
+                {p.status_reason ? ` — "${p.status_reason}"` : ""}
+              </span>
+            )}
           </div>
         </div>
       ))}
@@ -521,6 +751,14 @@ function DetailModal({ kind, id, onClose, onChanged }) {
                 <Field label="Content Hash" value={state.data.active_version?.content_hash || state.data.content_hash}
                   mono title={state.data.active_version?.content_hash || state.data.content_hash} />
               </div>
+
+              {/* Phase E12 (MOD-4/RAG-7): the DECLARED semantic type, shown
+                  and editable separately from the file format above. This is
+                  what decides whether retrieval treats the document as an
+                  authoritative source. */}
+              {kind === "document" && (
+                <SemanticTypeControl doc={state.data} onChanged={load} />
+              )}
 
               {kind === "dataset" && state.data.schema && (
                 <div>

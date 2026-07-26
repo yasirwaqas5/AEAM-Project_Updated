@@ -26,7 +26,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from aeam.ingestion.validation import IngestValidationError, validate_upload
@@ -38,6 +38,7 @@ from aeam.registry.models import (
     JobStatus,
     JobType,
     ParentType,
+    SemanticDocType,
     Source,
     SourceKind,
     SourceStatus,
@@ -94,6 +95,7 @@ def _get_or_create_document(
     category: str,
     content_hash: str,
     blob_uri: str,
+    semantic_type: str | None = None,
 ) -> tuple[str, bool]:
     """
     Return ``(doc_id, created)`` for the document backing this upload.
@@ -106,9 +108,25 @@ def _get_or_create_document(
     A brand-new document is created ``pending`` together with its first active
     Version (``version=1``), which records the BlobStore URI of the original.
     The background worker/processor advances it to ``processing`` → ``indexed``.
+
+    Phase E12 (MOD-4/RAG-7): ``category`` is the FORMAT the validator detected
+    and continues to be stored in ``doc_type``, unchanged. ``semantic_type``
+    is the separately-DECLARED semantic type ("runbook", "incident_report",
+    …) that retrieval's authoritative-source bonus actually needs. When an
+    identical-bytes document already exists and this upload declares a
+    semantic type the stored row lacks, the declaration is recorded on the
+    existing row — re-uploading a file specifically to classify it is a
+    reasonable thing to do, and silently discarding the declaration would be
+    the same defect this phase fixes.
     """
     existing = doc_repo.get_by_content_hash(content_hash)
     if existing is not None:
+        if semantic_type and not existing.semantic_type:
+            doc_repo.update(existing.doc_id, {"semantic_type": semantic_type})
+            logger.info(
+                "upload_file | recorded declared semantic_type=%r on existing doc_id=%s",
+                semantic_type, existing.doc_id,
+            )
         return existing.doc_id, False
 
     doc_id = doc_repo.create(
@@ -117,6 +135,7 @@ def _get_or_create_document(
             source_id=source_id,
             origin_path=filename,
             doc_type=category,
+            semantic_type=semantic_type,
             content_hash=content_hash,
             status=AssetStatus.PENDING,
         )
@@ -240,7 +259,22 @@ def _asset_id_keys(parent_type: str | None, parent_id: str | None) -> dict[str, 
     summary="Upload a file and create an ingestion job",
     response_description="The created (or reused) ingestion job.",
 )
-async def upload_file(request: Request, file: UploadFile = File(...)) -> JSONResponse:
+async def upload_file(
+    request: Request,
+    file: UploadFile = File(...),
+    doc_type: str | None = Form(
+        default=None,
+        description=(
+            "Phase E12 (MOD-4/RAG-7): OPTIONAL declared SEMANTIC document "
+            "type — one of SemanticDocType.ALL (e.g. 'runbook', "
+            "'incident_report', 'post_mortem'). Distinct from the file "
+            "FORMAT, which is detected from the upload and stored separately. "
+            "Declaring 'runbook' is what lets the document earn retrieval's "
+            "authoritative-source bonus; omitting it preserves the exact "
+            "pre-E12 behaviour."
+        ),
+    ),
+) -> JSONResponse:
     """
     Validate, store, and register an uploaded file for later processing.
 
@@ -263,6 +297,25 @@ async def upload_file(request: Request, file: UploadFile = File(...)) -> JSONRes
     """
     container = request.app.state.container
     data = await file.read()
+
+    # Phase E12: validate the DECLARED semantic type against the closed
+    # vocabulary before anything is stored. An unrecognised value is rejected
+    # rather than persisted, because a typo'd 'runbok' would silently fail to
+    # earn the very bonus the declaration exists to grant.
+    semantic_type: str | None = None
+    if doc_type is not None and doc_type.strip():
+        semantic_type = doc_type.strip().lower()
+        if semantic_type not in SemanticDocType.ALL:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "reason": "unsupported_doc_type",
+                    "detail": (
+                        f"doc_type {doc_type!r} is not a recognised semantic document "
+                        f"type. Must be one of {sorted(SemanticDocType.ALL)}."
+                    ),
+                },
+            )
 
     try:
         category = validate_upload(file.filename, file.content_type, len(data))
@@ -322,6 +375,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)) -> JSONRes
             category=category,
             content_hash=blob_ref.content_hash,
             blob_uri=blob_ref.uri,
+            semantic_type=semantic_type,
         )
 
     job = IngestionJob(
@@ -354,6 +408,10 @@ async def upload_file(request: Request, file: UploadFile = File(...)) -> JSONRes
         "blob_uri": blob_ref.uri,
         "filename": file.filename,
         "category": category,
+        # Phase E12: echo back what was DECLARED (None when nothing was), so
+        # the caller can see whether the classification landed rather than
+        # having to re-fetch the document to find out.
+        "semantic_type": semantic_type,
     })
 
 

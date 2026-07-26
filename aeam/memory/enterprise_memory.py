@@ -185,6 +185,17 @@ class EnterpriseMemoryEngine:
             if value is not None:
                 metadata[key] = value
 
+        # Phase E12 (MEM-4): when this write is a CORRECTION rewrite, carry the
+        # correction provenance into the stored memory so a future
+        # investigation that recalls it can see it was corrected, by whom, and
+        # why — a corrected memory that looks identical to an original one
+        # would hide exactly the fact an auditor needs.
+        provenance = incident.get("_correction_provenance")
+        if isinstance(provenance, dict) and provenance:
+            for key, value in provenance.items():
+                if value is not None:
+                    metadata[key] = value
+
         try:
             result = self._ingest.ingest_document(text=text, metadata=metadata)
         except Exception as exc:  # noqa: BLE001
@@ -292,6 +303,290 @@ class EnterpriseMemoryEngine:
                 break
 
         return matches
+
+    # ------------------------------------------------------------------
+    # Curation path — Phase E12 (MEM-4)
+    # ------------------------------------------------------------------
+
+    def expunge_incident_memory(
+        self,
+        incident_id: str,
+        *,
+        reason: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        """
+        Permanently remove one incident's memory from recall (MEM-4).
+
+        Before this phase organizational memory had no correction path: a
+        memory recorded from a wrong root cause kept surfacing as evidence in
+        every future investigation, with no way to withdraw it short of
+        deleting Qdrant points by hand. MEM-4 requires a correction path;
+        this is the destructive half of it.
+
+        Uses the SAME Qdrant client the ingestion pipeline already holds
+        (``IngestionPipeline._qdrant``) with a payload filter on
+        ``incident_id`` — the field :meth:`remember_incident` already writes
+        into every point's payload. No new client, no new collection, no
+        second delete mechanism.
+
+        ``reason`` and ``actor`` are REQUIRED, not optional: an unattributed,
+        unexplained deletion from an audited store is exactly the thing MEM-4
+        exists to prevent. The caller (the curation API) writes the
+        tamper-evident audit record; this method returns the facts that
+        record needs and refuses to act without them.
+
+        Args:
+            incident_id: The incident whose memory should be withdrawn.
+            reason:      Why it is being withdrawn. Recorded verbatim.
+            actor:       The acting principal.
+
+        Returns:
+            ``{"expunged": bool, "incident_id": str, "points_deleted": int|None,
+            "reason": str, "actor": str, "expunged_at": str}``.
+            ``points_deleted`` is ``None`` when Qdrant does not report a
+            count — reported honestly as unknown rather than guessed.
+
+        Raises:
+            ValueError: If ``incident_id``, ``reason``, or ``actor`` is blank.
+            RuntimeError: If the delete fails. Unlike the write path (where a
+                          failure must never break finalization), a curation
+                          failure MUST surface: silently reporting success
+                          would leave a withdrawn memory still recallable.
+        """
+        incident_id, reason, actor = self._require_curation_args(incident_id, reason, actor)
+
+        try:
+            from qdrant_client.http import models as qmodels
+
+            result = self._ingest._qdrant.delete(
+                collection_name=self._ingest.collection,
+                points_selector=qmodels.FilterSelector(
+                    filter=qmodels.Filter(
+                        must=[
+                            qmodels.FieldCondition(
+                                key="incident_id",
+                                match=qmodels.MatchValue(value=incident_id),
+                            )
+                        ]
+                    )
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "expunge_incident_memory | FAILED | incident_id=%s | actor=%s | error=%s",
+                incident_id, actor, exc,
+            )
+            raise RuntimeError(
+                f"Failed to expunge memory for incident {incident_id!r}: {exc}"
+            ) from exc
+
+        record = {
+            "expunged": True,
+            "incident_id": incident_id,
+            # Qdrant's delete-by-filter acknowledges the operation but does
+            # not report how many points it removed. `None` says "not
+            # reported"; inventing a count would be a fabricated fact in an
+            # audited record.
+            "points_deleted": None,
+            "operation_id": getattr(result, "operation_id", None),
+            "reason": reason,
+            "actor": actor,
+            "expunged_at": datetime.now(tz=timezone.utc).isoformat(),
+            "collection": self._ingest.collection,
+        }
+        logger.info(
+            "expunge_incident_memory | SUCCESS | incident_id=%s | actor=%s | reason=%s",
+            incident_id, actor, reason,
+        )
+        return record
+
+    def correct_incident_memory(
+        self,
+        incident_id: str,
+        corrections: dict[str, Any],
+        *,
+        reason: str,
+        actor: str,
+    ) -> dict[str, Any]:
+        """
+        Replace one incident's memory with a corrected version (MEM-4).
+
+        The non-destructive half of the correction path. Implemented as
+        expunge-then-rewrite rather than an in-place payload patch, because
+        the memory's EMBEDDING is derived from the same text as its metadata:
+        patching ``root_cause`` in the payload without re-embedding would
+        leave a memory that recalls on its old, wrong text while displaying
+        its corrected one — a subtler dishonesty than not correcting at all.
+
+        The rewritten memory carries the correction provenance in its own
+        metadata (``corrected``/``corrected_by``/``corrected_at``/
+        ``correction_reason``), so a future investigation that recalls it can
+        see it was corrected, by whom, and why.
+
+        Args:
+            incident_id: The incident whose memory is being corrected.
+            corrections: Field overrides applied on top of the existing
+                         memory, e.g. ``{"root_cause": "…"}``. Only the
+                         recognised :meth:`remember_incident` keys are used;
+                         anything else is ignored rather than silently
+                         written into a shape nothing reads.
+            reason:      Why the correction is being made. Recorded verbatim.
+            actor:       The acting principal.
+
+        Returns:
+            ``{"corrected": True, "incident_id": …, "fields_corrected": [...],
+            "previous": {...}, "reason": …, "actor": …, "corrected_at": …}``.
+
+        Raises:
+            ValueError:   If required arguments are blank, or ``corrections``
+                          is empty (a correction that corrects nothing is a
+                          caller bug, not a no-op to swallow).
+            LookupError:  If no memory exists for ``incident_id`` — there is
+                          nothing to correct, and creating one here would
+                          fabricate organizational memory.
+            RuntimeError: If the rewrite fails.
+        """
+        incident_id, reason, actor = self._require_curation_args(incident_id, reason, actor)
+        if not corrections:
+            raise ValueError("corrections must not be empty.")
+
+        existing = self._find_memory_payload(incident_id)
+        if existing is None:
+            raise LookupError(
+                f"No Enterprise Memory entry exists for incident {incident_id!r}; "
+                "nothing to correct."
+            )
+
+        recognised = {
+            "event_type", "metric", "severity", "root_cause", "confidence",
+            "investigation_status", "recommended_actions", "executed_actions",
+            "chunk_ids", "timestamp",
+        }
+        applied = {k: v for k, v in corrections.items() if k in recognised}
+        if not applied:
+            raise ValueError(
+                f"none of {sorted(corrections)} is a correctable memory field; "
+                f"correctable fields are {sorted(recognised)}."
+            )
+
+        # Rebuild the full incident dict from what was stored, then overlay
+        # the corrections — so a correction to one field never silently drops
+        # the others.
+        rebuilt: dict[str, Any] = {
+            "incident_id": incident_id,
+            "event_type": existing.get("category"),
+            "metric": existing.get("triggered_metric"),
+            "severity": existing.get("severity"),
+            "root_cause": existing.get("root_cause"),
+            "confidence": existing.get("confidence"),
+            "investigation_status": existing.get("resolution_status"),
+            "recommended_actions": existing.get("recommended_actions") or [],
+            "executed_actions": existing.get("executed_actions") or [],
+            "chunk_ids": existing.get("evidence_chunk_ids") or [],
+            "timestamp": existing.get("timestamp"),
+        }
+        previous = {field: rebuilt.get(field) for field in applied}
+        rebuilt.update(applied)
+
+        corrected_at = datetime.now(tz=timezone.utc).isoformat()
+
+        # Withdraw the stale vector first so a failure mid-way can never leave
+        # BOTH versions recallable (which would be worse than either alone).
+        self.expunge_incident_memory(
+            incident_id, reason=f"superseded by correction: {reason}", actor=actor,
+        )
+
+        result = self.remember_incident({
+            **rebuilt,
+            "_correction_provenance": {
+                "corrected": True,
+                "corrected_by": actor,
+                "corrected_at": corrected_at,
+                "correction_reason": reason,
+                "fields_corrected": sorted(applied),
+            },
+        })
+        if result is None:
+            raise RuntimeError(
+                f"Failed to rewrite corrected memory for incident {incident_id!r}. "
+                "The stale memory was already withdrawn, so it no longer recalls; "
+                "re-run the correction to restore a corrected entry."
+            )
+
+        record = {
+            "corrected": True,
+            "incident_id": incident_id,
+            "fields_corrected": sorted(applied),
+            "previous": previous,
+            "reason": reason,
+            "actor": actor,
+            "corrected_at": corrected_at,
+            "collection": self._ingest.collection,
+        }
+        logger.info(
+            "correct_incident_memory | SUCCESS | incident_id=%s | actor=%s | fields=%s",
+            incident_id, actor, sorted(applied),
+        )
+        return record
+
+    @staticmethod
+    def _require_curation_args(
+        incident_id: str, reason: str, actor: str,
+    ) -> tuple[str, str, str]:
+        """Validate the three arguments MEM-4 makes mandatory for any curation."""
+        incident_id = (incident_id or "").strip()
+        reason = (reason or "").strip()
+        actor = (actor or "").strip()
+        if not incident_id:
+            raise ValueError("incident_id must be a non-empty string.")
+        if not reason:
+            raise ValueError(
+                "reason must be a non-empty string — MEM-4 requires every memory "
+                "correction to record WHY it was made."
+            )
+        if not actor:
+            raise ValueError(
+                "actor must be a non-empty string — MEM-4 requires every memory "
+                "correction to record WHO made it."
+            )
+        return incident_id, reason, actor
+
+    def _find_memory_payload(self, incident_id: str) -> dict[str, Any] | None:
+        """
+        Return the stored payload of ``incident_id``'s memory, or ``None``.
+
+        Uses Qdrant's scroll-by-filter (an exact payload lookup) rather than a
+        similarity search, because "does a memory for this exact incident
+        exist" is not a semantic question and a nearest-neighbour answer
+        could return a DIFFERENT incident's memory.
+        """
+        try:
+            from qdrant_client.http import models as qmodels
+
+            points, _next = self._ingest._qdrant.scroll(
+                collection_name=self._ingest.collection,
+                scroll_filter=qmodels.Filter(
+                    must=[
+                        qmodels.FieldCondition(
+                            key="incident_id",
+                            match=qmodels.MatchValue(value=incident_id),
+                        )
+                    ]
+                ),
+                limit=1,
+                with_payload=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "_find_memory_payload | lookup failed | incident_id=%s | error=%s",
+                incident_id, exc,
+            )
+            return None
+
+        if not points:
+            return None
+        return dict(getattr(points[0], "payload", None) or {})
 
     @property
     def collection(self) -> str:

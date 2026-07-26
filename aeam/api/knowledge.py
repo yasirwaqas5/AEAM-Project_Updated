@@ -34,6 +34,22 @@ Rules enforced (mirrors every other API module in this package):
   re-processing identical bytes safely overwrites the same vector points).
 - Preview reuses ``extract_text``/``read_primary_table`` directly against
   the already-stored blob bytes — read-only, no new parsing logic.
+
+Phase E12 (Knowledge, Policy & Memory Governance) adds two things here and
+nothing else:
+
+- **Policy lifecycle reads** under ``/policies`` — list and filter extracted
+  policies by their new ``status``. Read-only, mapped to ``documents:search``
+  like the rest of this router.
+- **A privileged curation namespace** under ``/curate`` — policy status
+  transitions and Enterprise Memory expunge/correct. These are the only
+  WRITE operations this phase introduces, and they are deliberately grouped
+  under one path prefix so ``_ENDPOINT_RBAC_MAP`` can guard the whole
+  namespace with ``admin:config`` in a single, longest-prefix-first entry
+  (SEC-7: curation is privileged). Every one of them writes an audit record
+  through the SAME :class:`~aeam.security.audit_logger.AuditLogger` the
+  security middleware already uses (MEM-4: who, why, when) — no second audit
+  mechanism.
 """
 
 from __future__ import annotations
@@ -45,12 +61,14 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from aeam.ingestion.extraction import ExtractionError, UnsupportedCategoryError, extract_text
 from aeam.ingestion.schema_inference import SchemaInferenceError, read_primary_table
 from aeam.ingestion.validation import SUPPORTED_EXTENSIONS
 from aeam.registry.models import (
-    AssetStatus, Dataset, Document, IngestionJob, JobStatus, JobType, ParentType, Schema, Version,
+    AssetStatus, Dataset, Document, IngestionJob, JobStatus, JobType, ParentType,
+    PolicyStatus, Schema, SemanticDocType, Version,
 )
 from aeam.registry.repositories import (
     DatasetRepository,
@@ -232,6 +250,13 @@ def _document_to_dict(
         "origin_path": doc.origin_path,
         "file_type": doc.doc_type,
         "doc_type": doc.doc_type,
+        # Phase E12 (MOD-4): the DECLARED semantic type, exposed separately
+        # from the format above. Without this the console cannot tell a
+        # classified document from an unclassified one and would report every
+        # document as "not declared" regardless of what was actually stored.
+        # ``None`` when nothing was declared — which is the honest answer, not
+        # a fallback to the format.
+        "semantic_type": getattr(doc, "semantic_type", None),
         "current_version": doc.current_version,
         "content_hash": doc.content_hash,
         "chunk_count": doc.chunk_count,
@@ -730,27 +755,7 @@ def get_document_policies(request: Request, doc_id: str) -> JSONResponse:
     return JSONResponse(status_code=200, content={
         "doc_id": doc_id,
         "count": len(policies),
-        "policies": [
-            {
-                "policy_id": p.policy_id,
-                "source_document": p.source_document,
-                "source_chunk": p.source_chunk,
-                "raw_text": p.raw_text,
-                "business_rule": p.business_rule,
-                "condition": p.condition,
-                "threshold": p.threshold,
-                "actions": p.actions,
-                "escalation_rule": p.escalation_rule,
-                "approval_required": p.approval_required,
-                "department": p.department,
-                "role": p.role,
-                "time_constraint": p.time_constraint,
-                "priority": p.priority,
-                "related_metrics": p.related_metrics,
-                "extracted_at": _iso(p.extracted_at),
-            }
-            for p in policies
-        ],
+        "policies": [_policy_to_dict(p) for p in policies],
     })
 
 
@@ -803,4 +808,482 @@ def preview_dataset(request: Request, dataset_id: str) -> JSONResponse:
         "total_rows": int(len(df)),
         "previewed_rows": int(len(preview_df)),
         "detail": detail,
+    })
+
+
+# ===========================================================================
+# Phase E12 — Policy lifecycle (read) + privileged curation (write)
+# ===========================================================================
+#
+# Everything below composes objects that already exist: PolicyRepository's
+# new lifecycle methods, EnterpriseMemoryEngine's new curation methods, and
+# the AuditLogger the security middleware already writes through. No second
+# policy store, no second memory client, no second audit mechanism.
+
+
+class PolicyStatusRequest(BaseModel):
+    """A policy lifecycle transition (Phase E12, COMPAT-6 / SEC-7)."""
+
+    status: str = Field(
+        description=(
+            "Target lifecycle status: 'active', 'pending_review', or 'retired'. "
+            "A RETIRED policy never matches a new investigation."
+        ),
+    )
+    reason: str = Field(
+        min_length=1,
+        description=(
+            "Why the transition is being made. REQUIRED — an unexplained "
+            "governance change is exactly what this lifecycle exists to prevent."
+        ),
+    )
+
+
+class MemoryExpungeRequest(BaseModel):
+    """Withdraw one incident's memory from recall (Phase E12, MEM-4)."""
+
+    incident_id: str = Field(min_length=1, description="Incident whose memory is withdrawn.")
+    reason: str = Field(
+        min_length=1,
+        description="Why it is being withdrawn. REQUIRED by MEM-4; recorded verbatim.",
+    )
+
+
+class MemoryCorrectionRequest(BaseModel):
+    """Correct one incident's memory in place (Phase E12, MEM-4)."""
+
+    incident_id: str = Field(min_length=1, description="Incident whose memory is corrected.")
+    corrections: dict[str, Any] = Field(
+        description=(
+            "Field overrides, e.g. {'root_cause': '...'}. Correctable fields: "
+            "event_type, metric, severity, root_cause, confidence, "
+            "investigation_status, recommended_actions, executed_actions, "
+            "chunk_ids, timestamp."
+        ),
+    )
+    reason: str = Field(
+        min_length=1,
+        description="Why the correction is being made. REQUIRED by MEM-4; recorded verbatim.",
+    )
+
+
+def _policy_to_dict(p: Any) -> dict[str, Any]:
+    """Serialise one Policy, including its Phase E12 lifecycle fields."""
+    status = getattr(p, "status", PolicyStatus.ACTIVE) or PolicyStatus.ACTIVE
+    return {
+        "policy_id": p.policy_id,
+        "doc_id": p.doc_id,
+        "source_document": p.source_document,
+        "source_chunk": p.source_chunk,
+        "raw_text": p.raw_text,
+        "business_rule": p.business_rule,
+        "condition": p.condition,
+        "threshold": p.threshold,
+        "actions": p.actions,
+        "escalation_rule": p.escalation_rule,
+        "approval_required": p.approval_required,
+        "department": p.department,
+        "role": p.role,
+        "time_constraint": p.time_constraint,
+        "priority": p.priority,
+        "related_metrics": p.related_metrics,
+        "extracted_at": _iso(p.extracted_at),
+        # --- Phase E12 lifecycle (COMPAT-6: 'active' for every pre-E12 row) ---
+        "status": status,
+        "status_changed_at": _iso(getattr(p, "status_changed_at", None)),
+        "status_changed_by": getattr(p, "status_changed_by", None),
+        "status_reason": getattr(p, "status_reason", None),
+        # Stated inline so a console never has to re-derive the rule that
+        # decides whether this policy can still influence an investigation.
+        "matchable": status in PolicyStatus.MATCHABLE,
+    }
+
+
+def _require_curation_enabled(container: Any) -> None:
+    """
+    Enforce the phase's documented rollback posture.
+
+    ``KNOWLEDGE_CURATION_ENABLED=false`` disables every curation WRITE while
+    leaving all reads working — 503 rather than 404, because the capability
+    exists and is deliberately switched off, which is a different fact from
+    "no such endpoint".
+    """
+    settings = getattr(container, "settings", None)
+    if settings is not None and not getattr(settings, "KNOWLEDGE_CURATION_ENABLED", True):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Knowledge curation is disabled in this deployment "
+                "(KNOWLEDGE_CURATION_ENABLED=false). Read endpoints are unaffected."
+            ),
+        )
+
+
+def _acting_principal(request: Request) -> tuple[str, str]:
+    """
+    Return ``(principal, attribution_source)`` for a curation write.
+
+    Mirrors the Phase E9 review router's attribution contract exactly: the
+    principal comes from the verified JWT when the security middleware
+    established one, and is otherwise tagged so the audit trail never implies
+    a cryptographically-established identity it does not have. (The only way
+    to reach a curation endpoint without a verified principal is
+    ENVIRONMENT=development, where the middleware bypasses everything.)
+    """
+    user_id = getattr(request.state, "user_id", None)
+    if user_id and user_id != "anonymous":
+        return str(user_id), "jwt"
+    return "unauthenticated-development", "development-bypass"
+
+
+def _write_curation_audit(
+    request: Request,
+    *,
+    action: str,
+    endpoint: str,
+    detail: dict[str, Any],
+) -> None:
+    """
+    Record one curation act in the durable audit trail (MEM-4 / SEC-7).
+
+    Uses the SAME AuditLogger instance the security middleware writes
+    through, so a curation record lands in the same tamper-evident,
+    hash-carrying ``audit_logs`` table as every other audited action and is
+    queryable through the Phase E11 audit surface. An audit-write failure is
+    logged but never fails the request, exactly as the middleware's own audit
+    write does not — the curation already happened, and reporting failure
+    would be a worse lie than a missing audit line.
+    """
+    audit = getattr(request.app.state, "audit_logger", None)
+    if audit is None:
+        logger.warning(
+            "curation audit SKIPPED (no AuditLogger on app.state) | action=%s | detail=%s",
+            action, detail,
+        )
+        return
+    try:
+        audit.log({
+            "user_id": detail.get("actor", "unknown"),
+            "action": action,
+            "endpoint": endpoint,
+            "status_code": 200,
+            **detail,
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.error("curation audit write FAILED | action=%s | error=%s", action, exc)
+
+
+@router.get("/policies", summary="List extracted policies with their lifecycle status (Phase E12)")
+def list_policies(
+    request: Request,
+    status: str | None = Query(
+        default=None,
+        description="Filter by lifecycle status: 'active', 'pending_review', or 'retired'.",
+    ),
+    q: str | None = Query(
+        default=None,
+        description="Case-insensitive substring filter over business_rule/raw_text/source_document.",
+    ),
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> JSONResponse:
+    """
+    Return a bounded page of policies, newest-extracted first, with the
+    lifecycle status the Knowledge Center renders and acts on.
+
+    ``status_counts`` is aggregated in SQL so the console can render the
+    lifecycle breakdown without fetching every row.
+    """
+    container = request.app.state.container
+    policy_repo = PolicyRepository(container.db)
+
+    if status is not None and status not in PolicyStatus.ALL:
+        raise HTTPException(
+            status_code=422,
+            detail=f"invalid status {status!r}. Must be one of {sorted(PolicyStatus.ALL)}.",
+        )
+
+    policies = policy_repo.list_by_status(status) if status else policy_repo.list_all()
+
+    if q:
+        needle = q.strip().lower()
+        policies = [
+            p for p in policies
+            if _matches(needle, p.business_rule, p.raw_text, p.source_document)
+        ]
+
+    policies.sort(key=lambda p: p.extracted_at or "", reverse=True)
+    total = len(policies)
+    page = policies[offset:offset + limit]
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "policies": [_policy_to_dict(p) for p in page],
+            "count": len(page),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "status_counts": policy_repo.count_by_status(),
+            "lifecycle": {
+                "statuses": sorted(PolicyStatus.ALL),
+                "matchable": sorted(PolicyStatus.MATCHABLE),
+                "note": (
+                    "A policy in a matchable status can be cited as advisory evidence by a "
+                    "new investigation. A retired policy never can — but is retained, not "
+                    "deleted, so historical incidents that cited it stay explainable."
+                ),
+            },
+        },
+    )
+
+
+@router.post(
+    "/curate/policies/{policy_id}/status",
+    summary="Transition a policy's lifecycle status (Phase E12, privileged)",
+)
+def set_policy_status(
+    request: Request, policy_id: str, body: PolicyStatusRequest,
+) -> JSONResponse:
+    """
+    Move one policy through its lifecycle, with attribution.
+
+    Retiring a policy takes it out of force immediately: the very next
+    investigation's ``PolicyRegistry.match_for_incident`` call will not see
+    it. The row is kept so incidents that already cited it remain
+    explainable.
+
+    Authorisation is the middleware's — ``/api/v1/knowledge/curate`` maps to
+    ``admin:config``, so only the admin role reaches this at all.
+    """
+    container = request.app.state.container
+    _require_curation_enabled(container)
+
+    if body.status not in PolicyStatus.ALL:
+        raise HTTPException(
+            status_code=422,
+            detail=f"invalid status {body.status!r}. Must be one of {sorted(PolicyStatus.ALL)}.",
+        )
+
+    policy_repo = PolicyRepository(container.db)
+    policy = policy_repo.get(policy_id)
+    if policy is None:
+        raise HTTPException(status_code=404, detail=f"No policy with id {policy_id!r}.")
+
+    previous_status = getattr(policy, "status", PolicyStatus.ACTIVE) or PolicyStatus.ACTIVE
+    actor, attribution_source = _acting_principal(request)
+
+    policy_repo.set_status(
+        policy_id, body.status, changed_by=actor, reason=body.reason,
+    )
+
+    detail = {
+        "policy_id": policy_id,
+        "previous_status": previous_status,
+        "new_status": body.status,
+        "reason": body.reason,
+        "actor": actor,
+        "attribution_source": attribution_source,
+    }
+    _write_curation_audit(
+        request,
+        action="policy_status_changed",
+        endpoint=f"/api/v1/knowledge/curate/policies/{policy_id}/status",
+        detail=detail,
+    )
+    logger.info(
+        "set_policy_status | policy_id=%s | %s -> %s | actor=%s | reason=%s",
+        policy_id, previous_status, body.status, actor, body.reason,
+    )
+
+    updated = policy_repo.get(policy_id)
+    return JSONResponse(status_code=200, content={
+        **detail,
+        "policy": _policy_to_dict(updated) if updated else None,
+        "matches_new_investigations": body.status in PolicyStatus.MATCHABLE,
+    })
+
+
+@router.post(
+    "/curate/memory/expunge",
+    summary="Withdraw one incident's Enterprise Memory entry from recall (Phase E12, privileged)",
+)
+def expunge_memory(request: Request, body: MemoryExpungeRequest) -> JSONResponse:
+    """
+    Permanently remove an incident's memory so it stops surfacing as evidence.
+
+    MEM-4's destructive correction path. ``reason`` is mandatory and the
+    acting principal is taken from the verified session, so the resulting
+    audit record answers who, why, and when without further lookup.
+    """
+    container = request.app.state.container
+    _require_curation_enabled(container)
+
+    memory = getattr(container, "enterprise_memory", None)
+    if memory is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Enterprise Memory is not configured in this deployment, so there is "
+                "nothing to curate."
+            ),
+        )
+
+    actor, attribution_source = _acting_principal(request)
+    try:
+        result = memory.expunge_incident_memory(
+            body.incident_id, reason=body.reason, actor=actor,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    _write_curation_audit(
+        request,
+        action="memory_expunged",
+        endpoint="/api/v1/knowledge/curate/memory/expunge",
+        detail={
+            "incident_id": body.incident_id,
+            "reason": body.reason,
+            "actor": actor,
+            "attribution_source": attribution_source,
+        },
+    )
+    return JSONResponse(status_code=200, content={
+        **result, "attribution_source": attribution_source,
+    })
+
+
+@router.post(
+    "/curate/memory/correct",
+    summary="Correct one incident's Enterprise Memory entry (Phase E12, privileged)",
+)
+def correct_memory(request: Request, body: MemoryCorrectionRequest) -> JSONResponse:
+    """
+    Rewrite an incident's memory with corrected field values.
+
+    MEM-4's non-destructive correction path. Implemented as
+    expunge-then-rewrite so the memory's embedding is regenerated from the
+    corrected text — a payload-only patch would leave the entry recalling on
+    its old, wrong wording while displaying the corrected one.
+    """
+    container = request.app.state.container
+    _require_curation_enabled(container)
+
+    memory = getattr(container, "enterprise_memory", None)
+    if memory is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Enterprise Memory is not configured in this deployment, so there is "
+                "nothing to curate."
+            ),
+        )
+
+    actor, attribution_source = _acting_principal(request)
+    try:
+        result = memory.correct_incident_memory(
+            body.incident_id, body.corrections, reason=body.reason, actor=actor,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    _write_curation_audit(
+        request,
+        action="memory_corrected",
+        endpoint="/api/v1/knowledge/curate/memory/correct",
+        detail={
+            "incident_id": body.incident_id,
+            "fields_corrected": result.get("fields_corrected"),
+            "reason": body.reason,
+            "actor": actor,
+            "attribution_source": attribution_source,
+        },
+    )
+    return JSONResponse(status_code=200, content={
+        **result, "attribution_source": attribution_source,
+    })
+
+
+@router.post(
+    "/curate/documents/{doc_id}/semantic-type",
+    summary="Declare an already-ingested document's semantic type (Phase E12, privileged)",
+)
+def set_document_semantic_type(
+    request: Request,
+    doc_id: str,
+    semantic_type: str = Query(
+        description=(
+            "Declared semantic type, e.g. 'runbook'. Distinct from the file "
+            "format. Determines whether retrieval treats the document as an "
+            "authoritative source."
+        ),
+    ),
+) -> JSONResponse:
+    """
+    Classify an already-ingested document after the fact.
+
+    The upload path accepts a declaration inline, but a corpus ingested
+    before this phase has none — and re-uploading every file just to classify
+    it would be absurd. Declaring the type here updates the registry row; the
+    new type reaches retrieval on the document's next re-index, which the
+    response states explicitly rather than implying an instant effect it does
+    not have.
+    """
+    container = request.app.state.container
+    _require_curation_enabled(container)
+
+    normalised = (semantic_type or "").strip().lower()
+    if normalised not in SemanticDocType.ALL:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"semantic_type {semantic_type!r} is not recognised. "
+                f"Must be one of {sorted(SemanticDocType.ALL)}."
+            ),
+        )
+
+    doc_repo = DocumentRepository(container.db)
+    doc = doc_repo.get(doc_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"No document with id {doc_id!r}.")
+
+    previous = getattr(doc, "semantic_type", None)
+    actor, attribution_source = _acting_principal(request)
+    doc_repo.update(doc_id, {"semantic_type": normalised})
+
+    _write_curation_audit(
+        request,
+        action="document_semantic_type_declared",
+        endpoint=f"/api/v1/knowledge/curate/documents/{doc_id}/semantic-type",
+        detail={
+            "doc_id": doc_id,
+            "previous_semantic_type": previous,
+            "new_semantic_type": normalised,
+            "actor": actor,
+            "attribution_source": attribution_source,
+        },
+    )
+
+    return JSONResponse(status_code=200, content={
+        "doc_id": doc_id,
+        "previous_semantic_type": previous,
+        "semantic_type": normalised,
+        "format": doc.doc_type,
+        "actor": actor,
+        "attribution_source": attribution_source,
+        # Honest about WHEN this takes effect: the vectors already in Qdrant
+        # carry the old doc_type until the document is re-processed.
+        "takes_effect": (
+            "on the document's next re-index — POST /api/v1/knowledge/documents/"
+            f"{doc_id}/reindex applies it to the already-indexed chunks now."
+        ),
+        "authoritative_source": normalised in {
+            "runbook", "sre_runbook", "incident_report", "post_mortem",
+        },
     })

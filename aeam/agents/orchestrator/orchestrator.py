@@ -55,10 +55,12 @@ from aeam.monitoring.metrics import (
     active_incidents,
     agent_execution_time,
     end_timer,
+    incident_cost_scope,
     incidents_total,
     investigation_duration,
     start_timer,
 )
+from aeam.monitoring.tracing import current_trace_id, investigation_span
 from aeam.services.llm_service import LLMService
 
 if TYPE_CHECKING:
@@ -235,6 +237,12 @@ class Orchestrator:
         incidents_total.labels(event_type=event.event_type, severity=event.severity).inc()
         active_incidents.inc()
 
+        # Phase E11 (OBS-2): open this thread's per-incident cost scope so
+        # every LLM call, retrieval, and action the investigation causes is
+        # attributable to it. Thread-local, so concurrent investigations
+        # (Phase E2) accumulate separately. Closed in _finalize_incident.
+        incident_cost_scope.start(incident_id)
+
         logger.info(
             "Orchestrator.handle_event | incident_id=%s | event_id=%s | "
             "metric=%s | severity=%s",
@@ -270,7 +278,18 @@ class Orchestrator:
             "handle_event | STM initialised | incident_id=%s", incident_id
         )
 
-        self._investigate(ctx)
+        # Phase E11 (OBS-6): one ROOT span per investigation. Every stage
+        # span opened below nests inside it automatically, so an
+        # investigation emits a single connected trace joinable to its logs
+        # by incident id. A no-op when tracing is disabled (the default).
+        with investigation_span(
+            "investigation",
+            incident_id=incident_id,
+            event_type=event.event_type,
+            metric=event.metric,
+            severity=event.severity,
+        ):
+            self._investigate(ctx)
 
     def _investigate(self, ctx: IncidentContext) -> None:
         """
@@ -303,15 +322,17 @@ class Orchestrator:
         ctx.stm.set("investigation_depth", depth)
 
         logger.info(
-            "investigate | depth=%d | event_id=%s",
-            depth, ctx.event.event_id,
+            "investigate | depth=%d | event_id=%s | incident_id=%s",
+            depth, ctx.event.event_id, ctx.incident_id,
         )
 
         # --- Step 3: decide ---
-        decision_result = self._decision.decide(
-            event=ctx.event,
-            memory=ctx.stm,
-        )
+        # Phase E11 (OBS-6): the first stage span of the investigation trace.
+        with investigation_span("decision", incident_id=ctx.incident_id, depth=depth):
+            decision_result = self._decision.decide(
+                event=ctx.event,
+                memory=ctx.stm,
+            )
 
         # ✅ NEW: store LLM response if present (from the decision engine)
         if decision_result.get("source") == "llm":
@@ -320,9 +341,12 @@ class Orchestrator:
         action: str = decision_result.get("decision", "INVESTIGATE")
         confidence: float = float(decision_result.get("confidence", 0.0))
 
+        # Phase E11 (OBS-5): every investigation-path log line carries the
+        # incident id, so logs, metrics, and the OTel trace all correlate on
+        # one key without a second correlation scheme.
         logger.info(
-            "investigate | decision=%s | confidence=%.2f | source=%s",
-            action, confidence, decision_result.get("source", "unknown"),
+            "investigate | decision=%s | confidence=%.2f | source=%s | incident_id=%s",
+            action, confidence, decision_result.get("source", "unknown"), ctx.incident_id,
         )
 
         # Log the decision to STM for evaluation and audit.
@@ -365,16 +389,20 @@ class Orchestrator:
         # logic. A missing/failed memory engine never blocks investigation.
         if self._memory is not None and not self._has_memory_finding(ctx):
             memory_incident_id = ctx.stm.get("incident_id", "unknown")
-            try:
-                memory_query = RAGAgent._formulate_query(ctx.event)
-                similar_incidents = self._memory.recall_similar_incidents(
-                    query=memory_query,
-                    exclude_incident_id=memory_incident_id,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.error("investigate | memory recall failed: %s", exc)
-                memory_query = None
-                similar_incidents = []
+            with investigation_span("evidence.memory", incident_id=ctx.incident_id):
+                try:
+                    memory_query = RAGAgent._formulate_query(ctx.event)
+                    similar_incidents = self._memory.recall_similar_incidents(
+                        query=memory_query,
+                        exclude_incident_id=memory_incident_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "investigate | memory recall failed | incident_id=%s | error=%s",
+                        ctx.incident_id, exc,
+                    )
+                    memory_query = None
+                    similar_incidents = []
 
             ctx.stm.append("findings", {
                 "type": "memory",
@@ -400,16 +428,20 @@ class Orchestrator:
         # deterministic rule.
         if self._policy_registry is not None and not self._has_policy_finding(ctx):
             policy_incident_id = ctx.stm.get("incident_id", "unknown")
-            try:
-                policy_query = RAGAgent._formulate_query(ctx.event)
-                policy_matches = self._policy_registry.match_for_incident(
-                    metric=ctx.event.metric,
-                    query=policy_query,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.error("investigate | policy match failed: %s", exc)
-                policy_query = None
-                policy_matches = []
+            with investigation_span("evidence.policy", incident_id=ctx.incident_id):
+                try:
+                    policy_query = RAGAgent._formulate_query(ctx.event)
+                    policy_matches = self._policy_registry.match_for_incident(
+                        metric=ctx.event.metric,
+                        query=policy_query,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "investigate | policy match failed | incident_id=%s | error=%s",
+                        ctx.incident_id, exc,
+                    )
+                    policy_query = None
+                    policy_matches = []
 
             ctx.stm.append("findings", {
                 "type": "policy",
@@ -434,17 +466,21 @@ class Orchestrator:
         # entry, never fed back into RuleEngine/DecisionEngine/ActionAgent.
         if self._cross_dataset is not None and not self._has_cross_dataset_finding(ctx):
             cross_incident_id = ctx.stm.get("incident_id", "unknown")
-            try:
-                cross_dataset_result = self._cross_dataset.analyze(metric=ctx.event.metric)
-            except Exception as exc:  # noqa: BLE001
-                logger.error("investigate | cross-dataset analysis failed: %s", exc)
-                cross_dataset_result = {
-                    "insufficient_data": True,
-                    "reason": f"Cross-dataset analysis failed: {exc}",
-                    "origin_dataset_id": None, "origin_dataset_name": None,
-                    "candidates_checked": 0, "supporting": [], "contradicting": [],
-                    "strong_correlations": [], "missing_signals": [],
-                }
+            with investigation_span("evidence.cross_dataset", incident_id=ctx.incident_id):
+                try:
+                    cross_dataset_result = self._cross_dataset.analyze(metric=ctx.event.metric)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "investigate | cross-dataset analysis failed | incident_id=%s | error=%s",
+                        ctx.incident_id, exc,
+                    )
+                    cross_dataset_result = {
+                        "insufficient_data": True,
+                        "reason": f"Cross-dataset analysis failed: {exc}",
+                        "origin_dataset_id": None, "origin_dataset_name": None,
+                        "candidates_checked": 0, "supporting": [], "contradicting": [],
+                        "strong_correlations": [], "missing_signals": [],
+                    }
 
             ctx.stm.append("findings", {
                 "type": "cross_dataset",
@@ -471,25 +507,29 @@ class Orchestrator:
         # into DecisionEngine/ActionAgent. Advisory only.
         if self._adaptive_detection is not None and not self._has_adaptive_finding(ctx):
             adaptive_incident_id = ctx.stm.get("incident_id", "unknown")
-            try:
-                adaptive_result = self._adaptive_detection.analyze(
-                    metric=ctx.event.metric,
-                    current_value=ctx.event.current_value,
-                    event_metadata=ctx.event.metadata,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.error("investigate | adaptive detection failed: %s", exc)
-                adaptive_result = {
-                    "history_points_used": 0,
-                    "adaptive_baseline": None,
-                    "adaptive_baseline_insufficient": f"Adaptive analysis failed: {exc}",
-                    "seasonality": None,
-                    "seasonality_insufficient": f"Adaptive analysis failed: {exc}",
-                    "existing_statistical": None,
-                    "existing_forecast": None,
-                    "combined_signal": False,
-                    "corroborating_signals": [],
-                }
+            with investigation_span("evidence.adaptive_detection", incident_id=ctx.incident_id):
+                try:
+                    adaptive_result = self._adaptive_detection.analyze(
+                        metric=ctx.event.metric,
+                        current_value=ctx.event.current_value,
+                        event_metadata=ctx.event.metadata,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "investigate | adaptive detection failed | incident_id=%s | error=%s",
+                        ctx.incident_id, exc,
+                    )
+                    adaptive_result = {
+                        "history_points_used": 0,
+                        "adaptive_baseline": None,
+                        "adaptive_baseline_insufficient": f"Adaptive analysis failed: {exc}",
+                        "seasonality": None,
+                        "seasonality_insufficient": f"Adaptive analysis failed: {exc}",
+                        "existing_statistical": None,
+                        "existing_forecast": None,
+                        "combined_signal": False,
+                        "corroborating_signals": [],
+                    }
 
             ctx.stm.append("findings", {
                 "type": "adaptive",
@@ -506,13 +546,14 @@ class Orchestrator:
 
         # --- RAG integration (Phase 4) ---
         if "RAG" in agents and self._rag is not None:
-            logger.info("investigate | invoking RAG agent")
+            logger.info("investigate | invoking RAG agent | incident_id=%s", ctx.incident_id)
 
             t = start_timer()
-            rag_result = self._rag.investigate(
-                event=ctx.event,
-                memory=ctx.stm,
-            )
+            with investigation_span("evidence.rag", incident_id=ctx.incident_id):
+                rag_result = self._rag.investigate(
+                    event=ctx.event,
+                    memory=ctx.stm,
+                )
             end_timer(agent_execution_time.labels(agent="rag"), t)
 
             # RAG Agent actual contract (rag_agent.py:278-282):
@@ -591,12 +632,28 @@ class Orchestrator:
             if requires_human is True:
                 ctx.stm.set("requires_human", True)
 
+            # Phase E11 (OBS-2): attribute this pass's retrieval VOLUME to the
+            # incident's cost scope — the third cost axis alongside LLM spend
+            # and action executions. Counts what retrieval actually returned;
+            # never an estimate.
+            retrieved_this_pass = 0
+            if isinstance(rag_findings, dict):
+                raw_count = rag_findings.get("retrieved_count")
+                if isinstance(raw_count, int):
+                    retrieved_this_pass = raw_count
+                else:
+                    retrieved_this_pass = len(rag_findings.get("possible_causes", []) or [])
+            incident_cost_scope.record_retrieval(retrieved_this_pass)
+
         # Always run the KPI placeholder (can be replaced later with actual KPI Agent)
         self._run_kpi_investigation_placeholder(ctx)
 
         # ---------- Force LLM reasoning at depth >= 3 ----------
         if depth >= 3 and self._settings.LLM_ENABLED:
-            logger.info("investigate | triggering LLM reasoning at depth %d", depth)
+            logger.info(
+                "investigate | triggering LLM reasoning at depth %d | incident_id=%s",
+                depth, ctx.incident_id,
+            )
             try:
                 llm = LLMService(settings=self._settings)
 
@@ -770,8 +827,17 @@ class Orchestrator:
         # above already prevents finalize_incident() from running twice for
         # the same incident, so this dec()/observe() pair can never double-count.
         active_incidents.dec()
+        # Phase E11 (OBS-2 / COMPAT-1): end_timer already returns the measured
+        # elapsed seconds — capture it so the SAME measurement that feeds the
+        # Prometheus histogram is also persisted per-incident into
+        # audit_summary below. This closes D3's honestly-disclosed duration
+        # gap the honest way (measured at finalize), rather than merging in a
+        # differently-shaped, process-lifetime Prometheus aggregate.
+        investigation_duration_seconds: float | None = None
         if ctx.started_at is not None:
-            end_timer(investigation_duration, ctx.started_at)
+            investigation_duration_seconds = round(
+                end_timer(investigation_duration, ctx.started_at), 4
+            )
             ctx.started_at = None
 
         event_data: dict[str, Any] = ctx.stm.get("event") or {}
@@ -831,31 +897,35 @@ class Orchestrator:
         # entry. ActionAgent.execute() and the action_plan loop below are
         # completely unchanged by this stage.
         if self._execution_planner is not None and not self._has_execution_plan_finding(ctx):
-            try:
-                execution_plan = self._execution_planner.plan(
-                    event_type=event_data.get("event_type", ""),
-                    metric=event_data.get("metric", ""),
-                    severity=event_data.get("severity", ""),
-                    current_value=event_data.get("current_value"),
-                    expected_value=event_data.get("expected_value"),
-                    findings=ctx.stm.get("findings", []) or [],
-                    root_cause=root_cause,
-                    confidence=confidence,
-                    requires_human=requires_human,
-                    runbook_recommended_actions=runbook["recommended_actions"],
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.error("finalize_incident | execution planning failed: %s", exc)
-                execution_plan = {
-                    "executive_summary": f"Execution planning failed: {exc}",
-                    "recommended_actions": [], "order_rationale": None,
-                    "supporting_evidence": [], "business_risk_assessment": None,
-                    "expected_impact": None, "confidence": 0.0,
-                    "evidence_quality": "insufficient", "evidence_conflicts": [],
-                    "human_approval_required": True, "explanation": f"Execution planning failed: {exc}",
-                    "insufficient_evidence": True,
-                    "sources_consulted": {}, "sources_with_signal": {},
-                }
+            with investigation_span("planning", incident_id=ctx.incident_id):
+                try:
+                    execution_plan = self._execution_planner.plan(
+                        event_type=event_data.get("event_type", ""),
+                        metric=event_data.get("metric", ""),
+                        severity=event_data.get("severity", ""),
+                        current_value=event_data.get("current_value"),
+                        expected_value=event_data.get("expected_value"),
+                        findings=ctx.stm.get("findings", []) or [],
+                        root_cause=root_cause,
+                        confidence=confidence,
+                        requires_human=requires_human,
+                        runbook_recommended_actions=runbook["recommended_actions"],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "finalize_incident | execution planning failed | incident_id=%s | error=%s",
+                        incident_id, exc,
+                    )
+                    execution_plan = {
+                        "executive_summary": f"Execution planning failed: {exc}",
+                        "recommended_actions": [], "order_rationale": None,
+                        "supporting_evidence": [], "business_risk_assessment": None,
+                        "expected_impact": None, "confidence": 0.0,
+                        "evidence_quality": "insufficient", "evidence_conflicts": [],
+                        "human_approval_required": True, "explanation": f"Execution planning failed: {exc}",
+                        "insufficient_evidence": True,
+                        "sources_consulted": {}, "sources_with_signal": {},
+                    }
 
             ctx.stm.append("findings", {
                 "type": "execution_plan",
@@ -988,17 +1058,21 @@ class Orchestrator:
             merged_params = {**params, **extra_params}
             t = start_timer()
             try:
-                result = self._action.execute(
-                    action_type=registry_type,
-                    parameters=merged_params,
-                    incident_id=incident_id,
-                )
+                with investigation_span(
+                    "action", incident_id=ctx.incident_id, action_type=registry_type, step=step,
+                ):
+                    result = self._action.execute(
+                        action_type=registry_type,
+                        parameters=merged_params,
+                        incident_id=incident_id,
+                    )
             except Exception as exc:  # noqa: BLE001
                 end_timer(agent_execution_time.labels(agent=f"action:{registry_type}"), t)
                 action_failure_total.labels(action_type=registry_type).inc()
                 skipped_actions.append({"action": step, "reason": str(exc)})
                 logger.error(
-                    "finalize_incident | action %s raised: %s", step, exc,
+                    "finalize_incident | action %s raised | incident_id=%s | error=%s",
+                    step, incident_id, exc,
                 )
                 return
 
@@ -1166,7 +1240,21 @@ class Orchestrator:
         # frontend reads instead of reconstructing state from scattered
         # findings entries. Stored inside the existing "findings" JSON
         # column — no schema change.
-        ctx.stm.append("findings", {
+        # Phase E11 (OBS-2 / EXPL-5): close the per-incident cost scope and
+        # attribute this incident's action outcomes before snapshotting it.
+        # An incident whose scope was never opened (a direct
+        # _finalize_incident call in a unit test) simply yields no cost block
+        # — absence stays honestly distinguishable from a measured zero.
+        for _ in executed_actions:
+            incident_cost_scope.record_action("executed")
+        for _ in skipped_actions:
+            incident_cost_scope.record_action("skipped")
+        for _ in pending_actions:
+            incident_cost_scope.record_action("withheld")
+        cost_snapshot = incident_cost_scope.snapshot()
+        incident_cost_scope.clear()
+
+        audit_summary: dict[str, Any] = {
             "type": "audit_summary",
             "investigation_status": investigation_status,
             "root_cause": root_cause,
@@ -1184,7 +1272,40 @@ class Orchestrator:
             "recommended_actions": runbook["recommended_actions"],
             "executed_actions": executed_actions,
             "skipped_actions": skipped_actions,
-        })
+        }
+
+        # --- Phase E11 additive fields (COMPAT-1: every existing reader
+        # ignores an unknown key, and every incident recorded BEFORE this
+        # phase simply lacks them — which is exactly what lets D3 report
+        # "measured" for new incidents and an honest reason for old ones,
+        # instead of silently backfilling a number it never measured).
+        if investigation_duration_seconds is not None:
+            audit_summary["investigation_duration_seconds"] = investigation_duration_seconds
+        if cost_snapshot is not None:
+            audit_summary["cost"] = {
+                "llm_calls": cost_snapshot["llm_calls"],
+                "llm_prompt_tokens": cost_snapshot["llm_prompt_tokens"],
+                "llm_completion_tokens": cost_snapshot["llm_completion_tokens"],
+                "llm_total_tokens": cost_snapshot["llm_total_tokens"],
+                "llm_cost_usd": cost_snapshot["llm_cost_usd"],
+                "retrieval_chunks": cost_snapshot["retrieval_chunks"],
+                "actions_executed": cost_snapshot["actions_executed"],
+                "actions_skipped": cost_snapshot["actions_skipped"],
+                "actions_withheld": cost_snapshot["actions_withheld"],
+                # The cost figure is operator-priced from real token counts
+                # (Settings.LLM_COST_PER_1K_*), never an invoiced total —
+                # stated inline so no reader has to infer the semantics.
+                "cost_basis": (
+                    "LLM spend estimated from provider-reported token counts at the "
+                    "operator-configured LLM_COST_PER_1K_* rates; 0.0 when no rate is "
+                    "configured. Action and retrieval counts are measured, not estimated."
+                ),
+            }
+        trace_id = current_trace_id()
+        if trace_id:
+            audit_summary["trace_id"] = trace_id
+
+        ctx.stm.append("findings", audit_summary)
 
         # --- Assemble persistence payload (schema unchanged). ---
         payload: dict[str, Any] = {

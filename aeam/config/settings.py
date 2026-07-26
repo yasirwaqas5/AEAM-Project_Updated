@@ -414,6 +414,60 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Distributed tracing (Phase E11, OBS-1/OBS-6) ---
+    #
+    # OpenTelemetry spans are a COMPLEMENTARY signal to the Prometheus
+    # metrics pipeline, never a replacement for it (OBS-1: metrics remain
+    # the single metrics pipeline). Tracing is OFF by default so every
+    # existing deployment behaves exactly as it did before this phase
+    # (COMPAT-1); turning it on requires both the flag and a real endpoint.
+
+    OTEL_TRACING_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "Phase E11 (OBS-6): emit OpenTelemetry spans across the "
+            "investigation path (decision -> evidence stages -> planning -> "
+            "action), correlated by incident id. False (the default) makes "
+            "every tracing call site a no-op. Requires the optional "
+            "opentelemetry-sdk / opentelemetry-exporter-otlp-proto-http "
+            "packages; when they are absent, tracing stays off with a loud "
+            "warning rather than failing startup."
+        ),
+    )
+
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = Field(
+        default="",
+        description=(
+            "Phase E11: base OTLP/HTTP endpoint of the enterprise tracing "
+            "backend (e.g. 'http://otel-collector:4318'). '/v1/traces' is "
+            "appended by the exporter. Empty with tracing enabled keeps "
+            "tracing OFF rather than silently dropping spans."
+        ),
+    )
+
+    OTEL_SERVICE_NAME: str = Field(
+        default="aeam",
+        description=(
+            "Phase E11: 'service.name' resource attribute on every emitted "
+            "span, so AEAM is identifiable in a shared tracing backend."
+        ),
+    )
+
+    # --- Knowledge, policy & memory governance (Phase E12) ---
+
+    KNOWLEDGE_CURATION_ENABLED: bool = Field(
+        default=True,
+        description=(
+            "Phase E12 (SEC-7): master switch for the privileged curation "
+            "write endpoints -- policy status transitions and Enterprise "
+            "Memory expunge/correct. False returns 503 from those endpoints "
+            "while every read path stays available, which is the phase's "
+            "documented rollback posture. Authorisation is still the "
+            "middleware's job (admin:config); this flag only decides whether "
+            "the capability exists at all in this deployment."
+        ),
+    )
+
     # --- Forecast configuration (Phase 5) ---
 
     FORECAST_WINDOW_DAYS: int = Field(
