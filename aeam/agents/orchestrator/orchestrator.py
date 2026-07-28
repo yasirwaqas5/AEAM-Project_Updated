@@ -35,6 +35,8 @@ import uuid
 import warnings
 from typing import TYPE_CHECKING, Any
 
+from aeam.agents.kpi.kpi_agent import _DEFAULT_HISTORY_LIMIT as _KPI_DEFAULT_HISTORY_LIMIT
+from aeam.agents.kpi.kpi_agent import KPIAgent
 from aeam.agents.orchestrator.decision_engine import DecisionEngine
 from aeam.agents.orchestrator.evaluation_engine import EvaluationEngine
 from aeam.agents.orchestrator.incident_context import IncidentContext
@@ -67,6 +69,22 @@ if TYPE_CHECKING:
     from aeam.agents.report.report_agent import ReportAgent
 
 logger = logging.getLogger(__name__)
+
+
+def _kpi_history_limit(settings: Any) -> int:
+    """Read ``KPI_AGENT_HISTORY_LIMIT``, falling back to the engine default.
+
+    Guarded rather than read directly because construction sites across the
+    suite pass Settings-shaped doubles whose attributes are auto-created;
+    a non-integer reaching ``KPIAgent`` would raise at construction and take
+    the whole Orchestrator down with it. The engine-owned default lives in
+    :mod:`aeam.agents.kpi.kpi_agent` (ENG-6), so ``None`` here means "use
+    whatever that module says", not a second copy of the number.
+    """
+    value = getattr(settings, "KPI_AGENT_HISTORY_LIMIT", None)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 2:
+        return value
+    return _KPI_DEFAULT_HISTORY_LIMIT
 
 
 class Orchestrator:
@@ -152,6 +170,7 @@ class Orchestrator:
         explainability_engine: Any | None = None,  # Phase D1 — Enterprise Explainability Engine
         ai_evaluation_engine: Any | None = None,  # Phase D2 — Enterprise AI Evaluation & Quality Engine
         human_review_service: Any | None = None,  # Phase E9 — Human-in-the-Loop Enforcement
+        kpi_agent: Any | None = None,  # Phase F1 — real KPI investigation pass
         short_term_memory: ShortTermMemory | None = None,   # DEPRECATED (Phase E2) — see class docstring
         state_machine: IncidentStateMachine | None = None,  # DEPRECATED (Phase E2) — see class docstring
     ) -> None:
@@ -174,6 +193,23 @@ class Orchestrator:
         # recorded as pending instead of executed. None (or a service with
         # enforcement off) leaves finalization byte-identical to pre-E9.
         self._human_review = human_review_service  # Phase E9
+
+        # Phase F1: the real KPI Agent. An explicitly injected agent wins
+        # (tests, and any caller assembling the graph itself); otherwise
+        # one is constructed unless KPI_AGENT_ENABLED is explicitly false.
+        # Defaulting to constructed is deliberate: F1 DELETED the
+        # placeholder this pass replaces, so an absent agent means the
+        # investigation has no KPI pass at all — a posture that exists only
+        # for the documented rollback, never by accident.
+        if kpi_agent is not None:
+            self._kpi_agent = kpi_agent
+        elif getattr(settings, "KPI_AGENT_ENABLED", True) is False:
+            self._kpi_agent = None
+        else:
+            self._kpi_agent = KPIAgent(
+                long_term_memory=long_term_memory,
+                history_limit=_kpi_history_limit(settings),
+            )
 
         # Phase E2, ARCH-8: no per-incident instance attributes. STM,
         # FSM, active event, and investigation_started_at all live on the
@@ -261,10 +297,12 @@ class Orchestrator:
         ctx.stm.set("confidence", None)
         ctx.stm.set("root_cause", None)
         # Provenance of the root cause (Phase E1, ENG-5): "rag" |
-        # "llm_reasoning" | "placeholder" | None. Every writer of
+        # "llm_reasoning" | "kpi_analysis" | None. Every writer of
         # "root_cause" also writes this, so _finalize_incident can
-        # quarantine placeholder-derived conclusions from Enterprise Memory
-        # and the UI can label them.
+        # quarantine untrustworthy conclusions from Enterprise Memory and
+        # the UI can label them. Phase F1 retired the "placeholder" value's
+        # only producer; the vocabulary keeps the member because persisted
+        # incidents predating F1 still carry it (COMPAT-1/COMPAT-6).
         ctx.stm.set("root_cause_source", None)
         ctx.stm.set("action_taken", False)
         ctx.stm.set("requires_human", False)
@@ -302,7 +340,7 @@ class Orchestrator:
         4. Transition FSM to ``DECIDING``.
         5. Act on the decision:
            - ``"INVESTIGATE"`` → (optionally invoke RAG if configured), then
-             run KPI placeholder and call :meth:`evaluate`.
+             run the KPI Agent pass and call :meth:`evaluate`.
            - ``"STOP"`` → call :meth:`finalize_incident`.
            - Unknown decision → log a warning and call :meth:`finalize_incident`.
 
@@ -605,7 +643,8 @@ class Orchestrator:
             ctx.stm.set("llm_response", json.dumps(rag_result, default=str))
 
             # Promote the grounded root cause into STM so finalize_incident()
-            # persists it — and so the KPI placeholder does not overwrite it.
+            # persists it. The KPI Agent pass below writes a root cause only
+            # when none is set, so this grounded, chunk-cited cause wins.
             if rag_root_cause and not no_knowledge:
                 ctx.stm.set("root_cause", rag_root_cause)
                 ctx.stm.set("root_cause_source", "rag")
@@ -645,8 +684,11 @@ class Orchestrator:
                     retrieved_this_pass = len(rag_findings.get("possible_causes", []) or [])
             incident_cost_scope.record_retrieval(retrieved_this_pass)
 
-        # Always run the KPI placeholder (can be replaced later with actual KPI Agent)
-        self._run_kpi_investigation_placeholder(ctx)
+        # Phase F1: the real KPI Agent pass. Runs on every depth, exactly
+        # where the placeholder ran, so the EvaluationEngine keeps scoring
+        # against a populated STM — the difference is that what it scores
+        # is now measured rather than simulated.
+        self._run_kpi_investigation(ctx)
 
         # ---------- Force LLM reasoning at depth >= 3 ----------
         if depth >= 3 and self._settings.LLM_ENABLED:
@@ -686,9 +728,9 @@ class Orchestrator:
                         "parsed as JSON | depth=%d", depth,
                     )
                     # Structured, visible failure record — never fabricate a
-                    # root cause from unparseable output. The placeholder
-                    # root cause already set by
-                    # _run_kpi_investigation_placeholder() is left intact.
+                    # root cause from unparseable output. The grounded
+                    # characterisation already set by
+                    # _run_kpi_investigation() is left intact.
                     ctx.stm.append("findings", {
                         "type": "llm_reasoning_error",
                         "depth": depth,
@@ -705,7 +747,7 @@ class Orchestrator:
                     logger.info("investigate | LLM reasoning stored successfully")
             except Exception as exc:
                 logger.warning("investigate | LLM reasoning failed: %s", exc)
-                # Keep the existing placeholder root cause (already set in _run_kpi_investigation_placeholder)
+                # Keep the KPI Agent's grounded characterisation (already set in _run_kpi_investigation)
 
         self._evaluate(ctx)
 
@@ -844,7 +886,8 @@ class Orchestrator:
         incident_id: str = ctx.stm.get("incident_id", "unknown")
         root_cause = ctx.stm.get("root_cause")
         # Provenance written by whichever component set root_cause (Phase E1,
-        # ENG-5): "rag" | "llm_reasoning" | "placeholder" | None.
+        # ENG-5): "rag" | "llm_reasoning" | "kpi_analysis" | None.
+        # "placeholder" survives only on incidents persisted before F1.
         root_cause_source = ctx.stm.get("root_cause_source")
         requires_human = bool(ctx.stm.get("requires_human"))
         confidence = ctx.stm.get("confidence")
@@ -1377,6 +1420,13 @@ class Orchestrator:
         # placeholder-derived root cause — synthetic KPI-stub output is not
         # organizational knowledge, and remembering it would poison future
         # recalls with fabricated precedent. Skipped loudly, never silently.
+        #
+        # Phase F1 deleted the only code that ever produced this marker, so
+        # no NEW incident can reach this branch. It is deliberately kept:
+        # a re-investigation or replay of an incident persisted before F1
+        # still carries "placeholder", and the quarantine must hold for it
+        # exactly as it did then (COMPAT-1 — persisted incidents render,
+        # and are governed, forever).
         if self._memory is not None and root_cause_source == "placeholder":
             logger.warning(
                 "finalize_incident | Enterprise Memory write SKIPPED — root cause is "
@@ -1676,59 +1726,114 @@ class Orchestrator:
             })
         return attempts
 
-    def _run_kpi_investigation_placeholder(self, ctx: IncidentContext) -> None:
+    def _run_kpi_investigation(self, ctx: IncidentContext) -> None:
         """
-        Placeholder for a KPI investigation pass.
+        Run the KPI Agent's investigation pass (Phase F1).
 
-        In production this would dispatch to a KPI Agent (not yet implemented)
-        and await structured findings. For now it writes synthetic evidence to
-        STM so the EvaluationEngine has non-empty data to score against.
+        Replaces ``_run_kpi_investigation_placeholder``, which stood here
+        from Phase 3 until F1 emitting a synthetic ``"Simulated root
+        cause"``. That method is **deleted**, not bypassed: PHIL-1 is
+        satisfied by removal, and a placeholder left behind a flag would
+        still be a placeholder that could reach an operator.
 
-        This method contains NO real analysis, NO LLM calls, NO external I/O.
-        It exists solely to keep the investigation loop functional until the
-        KPI Agent is wired in.
+        What changes for readers of the record:
+
+        * ``root_cause_source`` becomes ``"kpi_analysis"`` where it was
+          ``"placeholder"``. The E1 quarantine on ``"placeholder"`` is left
+          untouched in :meth:`finalize_incident` — it still guards every
+          historical incident that carries the old marker (COMPAT-1), it
+          simply has no new producer.
+        * Evidence entries carry real measurements instead of a
+          ``placeholder: True`` flag.
+        * Confidence is derived from the measurement, not incremented by a
+          fixed 0.3 per pass.
+
+        The agent is advisory (AGENT-5): a grounded root cause is written
+        to STM only when nothing better is already there, so RAG's
+        chunk-cited cause and LLM reasoning both continue to win — a
+        characterisation of *what* changed must never displace an
+        explanation of *why*.
         """
-
         depth: int = ctx.stm.get("investigation_depth") or 1
 
-        logger.debug(
-            "_run_kpi_investigation_placeholder | depth=%d | metric=%s",
-            depth, ctx.event.metric,
-        )
+        if self._kpi_agent is None:
+            # KPI_AGENT_ENABLED=false. Recorded, not silent: an operator
+            # reading the findings must be able to see that the KPI pass
+            # did not run, rather than inferring it from an absence
+            # (EXPL-3 — "not consulted" is its own state).
+            ctx.stm.append("findings", {
+                "type": "kpi_analysis",
+                "depth": depth,
+                "data": {
+                    "not_consulted": (
+                        "KPI Agent is disabled for this deployment "
+                        "(KPI_AGENT_ENABLED=false)."
+                    ),
+                },
+            })
+            return
 
-        # Simulate accumulating evidence over successive passes. The
-        # machine-readable "placeholder" flag (Phase E1, ENG-5) marks this
-        # entry as synthetic — readers must never treat it as real analysis.
-        ctx.stm.append("evidence", {
+        with investigation_span("evidence.kpi_analysis", incident_id=ctx.incident_id):
+            result = self._kpi_agent.analyze(
+                metric=ctx.event.metric,
+                current_value=ctx.event.current_value,
+                expected_value=ctx.event.expected_value,
+                event_metadata=ctx.event.metadata,
+                depth=depth,
+            )
+
+        ctx.stm.append("findings", {
+            "type": "kpi_analysis",
             "depth": depth,
-            "metric": ctx.event.metric,
-            "current_value": ctx.event.current_value,
-            "expected_value": ctx.event.expected_value,
-            "note": "placeholder — awaiting KPI Agent integration",
-            "placeholder": True,
+            "confidence": result.get("confidence", 0.0),
+            "root_cause": result.get("root_cause"),
+            "data": result,
         })
 
-        # On the first pass, propose a generic hypothesis.
-        if depth == 1:
-            ctx.stm.append("hypotheses", f"Anomaly in {ctx.event.metric} ({ctx.event.current_value} vs expected {ctx.event.expected_value})")
+        # Evidence carries the measured characterisation. Nothing synthetic
+        # is written: every field below was computed from the event's own
+        # detector output or from real history.
+        ctx.stm.append("evidence", {
+            "source": "kpi_analysis",
+            "depth": depth,
+            "metric": result.get("metric"),
+            "current_value": result.get("current_value"),
+            "expected_value": result.get("expected_value"),
+            "baseline_source": result.get("baseline_source"),
+            "history_points_used": result.get("history_points_used"),
+            "deviation": result.get("deviation"),
+            "persistence": result.get("persistence"),
+            "trend": result.get("trend"),
+            "detectors_fired": result.get("detectors_fired"),
+            "insufficient_data": result.get("insufficient_data"),
+        })
 
-        # Simulate progressively increasing confidence with each pass.
-        current_confidence: float = float(ctx.stm.get("confidence") or 0.0)
-        new_confidence = min(current_confidence + 0.3, 1.0)
-        ctx.stm.set("confidence", round(new_confidence, 2))
+        if depth == 1 and result.get("root_cause"):
+            ctx.stm.append("hypotheses", result["root_cause"])
 
-        # On the second pass, simulate root cause identification (placeholder).
-        # root_cause_source="placeholder" (Phase E1, ENG-5) makes this
-        # machine-identifiable: finalize_incident() quarantines it from
-        # Enterprise Memory and the UI labels it — never presented or
-        # remembered as real analysis.
-        if depth >= 2 and not ctx.stm.get("root_cause"):
-            ctx.stm.set(
-                "root_cause",
-                f"Simulated root cause for metric '{ctx.event.metric}' "
-                f"(placeholder — replace with real KPI Agent output)",
-            )
-            ctx.stm.set("root_cause_source", "placeholder")
+        # Confidence is the maximum of what any pass has established, not a
+        # running increment — a later, weaker pass must not talk a stronger
+        # earlier finding down.
+        existing_confidence = float(ctx.stm.get("confidence") or 0.0)
+        agent_confidence = float(result.get("confidence") or 0.0)
+        if agent_confidence > existing_confidence:
+            ctx.stm.set("confidence", round(agent_confidence, 2))
+
+        if result.get("root_cause") and not ctx.stm.get("root_cause"):
+            ctx.stm.set("root_cause", result["root_cause"])
+            ctx.stm.set("root_cause_source", "kpi_analysis")
+
+        logger.info(
+            "kpi_analysis | depth=%d | metric=%s | detectors=%s | history_points=%d | "
+            "confidence=%.2f | grounded=%s | incident_id=%s",
+            depth,
+            ctx.event.metric,
+            result.get("detectors_fired"),
+            result.get("history_points_used", 0),
+            agent_confidence,
+            bool(result.get("root_cause")),
+            ctx.incident_id,
+        )
 
     def __repr__(self) -> str:
         # Phase E2, ARCH-8: no per-incident FSM state — incidents

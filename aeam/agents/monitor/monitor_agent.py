@@ -35,7 +35,44 @@ from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
 
 from aeam.agents.kpi.rule_engine import RuleEngine
+from aeam.agents.kpi.advanced_detectors import (
+    ChangepointDetector,
+    SeasonalHybridDetector,
+)
 from aeam.agents.kpi.statistical_detector import StatisticalDetector
+
+
+def _flag_enabled(settings: Any, name: str) -> bool:
+    """Read a Phase-F1 detection feature flag, strictly.
+
+    Only a real boolean ``True`` enables a detector. Anything else --
+    absent, None, a string, or a test double whose attributes are
+    auto-created and truthy -- leaves it off.
+
+    Strictness is the point (COMPAT-2): the F1 detectors change an event's
+    signals, severity and metadata, so "off unless someone said true" must
+    hold even when a caller passes a Settings-shaped object that is not a
+    Settings. A permissive truthiness check would silently turn detection
+    changes on for every existing caller that mocks its configuration.
+    """
+    return getattr(settings, name, False) is True
+
+
+def _flag_int(settings: Any, name: str, default: int) -> int:
+    """Read an integer detector parameter, falling back on anything unusable.
+
+    Companion to :func:`_flag_enabled`: a flag may be legitimately true
+    while a tuning value is absent or non-numeric, and the engine-owned
+    default (ENG-6) is the honest answer in that case.
+    """
+    value = getattr(settings, name, None)
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+
+def _flag_float(settings: Any, name: str, default: float) -> float:
+    """Read a float detector parameter. See :func:`_flag_int`."""
+    value = getattr(settings, name, None)
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else default
 from aeam.config.settings import Settings
 from aeam.core.deduplication import EventDeduplicator
 from aeam.core.event_bus import EventBus
@@ -166,6 +203,8 @@ class MonitorAgent:
         settings: Settings,
         kpi_source: KPIRowSource | None = None,
         long_term_memory: MetricsSink | None = None,
+        changepoint_detector: 'ChangepointDetector | None' = None,
+        seasonal_detector: 'SeasonalHybridDetector | None' = None,
     ) -> None:
         self._bus = event_bus
         self._queue = queue
@@ -177,6 +216,40 @@ class MonitorAgent:
         self._settings = settings
         self._kpi_source = kpi_source
         self._ltm = long_term_memory
+
+        # Phase F1 (COMPAT-2): the two additional detectors are composed
+        # exactly as StatisticalDetector is -- injected, pure, optional.
+        # An explicitly injected detector wins (tests and any caller that
+        # wants one regardless of configuration); otherwise the settings
+        # flag decides, and its default is off. With both off, every line
+        # below behaves as it did in Phase 5, so the pipeline's signals,
+        # severity and event metadata are byte-identical.
+        self._changepoint = changepoint_detector or (
+            ChangepointDetector(
+                min_segment_size=_flag_int(settings, "DETECTION_CHANGEPOINT_MIN_SEGMENT", 4),
+                threshold=_flag_float(settings, "DETECTION_CHANGEPOINT_THRESHOLD", 3.0),
+                # Deseasonalize against the SAME cycle length the seasonal
+                # detector uses. Without it, a weekly metric produces a
+                # spurious "level shift" wherever a split straddles a
+                # weekend: on the F1 benchmark that cost 52 extra false
+                # positives and put this detector's precision BELOW the
+                # Phase-5 baseline (0.2063 vs 0.2236). With it, precision
+                # is 0.2473 — above the baseline, which is the bar a new
+                # detector has to clear to be worth enabling.
+                period=_flag_int(settings, "DETECTION_SEASONAL_PERIOD", 7),
+            )
+            if _flag_enabled(settings, "DETECTION_CHANGEPOINT_ENABLED")
+            else None
+        )
+        self._seasonal = seasonal_detector or (
+            SeasonalHybridDetector(
+                period=_flag_int(settings, "DETECTION_SEASONAL_PERIOD", 7),
+                min_cycles=_flag_int(settings, "DETECTION_SEASONAL_MIN_CYCLES", 3),
+                threshold=_flag_float(settings, "DETECTION_SEASONAL_THRESHOLD", 3.0),
+            )
+            if _flag_enabled(settings, "DETECTION_SEASONAL_HYBRID_ENABLED")
+            else None
+        )
         # Worksheet tab name derived from "SHEET_RANGE" (e.g. "Sheet1!A2:C10"
         # -> "Sheet1"), matching the range operators already configured for
         # the live KPI feed. Falls back to "Sheet1" if unset.
@@ -277,11 +350,31 @@ class MonitorAgent:
             history=clean_history,
         )
 
-        # Step 4: collect base signals (rule + statistical).
+        # Step 3b (Phase F1): additional deterministic detectors. Both are
+        # None unless explicitly enabled, so this whole block is skipped in
+        # the default posture and Step 4 sees exactly what it saw before.
+        changepoint_result: dict[str, Any] | None = None
+        if self._changepoint is not None:
+            changepoint_result = self._changepoint.detect(
+                current=current,
+                history=clean_history,
+            )
+
+        seasonal_result: dict[str, Any] | None = None
+        if self._seasonal is not None:
+            seasonal_result = self._seasonal.detect(
+                current=current,
+                history=clean_history,
+            )
+
+        # Step 4: collect base signals (rule + statistical), plus the F1
+        # detectors when they are enabled.
         signals = self._collect_signals(
             current=current,
             rule_result=rule_result,
             stat_result=stat_result,
+            changepoint_result=changepoint_result,
+            seasonal_result=seasonal_result,
         )
 
         # Step 5: forecast detection (Phase 5).
@@ -326,6 +419,8 @@ class MonitorAgent:
             rule_details=rule_result,
             stat_details=stat_result,
             forecast_details=forecast_result,
+            changepoint_details=changepoint_result,
+            seasonal_details=seasonal_result,
         )
 
         # Step 8: deduplication.
@@ -364,6 +459,8 @@ class MonitorAgent:
         rule_details: dict[str, Any],
         stat_details: dict[str, Any],
         forecast_details: dict[str, Any] | None = None,
+        changepoint_details: dict[str, Any] | None = None,
+        seasonal_details: dict[str, Any] | None = None,
     ) -> Event:
         """
         Construct an immutable :class:`~aeam.core.event_models.Event`.
@@ -383,6 +480,15 @@ class MonitorAgent:
             forecast_details:  Raw result dict from :class:`ForecastAgent.analyze`
                                (Phase 5), when the forecast step ran successfully.
                                ``None`` if the forecast step raised or was skipped.
+            changepoint_details: Raw result dict from
+                               :class:`~aeam.agents.kpi.advanced_detectors.ChangepointDetector`
+                               (Phase F1), or ``None`` when that detector is
+                               not enabled. ``None`` omits the metadata key
+                               entirely, so a default-posture event is
+                               byte-identical to a pre-F1 one (COMPAT-2/4).
+            seasonal_details:  Raw result dict from
+                               :class:`~aeam.agents.kpi.advanced_detectors.SeasonalHybridDetector`
+                               (Phase F1). Same None semantics.
 
         Returns:
             A frozen, immutable :class:`~aeam.core.event_models.Event`.
@@ -395,6 +501,10 @@ class MonitorAgent:
         }
         if forecast_details is not None:
             metadata["forecast"] = forecast_details
+        if changepoint_details is not None:
+            metadata["changepoint"] = changepoint_details
+        if seasonal_details is not None:
+            metadata["seasonal_hybrid"] = seasonal_details
 
         return Event(
             event_id=str(uuid.uuid4()),
@@ -513,6 +623,8 @@ class MonitorAgent:
         current: float,
         rule_result: dict[str, Any],
         stat_result: dict[str, Any],
+        changepoint_result: dict[str, Any] | None = None,
+        seasonal_result: dict[str, Any] | None = None,
     ) -> list[str]:
         """
         Collect the names of all detection signals that fired.
@@ -528,6 +640,14 @@ class MonitorAgent:
             current:     The actual current observed value.
             rule_result: Output dict from :meth:`RuleEngine.evaluate`.
             stat_result: Output dict from :meth:`StatisticalDetector.detect`.
+            changepoint_result: Output dict from
+                         :meth:`ChangepointDetector.detect` (Phase F1), or
+                         ``None`` when the detector is disabled. ``None``
+                         contributes nothing, so the returned list is
+                         identical to the pre-F1 one (COMPAT-2).
+            seasonal_result: Output dict from
+                         :meth:`SeasonalHybridDetector.detect` (Phase F1).
+                         Same None semantics.
 
         Returns:
             List of descriptive signal name strings. Empty list if nothing fired.
@@ -560,6 +680,32 @@ class MonitorAgent:
                     signals.append("statistical:above_p95")
                 # If we're here but no bounds breach, the anomaly must have come
                 # from z-score alone (already added above) - no generic signal needed
+
+        # Phase F1 sub-signals. Each carries the number that justified it,
+        # matching the z-score signal's existing convention so an operator
+        # reading detection_methods can see WHY without opening metadata.
+        #
+        # ASCII only, deliberately: these strings are logged and persisted
+        # in detection_methods, and a Windows console defaulting to cp1252
+        # raises UnicodeEncodeError on a sigma glyph — taking down the log
+        # line, and with it the record of the detection it was describing.
+        if changepoint_result is not None and changepoint_result.get("changepoint_detected"):
+            score = changepoint_result.get("shift_score")
+            magnitude = changepoint_result.get("shift_magnitude")
+            if score is not None and magnitude is not None:
+                signals.append(f"statistical:changepoint({magnitude:+.2f}@{score:.2f}sd)")
+            else:
+                signals.append("statistical:changepoint")
+
+        if seasonal_result is not None and seasonal_result.get("seasonal_anomaly"):
+            score = seasonal_result.get("residual_score")
+            if score is not None:
+                signals.append(f"statistical:seasonal_residual({score:.2f})")
+            else:
+                # A perfectly seasonal series with zero residual spread: the
+                # departure is real but no sigma score exists for it, and
+                # inventing one would be worse than naming the condition.
+                signals.append("statistical:seasonal_residual")
 
         return signals
 

@@ -361,12 +361,53 @@ export function getPendingActions(incident) {
 
 /**
  * The root_cause_source provenance tag from audit_summary (Phase E1, ENG-5):
- * "rag" | "llm_reasoning" | "placeholder" | null. null means either pre-E1
- * incident or no root cause was set.
+ * "rag" | "llm_reasoning" | "kpi_analysis" | "placeholder" | null. null means
+ * either a pre-E1 incident or no root cause was set.
+ *
+ * Phase F1 retired the only producer of "placeholder"; the value still
+ * appears on incidents persisted before F1 and must keep rendering with its
+ * warning (COMPAT-1).
  */
 export function getRootCauseSource(incident) {
   const audit = getAuditSummary(incident);
   return audit?.root_cause_source ?? null;
+}
+
+/**
+ * Badge descriptor for a root cause's provenance, or null when the source
+ * needs no qualifier (a chunk-cited RAG cause speaks for itself).
+ *
+ * One place decides how each provenance is labelled, so the Dashboard and
+ * Investigation views can never drift into describing the same record
+ * differently (EXPL-5: the UI inherits the honesty contract).
+ *
+ * - "placeholder"  → a pre-F1 simulated cause. Warned about, always.
+ * - "kpi_analysis" → Phase F1 measured characterisation. Real analysis, but
+ *   it states WHAT changed, not WHY, and saying so is the honest framing.
+ *
+ * @param {string|null} source  value from {@link getRootCauseSource}
+ * @param {boolean} verbose     longer wording, for the reasoning panel
+ */
+export function rootCauseSourceBadge(source, verbose = false) {
+  if (source === "placeholder") {
+    return {
+      label: verbose ? "Placeholder — not real analysis" : "Placeholder",
+      color: "var(--warn)",
+      title:
+        "Recorded before the KPI Agent existed (Phase F1). This root cause was " +
+        "simulated, never measured, and was quarantined from organizational memory.",
+    };
+  }
+  if (source === "kpi_analysis") {
+    return {
+      label: verbose ? "Measured — statistical characterisation" : "Measured",
+      color: "var(--info, var(--accent))",
+      title:
+        "Produced by the KPI Agent from the event's detector output and real " +
+        "history. It describes what changed and by how much — not why.",
+    };
+  }
+  return null;
 }
 
 /** Count of retrieved evidence chunks recorded for the incident. */
@@ -672,9 +713,14 @@ export function CardTitle({ icon, children, right }) {
 
 // ─── Badge ──────────────────────────────────────────────────────────────────
 
-export function Badge({ label, color = "var(--faint)", dot = false, subtle = true, style = {} }) {
+export function Badge({ label, color = "var(--faint)", dot = false, subtle = true, style = {}, title }) {
   return (
     <span
+      // Additive (Phase F1): a provenance badge is a two-word claim, and
+      // the qualifier behind it belongs on hover rather than in a label
+      // long enough to wrap. Undefined by default — every existing call
+      // site renders exactly as before.
+      title={title}
       style={{
         display: "inline-flex", alignItems: "center", gap: "0.4rem",
         fontSize: "0.68rem", fontWeight: 700, letterSpacing: "0.08em",

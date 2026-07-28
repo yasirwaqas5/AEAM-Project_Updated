@@ -122,15 +122,35 @@ the monitor thread and the trigger thread.
 
 - [x] Placeholder analysis quarantined from organizational memory and operator-facing conclusions (ENG-5).
 
-**How.** `_run_kpi_investigation_placeholder` tags its output
-`root_cause_source="placeholder"` and marks every evidence entry
-`placeholder: True`. `finalize_incident()` quarantines those incidents from
-Enterprise Memory, and the console renders a "Placeholder" badge rather than
-presenting the output as a conclusion.
+**How.** Through E13 this was satisfied by *containment*:
+`_run_kpi_investigation_placeholder` tagged its output
+`root_cause_source="placeholder"`, marked every evidence entry
+`placeholder: True`, `finalize_incident()` quarantined those incidents from
+Enterprise Memory, and the console badged them rather than presenting them
+as conclusions.
 
-**Evidence.** `aeam/agents/orchestrator/orchestrator.py`,
-`aeam/memory/enterprise_memory.py`, `frontend/src/components/EvidencePanel.jsx`,
-`aeam/tests/test_phase_e1_truth_hygiene.py`.
+**Phase F1 satisfies it by elimination.** The placeholder is deleted — not
+disabled, not flag-gated — and replaced by the real `KPIAgent`, whose
+findings are grounded in the event's own detector output and real history
+and are labelled `root_cause_source="kpi_analysis"`. No new incident can
+carry the `placeholder` marker because nothing produces it any more,
+asserted structurally by
+`test_placeholder_method_no_longer_exists` and
+`test_orchestrator_source_contains_no_simulated_root_cause`.
+
+The quarantine itself is deliberately **retained**: incidents persisted
+before F1 still carry the marker, and a replay or re-investigation of one
+must be governed exactly as it was then (COMPAT-1). The console likewise
+keeps its "Placeholder" badge for those historical records, and adds a
+"Measured" badge distinguishing an F1 statistical characterisation — which
+states *what* changed — from a chunk-cited causal explanation.
+
+**Evidence.** `aeam/agents/kpi/kpi_agent.py`,
+`aeam/agents/orchestrator/orchestrator.py`,
+`aeam/memory/enterprise_memory.py`, `frontend/src/components/ui.jsx`,
+`aeam/tests/test_phase_e1_truth_hygiene.py`,
+`aeam/tests/test_phase_f1_detection.py`,
+`aeam/tests/test_phase_c1_enterprise_memory.py`.
 
 - [x] Approval semantics enforced or explicitly documented as advisory (AGENT-5).
 

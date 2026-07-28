@@ -22,12 +22,15 @@ already passes without Qdrant running):
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from aeam.agents.orchestrator.decision_engine import DecisionEngine
 from aeam.agents.orchestrator.evaluation_engine import EvaluationEngine
+from aeam.agents.orchestrator.incident_context import IncidentContext
 from aeam.agents.orchestrator.orchestrator import Orchestrator
-from aeam.agents.orchestrator.state_machine import IncidentStateMachine
+from aeam.agents.orchestrator.state_machine import IncidentState, IncidentStateMachine
 from aeam.config.settings import Settings
 from aeam.core.event_bus import EventBus
 from aeam.core.event_models import Event
@@ -388,15 +391,66 @@ def test_orchestrator_calls_remember_incident_on_finalize():
 def test_placeholder_root_cause_quarantined_from_enterprise_memory():
     """ENG-5: placeholder-derived root causes must never be persisted into
     Enterprise Memory — they would poison future recalls with fabricated
-    precedent. With no RAG agent wired, the orchestrator falls through to the
-    KPI placeholder, producing root_cause_source="placeholder"."""
+    precedent.
+
+    Phase F1 deleted the code that produced ``root_cause_source="placeholder"``,
+    so this can no longer be provoked by running an investigation without a
+    RAG agent. The quarantine itself must still hold, because incidents
+    persisted before F1 carry the marker and a replay or re-investigation of
+    one must be governed exactly as it was then (COMPAT-1). The marker is
+    therefore injected directly — which tests the quarantine rather than the
+    now-removed producer that used to happen to set it.
+    """
+    memory = FakeMemoryEngine()
+    orchestrator, ltm, stm = _build_orchestrator(memory_engine=memory)
+
+    event = _event()
+    ctx = IncidentContext(
+        incident_id="pre-f1-incident",
+        event=event,
+        stm=ShortTermMemory(),
+        state_machine=IncidentStateMachine(incident_id="pre-f1-incident"),
+        started_at=time.perf_counter(),
+    )
+    # Walk the FSM the way handle_event() would, so finalization runs from
+    # a legal state rather than a synthetic one.
+    ctx.state_machine.transition(IncidentState.EVENT_RECEIVED)
+    ctx.state_machine.transition(IncidentState.INVESTIGATING)
+    ctx.stm.initialize(task_type="anomaly_investigation", incident_id="pre-f1-incident")
+    ctx.stm.set("findings", [])
+    ctx.stm.set("evidence", [])
+    ctx.stm.set("hypotheses", [])
+    ctx.stm.set("confidence", 0.6)
+    ctx.stm.set("root_cause", "Simulated root cause for metric 'latency_ms'")
+    ctx.stm.set("root_cause_source", "placeholder")
+
+    orchestrator._finalize_incident(ctx)
+
+    assert ltm.recorded is not None, "The incident must still be persisted."
+    assert memory.remembered == [], (
+        "A pre-F1 placeholder root cause reached Enterprise Memory — the "
+        "ENG-5 quarantine has regressed."
+    )
+
+
+def test_kpi_analysis_root_cause_is_remembered():
+    """The counterpart to the quarantine above, and the point of Phase F1.
+
+    The KPI Agent's characterisation is measured, not simulated, so it is
+    genuine organizational knowledge and must NOT be quarantined. Without
+    this assertion, a future change that widened the ENG-5 filter to cover
+    every non-RAG source would silently stop the platform learning from its
+    own detection work.
+    """
     memory = FakeMemoryEngine()
     orchestrator, ltm, stm = _build_orchestrator(memory_engine=memory)
 
     orchestrator.handle_event(_event())
 
     assert ltm.recorded is not None
-    assert memory.remembered == []
+    assert len(memory.remembered) == 1, "The KPI Agent's analysis was not remembered."
+    assert memory.remembered[0]["root_cause"], "Remembered with no root cause."
+    assert "latency_ms" in memory.remembered[0]["root_cause"]
 
 
 def test_memory_engine_failure_does_not_break_investigation():

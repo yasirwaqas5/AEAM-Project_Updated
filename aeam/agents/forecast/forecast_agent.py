@@ -30,6 +30,10 @@ from typing import Any, Protocol, runtime_checkable
 
 import pandas as pd
 
+from aeam.agents.forecast.backtesting import (
+    SeasonalNaiveForecaster,
+    select_best_model,
+)
 from aeam.agents.forecast.forecast_model import ForecastModel
 from aeam.config.settings import Settings
 from aeam.pipelines.forecast_data_pipeline import ForecastDataPipeline
@@ -44,6 +48,37 @@ _MODEL_MAX_AGE_DAYS: int = 7
 
 # Root directory for persisted models (architecture constraint).
 _MODEL_DIR: str = "models/forecasting"
+
+
+# ---------------------------------------------------------------------------
+# Phase F1 — settings readers
+# ---------------------------------------------------------------------------
+#
+# Read strictly rather than by truthiness. Construction sites across the
+# suite pass Settings-shaped doubles whose attributes are auto-created and
+# truthy; a permissive check would switch backtesting on for every one of
+# them, and a non-numeric ceiling would raise inside the forecast path.
+# Unset must mean exactly the behaviour before these settings existed
+# (COMPAT-3).
+
+
+def _flag_enabled(settings: Any, name: str) -> bool:
+    """True only for a real boolean ``True``."""
+    return getattr(settings, name, False) is True
+
+
+def _flag_int(settings: Any, name: str, default: int) -> int:
+    """Read an integer setting, falling back on anything unusable."""
+    value = getattr(settings, name, None)
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+
+def _flag_float(settings: Any, name: str, default: float) -> float:
+    """Read a float setting, falling back on anything unusable."""
+    value = getattr(settings, name, None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return float(value)
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +164,7 @@ class ForecastAgent:
         data_pipeline: ForecastDataPipeline,
         settings: Settings,
         model_dir: str = _MODEL_DIR,
+        database_client: Any | None = None,
     ) -> None:
         """
         Initialise the ForecastAgent with injected dependencies.
@@ -138,6 +174,15 @@ class ForecastAgent:
             data_pipeline:    ForecastDataPipeline instance.
             settings:         Application Settings.
             model_dir:        Directory for saved model files.
+            database_client:  Phase F1, optional. When wired AND
+                              ``FORECAST_BACKTEST_ENABLED`` is set, each
+                              holdout measurement is recorded to the
+                              ``forecast_backtests`` table so model quality
+                              is trackable over time (OBS-2). ``None`` (the
+                              default) keeps every existing call site
+                              behaving exactly as before (COMPAT-2) — the
+                              validation gate still runs, its result is
+                              simply not persisted.
 
         Raises:
             ValueError: If ``long_term_memory`` or ``data_pipeline`` is None.
@@ -151,6 +196,7 @@ class ForecastAgent:
         self._pipeline: ForecastDataPipeline = data_pipeline
         self._settings: Settings = settings
         self._model_dir: Path = Path(model_dir)
+        self._db: Any | None = database_client
 
     # ------------------------------------------------------------------
     # Public API
@@ -235,19 +281,189 @@ class ForecastAgent:
             )
             return {"insufficient_data": True}
 
-        # Train, save, and return.
-        model = ForecastModel(interval_width=0.95)
-        model.train(prepared_df)
+        # Phase F1 (TECH-6): re-validate before serving. Skipped entirely
+        # unless FORECAST_BACKTEST_ENABLED, so the default posture is the
+        # Phase-5 train-and-serve path, unchanged.
+        backtest_record: dict[str, Any] | None = None
+        if _flag_enabled(self._settings, "FORECAST_BACKTEST_ENABLED"):
+            model, backtest_record = self._train_validated(metric_name, prepared_df)
+            if model is None:
+                # Refused. Reporting insufficient_data rather than serving
+                # is the honest outcome: the platform has no model it can
+                # stand behind for this metric, and a silently-bad forecast
+                # would produce deviation signals that are pure noise.
+                #
+                # The refusal is recorded BEFORE returning. It is the single
+                # most important measurement to keep: it is the answer to
+                # "why did this metric stop forecasting?", and the question
+                # the idx_forecast_backtests_refused index exists to serve.
+                # Returning first would leave that index querying an empty
+                # set forever.
+                self._record_backtest(metric_name, backtest_record)
+                return {
+                    "insufficient_data": True,
+                    "backtest": backtest_record,
+                }
+        else:
+            model = ForecastModel(interval_width=0.95)
+            model.train(prepared_df)
 
         self._model_dir.mkdir(parents=True, exist_ok=True)
         model.save_model(str(model_path))
 
+        if backtest_record is not None:
+            self._record_backtest(metric_name, backtest_record)
+
         logger.info(
-            "load_or_train | trained and saved | metric=%s | path=%s",
+            "load_or_train | trained and saved | metric=%s | path=%s | holdout_mape=%s",
             metric_name, model_path,
+            backtest_record.get("mape") if backtest_record else "not measured",
         )
 
         return model
+
+    # ------------------------------------------------------------------
+    # Phase F1 — model quality (TECH-6)
+    # ------------------------------------------------------------------
+
+    def _train_validated(
+        self,
+        metric_name: str,
+        prepared_df: pd.DataFrame,
+    ) -> tuple[ForecastModel | None, dict[str, Any]]:
+        """Train a model that has earned the right to serve.
+
+        With model selection on, candidates are backtested and the
+        lowest-MAPE one is retrained on the full series. With it off, the
+        single Phase-5 configuration is backtested. Either way the winning
+        configuration is refit on ALL the data before serving — the
+        backtest measures a configuration, and shipping the fold-trained
+        artifact would serve a model that never saw the most recent
+        observations.
+
+        Returns:
+            ``(model, record)``. ``model`` is ``None`` when the holdout
+            error exceeded ``FORECAST_MAX_HOLDOUT_MAPE``; ``record`` always
+            describes what was measured, including on refusal.
+        """
+        holdout = _flag_int(self._settings, "FORECAST_BACKTEST_HOLDOUT", 7)
+        ceiling = _flag_float(self._settings, "FORECAST_MAX_HOLDOUT_MAPE", 0.0)
+
+        candidates: dict[str, Any] = {
+            "prophet": lambda: ForecastModel(interval_width=0.95),
+        }
+        if _flag_enabled(self._settings, "FORECAST_MODEL_SELECTION_ENABLED"):
+            # The seasonal-naive baseline is a genuine candidate, not a
+            # formality: on a metric with a clean weekly cycle and little
+            # trend it frequently wins, and letting it win is the honest
+            # outcome (AI-2 — the platform should not prefer a complex
+            # model that measures worse).
+            candidates["seasonal_naive_7"] = lambda: SeasonalNaiveForecaster(period=7)
+
+        winner, result, all_results = select_best_model(
+            prepared_df, candidates, holdout=holdout, folds=1,
+        )
+
+        record: dict[str, Any] = {
+            "metric": metric_name,
+            "selected_model": winner,
+            "mape": result.mape if result is not None else None,
+            "mae": result.mae if result is not None else None,
+            "holdout": holdout,
+            "points_scored": result.points_scored if result is not None else 0,
+            "training_rows": len(prepared_df),
+            "candidates": {name: res.to_dict() for name, res in all_results.items()},
+            "ceiling": ceiling if ceiling > 0 else None,
+            "refused": False,
+            "reason": None,
+        }
+
+        if result is None or not result.usable:
+            # Could not measure. That is NOT a refusal — refusing to serve
+            # because a metric has too little history would be a regression
+            # against Phase 5, which served happily without measuring. The
+            # honest posture is: serve, and record that quality is unknown.
+            record["reason"] = (
+                (result.failed or result.insufficient_data)
+                if result is not None
+                else "No candidate produced a usable backtest."
+            )
+            logger.info(
+                "load_or_train | backtest not usable | metric=%s | %s | serving anyway "
+                "(quality unmeasured, not refused)",
+                metric_name, record["reason"],
+            )
+            model = ForecastModel(interval_width=0.95)
+            model.train(prepared_df)
+            return model, record
+
+        if ceiling > 0 and result.mape > ceiling:
+            record["refused"] = True
+            record["reason"] = (
+                f"Holdout MAPE {result.mape:.4f}% exceeds the "
+                f"FORECAST_MAX_HOLDOUT_MAPE ceiling of {ceiling:.4f}%."
+            )
+            logger.warning(
+                "load_or_train | model REFUSED (TECH-6) | metric=%s | %s",
+                metric_name, record["reason"],
+            )
+            return None, record
+
+        # Refit the winning configuration on the complete series.
+        if winner == "seasonal_naive_7":
+            # The seasonal-naive baseline won the measurement but cannot be
+            # persisted as a ForecastModel or produce prediction intervals,
+            # which detect_deviation needs. Serving Prophet while recording
+            # that a trivial baseline beat it is the honest report: the
+            # number is preserved for whoever tunes this metric, and no
+            # capability is silently dropped.
+            record["reason"] = (
+                "Seasonal-naive baseline measured better than Prophet on the holdout; "
+                "Prophet is served because deviation detection requires prediction "
+                "intervals the baseline does not produce. Investigate this metric's "
+                "model configuration."
+            )
+            logger.warning(
+                "load_or_train | seasonal-naive baseline beat Prophet | metric=%s | "
+                "naive_mape=%.4f%%", metric_name, result.mape,
+            )
+
+        model = ForecastModel(interval_width=0.95)
+        model.train(prepared_df)
+        return model, record
+
+    def _record_backtest(self, metric_name: str, record: dict[str, Any]) -> None:
+        """Persist a backtest result to the ``forecast_backtests`` table.
+
+        Best-effort by design (same contract as the audit sink): a
+        quality-tracking write must never break the forecast path it is
+        measuring. Silently skipped when no database client is wired, which
+        is the case for every unit test and any caller that constructed the
+        agent without one.
+        """
+        if self._db is None:
+            return
+        try:
+            self._db.insert(
+                table="forecast_backtests",
+                data={
+                    "metric": metric_name,
+                    "selected_model": record.get("selected_model"),
+                    "holdout_mape": record.get("mape"),
+                    "holdout_mae": record.get("mae"),
+                    "holdout_points": record.get("points_scored"),
+                    "training_rows": record.get("training_rows"),
+                    "refused": bool(record.get("refused")),
+                    "reason": record.get("reason"),
+                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                },
+                returning_column="backtest_id",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "load_or_train | backtest record not persisted | metric=%s | %s",
+                metric_name, exc,
+            )
 
     def analyze(
         self,

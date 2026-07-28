@@ -217,9 +217,26 @@ CREATE TABLE IF NOT EXISTS review_verdicts (
 );
 """
 
+_FORECAST_BACKTESTS = """
+CREATE TABLE IF NOT EXISTS forecast_backtests (
+    backtest_id      TEXT PRIMARY KEY,
+    metric           TEXT NOT NULL,
+    selected_model   TEXT,             -- winning candidate name
+    holdout_mape     DOUBLE PRECISION, -- percent; NULL when unmeasurable
+    holdout_mae      DOUBLE PRECISION, -- metric's own units
+    holdout_points   INTEGER,          -- points actually scored
+    training_rows    INTEGER,
+    refused          BOOLEAN DEFAULT FALSE,  -- TECH-6: model denied the right to serve
+    reason           TEXT,
+    created_at       TIMESTAMP
+);
+"""
+
 _DDL: tuple[str, ...] = (
     _SOURCES, _DOCUMENTS, _DATASETS, _SCHEMAS, _VERSIONS, _INGESTION_JOBS, _POLICIES,
     _INCIDENT_APPROVALS, _REVIEW_VERDICTS,
+    # Phase F1 — forecast model quality tracking (TECH-6, OBS-2).
+    _FORECAST_BACKTESTS,
 )
 
 # Helpful lookup indexes for the query patterns later phases rely on.
@@ -239,6 +256,10 @@ _INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_approvals_status ON incident_approvals (status);",
     "CREATE INDEX IF NOT EXISTS idx_verdicts_incident ON review_verdicts (incident_id);",
     "CREATE INDEX IF NOT EXISTS idx_verdicts_approval ON review_verdicts (approval_id);",
+    # Phase F1 — "this metric's forecast quality over time", and "which
+    # models were refused" (the review after a metric stops forecasting).
+    "CREATE INDEX IF NOT EXISTS idx_forecast_backtests_metric ON forecast_backtests (metric, created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_forecast_backtests_refused ON forecast_backtests (refused);",
 )
 
 

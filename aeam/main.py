@@ -414,6 +414,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         long_term_memory=long_term_memory,
         data_pipeline=container.pipeline,
         settings=settings,
+        # Phase F1 (TECH-6/OBS-2): gives holdout measurements somewhere
+        # durable to land. Inert unless FORECAST_BACKTEST_ENABLED is set.
+        database_client=container.db,
         **_forecast_kwargs,
     )
 
@@ -981,10 +984,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # startup — monitor and action are conditional on configuration. Read by
     # GET /api/v1/system/status instead of a hardcoded count, so the figure
     # can never drift from the wiring above.
+    # Phase F1: "kpi" is listed only when the KPI Agent was actually
+    # constructed. The Orchestrator builds it itself from settings (the
+    # placeholder it replaces was unconditional), so the roster reads back
+    # what exists rather than asserting it.
     container.agent_roster = sorted(
         ["orchestrator", "rag", "forecast", "report"]
         + (["monitor"] if monitor_agent is not None else [])
         + (["action"] if action_agent is not None else [])
+        + (["kpi"] if getattr(orchestrator, "_kpi_agent", None) is not None else [])
     )
     logger.info("Agent roster | %s", container.agent_roster)
 

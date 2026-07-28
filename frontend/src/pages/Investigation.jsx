@@ -5,6 +5,7 @@ import {
   fmtTime, fmtRelative, severityOf, deriveStatus,
   getAuditSummary, getRetrievedCount, getRecommendedActions, getActionOutcome,
   actionLabel, getValidationStatus, getEvidence, parseMaybeJSON, getRootCauseSource,
+  rootCauseSourceBadge,
 } from "../components/ui";
 import {
   PageContainer, SplitLayout, Panel, EmptyState, LoadingState, ErrorState,
@@ -191,9 +192,13 @@ function InvestigationSummary({ incident }) {
         <div className="aeam-grid-auto" style={{ flex: 1, minWidth: 260 }}>
           <div>
             <Field label="Root Cause" value={incident.root_cause || "Pending"} />
-            {getRootCauseSource(incident) === "placeholder" && (
-              <Badge label="Placeholder" color="var(--warn)" style={{ marginTop: "0.4rem" }} />
-            )}
+            {(() => {
+              const badge = rootCauseSourceBadge(getRootCauseSource(incident));
+              return badge && (
+                <Badge label={badge.label} color={badge.color} title={badge.title}
+                       style={{ marginTop: "0.4rem" }} />
+              );
+            })()}
           </div>
           <Field label="Affected Metric" value={incident.metric || "—"} mono />
           <Field label="Business Impact"
@@ -222,9 +227,13 @@ function ReasoningPanel({ incident }) {
         {incident.root_cause ? (
           <div>
             <p style={{ fontSize: "0.82rem", color: "var(--text)", lineHeight: 1.6, margin: 0 }}>{incident.root_cause}</p>
-            {getRootCauseSource(incident) === "placeholder" && (
-              <Badge label="Placeholder — not real analysis" color="var(--warn)" style={{ marginTop: "0.5rem" }} />
-            )}
+            {(() => {
+              const badge = rootCauseSourceBadge(getRootCauseSource(incident), true);
+              return badge && (
+                <Badge label={badge.label} color={badge.color} title={badge.title}
+                       style={{ marginTop: "0.5rem" }} />
+              );
+            })()}
           </div>
         ) : (
           <div style={{ fontSize: "0.78rem", color: "var(--muted)" }}>

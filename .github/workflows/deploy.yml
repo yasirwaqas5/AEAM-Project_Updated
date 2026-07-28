@@ -242,6 +242,19 @@ jobs:
           LLM_ENABLED: "false"
           HF_HOME: "${{ runner.temp }}/hf_cache"
 
+      # Phase F1: detection quality is a gate for the same reason latency is.
+      # The suite asserts precision/recall against the recorded Phase-5
+      # baseline in aeam/tests/fixtures/detection_baselines.json, so a change
+      # that quietly loses a detector — or trades recall for precision —
+      # fails the build with the numbers that moved.
+      - name: Run detection quality benchmark
+        run: python -m pytest aeam/tests/test_phase_f1_detection.py -v
+        env:
+          REDIS_URL: "redis://localhost:6379/0"
+          ENVIRONMENT: "test"
+          LLM_ENABLED: "false"
+          HF_HOME: "${{ runner.temp }}/hf_cache"
+
   # ────────────────────────────────────────────────────────
   # Stage 3: Build Docker image
   # Runs only after tests AND the E13 gates pass, on main branch only

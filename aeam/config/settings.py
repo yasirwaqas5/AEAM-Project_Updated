@@ -99,6 +99,149 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Detection & forecast intelligence uplift (Phase F1) ---
+    #
+    # Every detection change in F1 is flag-gated with today's behaviour as
+    # the default (COMPAT-2), so an unset deployment runs the exact Phase-5
+    # detection pipeline byte-for-byte. The KPI Agent is the one exception
+    # and it defaults ON: it replaces a placeholder that F1 *deletes*, so
+    # defaulting it off would leave the investigation loop with no KPI pass
+    # at all — strictly worse than the honestly-labelled stand-in it
+    # retires. Its flag exists for the documented rollback, not as a
+    # posture anyone should run.
+
+    KPI_AGENT_ENABLED: bool = Field(
+        default=True,
+        description=(
+            "Phase F1 (PHIL-1): enables the real KPIAgent investigation "
+            "pass. True (the default) is the intended posture. False "
+            "disables the KPI pass entirely — it does NOT restore the "
+            "pre-F1 placeholder, which was deleted rather than bypassed; "
+            "reinstating that requires a version-control revert (see the "
+            "F1 rollback strategy in ROADMAP.md)."
+        ),
+    )
+
+    KPI_AGENT_HISTORY_LIMIT: int = Field(
+        default=90,
+        ge=2,
+        description=(
+            "Phase F1: maximum historical observations the KPIAgent fetches "
+            "per investigation. Bounds the query the same way E6 bounds "
+            "every other read path; 90 daily points covers a quarter."
+        ),
+    )
+
+    DETECTION_CHANGEPOINT_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "Phase F1 (COMPAT-2): enables ChangepointDetector in the "
+            "MonitorAgent detection pipeline. False (the default) leaves "
+            "the pipeline's signals, severity and event metadata "
+            "byte-identical to Phase 5."
+        ),
+    )
+
+    DETECTION_CHANGEPOINT_THRESHOLD: float = Field(
+        default=3.0,
+        gt=0,
+        description=(
+            "Phase F1 (ENG-6): robust-sigma score above which a level shift "
+            "is reported. Overrides advanced_detectors.py's engine-owned "
+            "default; matches the z-score threshold so both speak the same "
+            "units."
+        ),
+    )
+
+    DETECTION_CHANGEPOINT_MIN_SEGMENT: int = Field(
+        default=4,
+        ge=2,
+        description=(
+            "Phase F1 (ENG-6): minimum observations either side of a "
+            "candidate changepoint. Smaller segments make 'level' "
+            "meaningless."
+        ),
+    )
+
+    DETECTION_SEASONAL_HYBRID_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "Phase F1 (COMPAT-2): enables SeasonalHybridDetector in the "
+            "MonitorAgent detection pipeline. False (the default) leaves "
+            "Phase-5 behaviour unchanged."
+        ),
+    )
+
+    DETECTION_SEASONAL_PERIOD: int = Field(
+        default=7,
+        ge=2,
+        description=(
+            "Phase F1 (ENG-6): seasonal cycle length in observations "
+            "(7 = weekly on daily data)."
+        ),
+    )
+
+    DETECTION_SEASONAL_MIN_CYCLES: int = Field(
+        default=3,
+        ge=2,
+        description=(
+            "Phase F1 (ENG-6): complete cycles required before the seasonal "
+            "detector emits any score. Below this it honestly reports "
+            "insufficient data rather than guessing a seasonal shape."
+        ),
+    )
+
+    DETECTION_SEASONAL_THRESHOLD: float = Field(
+        default=3.0,
+        gt=0,
+        description=(
+            "Phase F1 (ENG-6): robust-sigma score above which a seasonal "
+            "residual is an anomaly."
+        ),
+    )
+
+    FORECAST_BACKTEST_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "Phase F1 (TECH-6): when true, a newly trained forecast model "
+            "is backtested on a holdout before it is allowed to serve, and "
+            "its holdout MAPE is recorded. False (the default) preserves "
+            "the Phase-5 train-and-serve behaviour exactly."
+        ),
+    )
+
+    FORECAST_BACKTEST_HOLDOUT: int = Field(
+        default=7,
+        ge=1,
+        description=(
+            "Phase F1: number of trailing observations withheld from "
+            "training and used as the backtest horizon."
+        ),
+    )
+
+    FORECAST_MAX_HOLDOUT_MAPE: float = Field(
+        default=0.0,
+        ge=0,
+        description=(
+            "Phase F1 (TECH-6): holdout MAPE (percent) above which a newly "
+            "trained model is REFUSED and the metric reports insufficient "
+            "data rather than serving predictions nobody validated. 0.0 "
+            "(the default) means 'record the score but never refuse' — "
+            "unset must mean exactly the behaviour before this setting "
+            "existed (COMPAT-3)."
+        ),
+    )
+
+    FORECAST_MODEL_SELECTION_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "Phase F1: when true (and FORECAST_BACKTEST_ENABLED is also "
+            "true), candidate models are backtested and the lowest-MAPE "
+            "candidate serves. False (the default) trains the single "
+            "Phase-5 configuration."
+        ),
+    )
+
     # --- Autonomous operations supervision (Phase E7, OBS-3/4) ---
 
     HEARTBEAT_STALE_SECONDS: int = Field(
