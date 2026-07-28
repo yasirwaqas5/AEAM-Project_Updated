@@ -6,12 +6,20 @@ import { Card, Button, Icon } from "../components/ui";
 /* ──────────────────────────────────────────────────────────────────────────
  * pages/Login.jsx
  *
- * Phase E10 console login surface. AEAM validates enterprise-issued tokens
- * rather than acting as an identity provider, so this page's only real job
- * is: accept a bearer token (obtained from whatever issues them for this
- * deployment) and hand it to AuthProvider. Full OIDC/SSO redirect flow is
- * Phase E13; this page is the landing zone it will attach a "Sign in with
- * SSO" button to, next to the same paste-token fallback.
+ * Phase E10 console login surface, completed by Phase E13's SSO redirect.
+ * AEAM validates enterprise-issued tokens rather than acting as an identity
+ * provider, so this page offers exactly two ways to obtain one:
+ *
+ *   1. "Sign in with SSO" — starts the OIDC authorization-code + PKCE
+ *      redirect, shown only when the deployment actually federates
+ *      identity (GET /api/v1/auth/sso/config says so). When SSO is off,
+ *      the button is absent and the reason is stated rather than a
+ *      dead control being rendered (EXPL-5: nothing renders as real that
+ *      isn't).
+ *   2. Pasting a bearer token issued by the organization's IdP — the
+ *      pre-E13 path, kept unchanged as the fallback for deployments
+ *      without federation and as the documented rollback if SSO
+ *      configuration is reverted.
  *
  * In a development posture AuthProvider auto-acquires a token before this
  * page would ever be reached (RequireAuth redirects here only once booting
@@ -25,6 +33,7 @@ export default function Login() {
   const location = useLocation();
   const [tokenInput, setTokenInput] = useState("");
   const [error, setError] = useState(null);
+  const [redirecting, setRedirecting] = useState(false);
 
   function handleSubmit(e) {
     e.preventDefault();
@@ -35,6 +44,18 @@ export default function Login() {
     }
     const dest = location.state?.from?.pathname || "/";
     navigate(dest, { replace: true });
+  }
+
+  async function handleSsoSignIn() {
+    setError(null);
+    setRedirecting(true);
+    const result = await auth.loginWithSso();
+    if (!result.ok) {
+      setError(result.error);
+      setRedirecting(false);
+    }
+    // On success the browser is already navigating to the IdP; leaving
+    // `redirecting` true keeps the button disabled until it does.
   }
 
   return (
@@ -50,6 +71,27 @@ export default function Login() {
             <div style={{ fontSize: "var(--fs-xs)", color: "var(--muted)" }}>Sign in to continue</div>
           </div>
         </div>
+
+        {auth.ssoEnabled && (
+          <div style={{ marginBottom: "var(--sp-4)" }}>
+            <Button
+              variant="primary"
+              style={{ width: "100%" }}
+              onClick={handleSsoSignIn}
+              disabled={redirecting}
+            >
+              {redirecting ? "Redirecting to your identity provider…" : "Sign in with SSO"}
+            </Button>
+            <div style={{
+              display: "flex", alignItems: "center", gap: "var(--sp-2)",
+              margin: "var(--sp-4) 0 0", color: "var(--faint)", fontSize: "var(--fs-2xs)",
+            }}>
+              <span style={{ flex: 1, height: 1, background: "var(--border)" }} />
+              or paste a token
+              <span style={{ flex: 1, height: 1, background: "var(--border)" }} />
+            </div>
+          </div>
+        )}
 
         <form onSubmit={handleSubmit}>
           <label style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
@@ -80,13 +122,22 @@ export default function Login() {
           )}
 
           <div style={{ marginTop: "var(--sp-4)" }}>
-            <Button type="submit" variant="primary" style={{ width: "100%" }}>Sign in</Button>
+            <Button
+              type="submit"
+              variant={auth.ssoEnabled ? "ghost" : "primary"}
+              style={{ width: "100%" }}
+            >
+              Sign in
+            </Button>
           </div>
         </form>
 
         <p style={{ fontSize: "var(--fs-2xs)", color: "var(--faint)", marginTop: "var(--sp-4)" }}>
-          AEAM validates tokens issued by your organization's identity provider — it does
-          not issue credentials itself. Federated single sign-on lands in a future phase.
+          AEAM validates tokens issued by your organization&rsquo;s identity provider — it does
+          not issue credentials itself.
+          {auth.sso && !auth.sso.enabled && (
+            <> Single sign-on is not available: {auth.sso.reason}</>
+          )}
         </p>
       </Card>
     </div>

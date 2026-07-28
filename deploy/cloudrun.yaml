@@ -149,6 +149,58 @@ spec:
               # durable sink is the audit_logs table (Phase E3).
               value: "/tmp/audit.log"
 
+            # ---------- Phase E13 (SEC-1/SEC-4) — enterprise SSO ----------
+            # Disabled by default: this manifest ships the E3 static-key
+            # posture, and JWT_PUBLIC_KEY above is what verifies tokens.
+            # To federate identity, register the console at the IdP as a
+            # PUBLIC client (authorization code + PKCE, redirect URI
+            # https://<console-host>/auth/callback), then flip this to
+            # "true" and set the two required values below. Startup ABORTS
+            # if it is true and either is missing -- a half-configured
+            # federation must never silently fall back to a weaker
+            # posture. See docs/SECURITY_POSTURE.md.
+            - name: OIDC_ENABLED
+              value: "false"
+
+            # - name: OIDC_ISSUER
+            #   value: "https://login.microsoftonline.com/<tenant>/v2.0"
+            # - name: OIDC_CLIENT_ID
+            #   value: "aeam-console"
+            # - name: OIDC_REDIRECT_URI
+            #   value: "https://aeam.example.com/auth/callback"
+            # - name: OIDC_SCOPES
+            #   value: "openid profile email"
+            # Set to the claim your IdP puts group/role membership in.
+            # Values must be members of aeam/security/rbac.py's vocabulary;
+            # an unrecognised role grants nothing (deny by default).
+            # - name: OIDC_ROLES_CLAIM
+            #   value: "roles"
+            #
+            # A client SECRET is only needed for a confidential client,
+            # which is NOT the recommended posture for a browser console.
+            # If your IdP requires one, source it from Secret Manager --
+            # never inline (SEC-5).
+            # - name: OIDC_CLIENT_SECRET
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: aeam-oidc-client-secret
+            #       key: latest
+
+            # ---------- Phase E13 (Article XVI) — declared postures ----------
+            # Declarations, not enforcement. AEAM implements no tenant
+            # partitioning: one deployment serves one organization, and
+            # isolation between organizations is achieved by deploying
+            # separately. Surfaced at GET /api/v1/system/compliance so the
+            # reported posture is always the configured one.
+            - name: TENANCY_MODEL
+              value: "single-tenant"
+
+            - name: DATA_CLASSIFICATION
+              value: "internal"
+
+            - name: PII_POSTURE
+              value: "not-expected"
+
             # ---------- Phase E4 (ARCH-7) — durable BlobStore ----------
             - name: BLOB_STORAGE_BACKEND
               value: "s3"

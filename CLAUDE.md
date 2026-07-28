@@ -29,6 +29,8 @@ Optional: `SLACK_BOT_TOKEN`, `JIRA_URL`, `JIRA_API_TOKEN`, `LLM_PROVIDER`, `LLM_
 
 `ENVIRONMENT` has no default — it must be one of `development` / `staging` / `production` / `test`. It also controls `SecurityMiddleware`: when set to `development`, **all** JWT/RBAC/rate-limit checks are bypassed. Never run a deployed instance with `ENVIRONMENT=development`.
 
+Enterprise SSO (Phase E13) is off by default. Setting `OIDC_ENABLED=true` requires `OIDC_ISSUER` and `OIDC_CLIENT_ID` — startup aborts otherwise, **in every environment including development**, so a half-configured federation can never silently fall back to the static-key or placeholder posture. Full variable list and IdP walkthrough: `docs/SECURITY_POSTURE.md`; canonical manifest: `deploy/env.yaml`.
+
 ## Known Issues & Quick Fixes
 - **401 on /api in dev** → expected: `SecurityMiddleware` bypasses auth entirely when `ENVIRONMENT=development`. To test authenticated flows locally, issue a real JWT. Never make the bypass unconditional (e.g. `or True`) — that disables auth in every environment, including production.
 - **No scheduler** → the APScheduler stub was removed in Phase E1; events enter only via `POST /api/v1/trigger` or `run_simulation.py`. Autonomous polling is deferred to Phase E7.
@@ -51,6 +53,12 @@ Trigger → EventBus → Orchestrator → DecisionEngine → EvaluationEngine �
 - Orchestrator: Coordinates investigation, hybrid decision (rules + LLM)
 - ActionAgent: Executes Slack, Jira, Email, Webhooks
 - ReportAgent: Generates human-readable summaries
+
+## Enterprise Evidence Pack (Phase E13)
+- `docs/ENTERPRISE_CERTIFICATION.md` — Article XVI sweep (all 19 items, evidence per item) + audit re-score. Its contents are re-verified by `aeam/tests/test_phase_e13_certification.py` on every run, so an added Constitution item or a rotted evidence link fails the build.
+- `docs/SECURITY_POSTURE.md` — identity/SSO configuration, RBAC tiers, audit, secrets, supply chain, deliberate non-goals.
+- `docs/DISASTER_RECOVERY.md` — per-store backup posture, restore procedure, recorded drill result. Rehearse with `python scripts/dr_drill.py --backup-dir ... --restore-database-url ...` (it refuses to restore over its own source).
+- `docs/PERFORMANCE_BASELINES.md` — recorded budgets; the numbers live in `aeam/tests/fixtures/performance_budgets.json` and gate CI.
 
 ## Testing
 - `pytest` for backend tests

@@ -128,7 +128,7 @@ from aeam.api.data_center import router as data_center_router
 from aeam.api.observability import router as observability_router
 from aeam.api.administration import router as administration_router
 from aeam.api.review import router as review_router
-from aeam.api.auth import router as auth_router
+from aeam.api.auth import router as auth_router, resolve_oidc_endpoints
 from aeam.api.audit import router as audit_router
 
 # ---------------------------------------------------------------------------
@@ -1046,14 +1046,28 @@ _DEV_PLACEHOLDER_KEY: str = "dummy-public-key"
 
 
 def _build_jwt_auth(settings: Settings) -> JWTAuth:
-    """Resolve the JWT public key from SecretManager and construct JWTAuth.
+    """Resolve JWT key material and construct JWTAuth.
+
+    Phase E13 adds a preceding branch: when ``OIDC_ENABLED`` is set, key
+    material comes from the enterprise IdP's JWKS document instead of a
+    static PEM, and the expected issuer/audience default to the IdP's
+    issuer and the registered client id. Everything downstream of the
+    verifier -- RBAC, rate limiting, audit -- is untouched by the switch.
 
     Fails closed in non-development environments if no real key material
-    is configured. In development, falls back to the well-known
-    placeholder with a loud WARNING so nobody deploys it by accident.
+    is configured, and fails closed in *every* environment if OIDC is
+    enabled but incompletely configured (a half-configured federation must
+    never silently degrade to a weaker posture). In development without
+    OIDC, falls back to the well-known placeholder with a loud WARNING so
+    nobody deploys it by accident.
     """
     secret_manager = SecretManager(settings=settings)
     environment = (settings.ENVIRONMENT or "").strip().lower()
+
+    # 0. Phase E13 — enterprise SSO. Checked first because when it is on it
+    #    is the whole answer: the static PEM plays no part.
+    if bool(getattr(settings, "OIDC_ENABLED", False)):
+        return _build_oidc_jwt_auth(settings)
 
     # 1. PEM literal via SecretManager (env-first, settings-fallback).
     pem: str = str(secret_manager.get_secret("JWT_PUBLIC_KEY", default="") or "").strip()
@@ -1097,6 +1111,82 @@ def _build_jwt_auth(settings: Settings) -> JWTAuth:
         public_key=pem,
         issuer=settings.JWT_ISSUER,
         audience=settings.JWT_AUDIENCE,
+    )
+
+
+def _build_oidc_jwt_auth(settings: Settings) -> JWTAuth:
+    """Construct the JWKS-backed verifier for an enterprise SSO deployment.
+
+    Fail-closed contract (SEC-4), applied in every environment including
+    development: enabling federation without the issuer, client id, or a
+    resolvable JWKS endpoint aborts startup. The alternative -- quietly
+    falling back to the static-key or placeholder path -- would mean an
+    operator who believes SSO is enforcing identity is running a posture
+    that is not.
+
+    The JWKS URL is taken from OIDC_JWKS_URL when pinned, otherwise from
+    the IdP's discovery document. Discovery happens once, here at startup,
+    so a misconfigured issuer is a loud startup failure rather than a
+    mysterious 401 on the first sign-in.
+
+    Raises:
+        RuntimeError: If OIDC is enabled but issuer/client id are missing,
+                      or the JWKS endpoint cannot be determined.
+    """
+    issuer = str(settings.OIDC_ISSUER or "").strip()
+    client_id = str(settings.OIDC_CLIENT_ID or "").strip()
+
+    missing = [
+        name
+        for name, value in (("OIDC_ISSUER", issuer), ("OIDC_CLIENT_ID", client_id))
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(
+            f"OIDC_ENABLED is true but {', '.join(missing)} "
+            f"{'is' if len(missing) == 1 else 'are'} not configured. "
+            "Startup aborted (Phase E13, SEC-4)."
+        )
+
+    try:
+        endpoints = resolve_oidc_endpoints(settings)
+    except Exception as exc:  # noqa: BLE001
+        # resolve_oidc_endpoints raises HTTPException(502) for an
+        # unreachable IdP -- correct inside a request, meaningless at
+        # startup, so it is restated as the fail-closed abort it is here.
+        raise RuntimeError(
+            f"OIDC discovery failed for issuer {issuer!r}: {exc}. "
+            "Startup aborted (Phase E13, SEC-4)."
+        ) from exc
+
+    jwks_uri = endpoints["jwks_uri"]
+    if not jwks_uri:
+        raise RuntimeError(
+            f"OIDC issuer {issuer!r} published no jwks_uri and OIDC_JWKS_URL "
+            "is not set; token signatures could not be verified. Startup "
+            "aborted (Phase E13, SEC-4)."
+        )
+
+    algorithms = [
+        part.strip()
+        for part in str(settings.OIDC_ALGORITHMS or "").split(",")
+        if part.strip()
+    ]
+
+    logger.info(
+        "Enterprise SSO enabled | issuer=%s | client_id=%s | jwks_uri=%s",
+        issuer, client_id, jwks_uri,
+    )
+
+    # JWT_ISSUER / JWT_AUDIENCE keep their ENG-6 override role: unset means
+    # "expect what the IdP configuration implies" (the issuer itself, and
+    # the client id as audience), which is the correct OIDC default.
+    return JWTAuth(
+        public_key="",
+        issuer=settings.JWT_ISSUER or issuer,
+        audience=settings.JWT_AUDIENCE or client_id,
+        jwks_url=jwks_uri,
+        algorithms=algorithms or None,
     )
 
 

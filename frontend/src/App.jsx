@@ -10,6 +10,7 @@ import { Icon } from "./components/ui";
 import { NAV_ITEMS } from "./config/nav";
 
 const Login = lazy(() => import("./pages/Login"));
+const SsoCallback = lazy(() => import("./pages/SsoCallback"));
 
 /* ──────────────────────────────────────────────────────────────────────────
  * App.jsx — root: design tokens + route table.
@@ -267,6 +268,12 @@ export default function App() {
                 } />
                 <Route path="/login" element={
                   <Suspense fallback={<RouteFallback />}><Login /></Suspense>
+                } />
+                {/* Phase E13: the OIDC redirect target. Unauthenticated by
+                    necessity — it is where the token arrives — so it sits
+                    outside RequireAuth alongside /login. */}
+                <Route path="/auth/callback" element={
+                  <Suspense fallback={<RouteFallback />}><SsoCallback /></Suspense>
                 } />
                 <Route path="*" element={
                   <RequireAuth>

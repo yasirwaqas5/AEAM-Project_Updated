@@ -1,0 +1,39 @@
+# ============================================================
+# AEAM — known-vulnerable dependency FIXTURE (Phase E13)
+# deploy/security/vulnerable-fixture-requirements.txt
+#
+# THIS FILE IS NEVER INSTALLED. It is a deliberate negative test for the
+# supply-chain gate in .github/workflows/deploy.yml.
+#
+# E13's acceptance criterion is "CI blocks on a known-vulnerable
+# dependency fixture" — a scanner that has never been observed failing is
+# indistinguishable from a scanner that is silently misconfigured. The CI
+# job runs `pip-audit` against this file and requires BOTH:
+#
+#   1. a non-zero exit, AND
+#   2. output naming an actual advisory ("known vulnerabilities").
+#
+# Both conditions matter. pip-audit also exits non-zero when it simply
+# cannot resolve a requirements file, and a fixture that "fails" for that
+# reason would prove the gate works while proving nothing at all. The
+# second condition is what makes this a real self-test.
+#
+# The pin below is a long-superseded release with a published advisory in
+# the Python Packaging Advisory Database:
+#
+#   PyYAML 5.3.1 — PYSEC-2021-142 / CVE-2020-14343: arbitrary code
+#   execution via yaml.full_load on untrusted input. Fixed in 5.4.
+#
+# One package, deliberately: the fixture must be *resolvable* so that
+# pip-audit reaches the advisory-lookup stage. An earlier draft pinned
+# requests 2.19.1 and urllib3 1.24.1 together, which pip cannot resolve
+# (requests 2.19.1 requires urllib3<1.24) — the scan exited non-zero
+# without ever consulting an advisory database.
+#
+# If the advisory database ever stops reporting this pin, the job's
+# assertion fails loudly and this fixture must be re-pinned to a package
+# that is still reported. The fixture's job is to be reliably vulnerable;
+# a silently-clean fixture is a broken test, not good news.
+# ============================================================
+
+PyYAML==5.3.1

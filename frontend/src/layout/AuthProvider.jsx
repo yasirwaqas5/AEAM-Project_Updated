@@ -8,11 +8,12 @@ import { useToast } from "./ToastHost";
  * layout/AuthProvider.jsx
  *
  * Phase E10 — Enterprise Console session layer.
+ * Phase E13 — enterprise SSO federation lands here, as the roadmap said it
+ *             would: no second session layer, just a second way to acquire
+ *             the token this one already manages.
  *
- * AEAM validates tokens issued elsewhere; it is not an identity provider
- * (real OIDC/SSO federation is Phase E13's job, landing on this same
- * session layer per the roadmap). This provider's job is narrower and
- * entirely session-side:
+ * AEAM validates tokens issued elsewhere; it is not an identity provider.
+ * This provider's job is narrower and entirely session-side:
  *
  *   - Hold the current bearer token (sessionStorage-backed — cleared when
  *     the tab closes, never persisted across browser restarts).
@@ -31,10 +32,50 @@ import { useToast } from "./ToastHost";
  *     ROADMAP.md E10: "Auth UI behind an environment flag preserving
  *     today's open-dev behaviour for local work"). That endpoint itself
  *     404s outside development, so this is a no-op probe everywhere else.
+ *   - (E13) Drive the OIDC authorization-code + PKCE redirect when the
+ *     deployment federates identity. The browser sends the user to the
+ *     IdP; the IdP redirects back to /auth/callback with a code; the code
+ *     is exchanged server-side (so a confidential-client secret never
+ *     reaches the browser) and the resulting token flows into exactly the
+ *     same applyToken() path a pasted token uses. Nothing downstream of
+ *     this file knows or cares which way the token arrived.
+ *
+ * PKCE note: the code verifier is held in sessionStorage for the duration
+ * of the redirect — it must survive a full page navigation to the IdP and
+ * back, which rules out component state, and it is single-use and
+ * tab-scoped, which is exactly what sessionStorage gives. It is cleared
+ * the moment the exchange completes, successfully or not.
  * ────────────────────────────────────────────────────────────────────────── */
 
 const AuthContext = createContext(null);
 const STORAGE_KEY = "aeam.auth.token";
+const PKCE_VERIFIER_KEY = "aeam.auth.pkce_verifier";
+const OIDC_STATE_KEY = "aeam.auth.oidc_state";
+
+/** Random URL-safe string for the PKCE verifier and the CSRF `state`. */
+function randomUrlSafe(bytes = 32) {
+  const raw = new Uint8Array(bytes);
+  (globalThis.crypto || {}).getRandomValues?.(raw);
+  let out = "";
+  for (const byte of raw) out += String.fromCharCode(byte);
+  return btoa(out).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** S256 PKCE challenge, or `null` when WebCrypto's digest is unavailable.
+ *
+ *  Returning null rather than silently downgrading to `plain` is
+ *  deliberate: the server advertises S256 and the IdP is registered for
+ *  it, so a downgraded challenge would simply be rejected at the token
+ *  endpoint — failing here, before the redirect, gives the operator an
+ *  actionable message instead of a confusing IdP error page. */
+async function pkceChallenge(verifier) {
+  const subtle = (globalThis.crypto || {}).subtle;
+  if (!subtle?.digest) return null;
+  const digest = await subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  let binary = "";
+  for (const byte of new Uint8Array(digest)) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
 
 function decodeJwtPayload(token) {
   try {
@@ -64,6 +105,10 @@ export function AuthProvider({ children }) {
   const [claims, setClaims] = useState(null);
   const [devMode, setDevMode] = useState(false);
   const [booting, setBooting] = useState(true);
+  // null while the probe is in flight; then always an object with
+  // `enabled` — never left undefined, so the UI can distinguish "still
+  // asking" from "asked, and the answer is no, because <reason>".
+  const [sso, setSso] = useState(null);
   const expiryTimerRef = useRef(null);
   const navigate = useNavigate();
   const location = useLocation();
@@ -118,11 +163,124 @@ export function AuthProvider({ children }) {
     return { ok: true };
   }, [applyToken]);
 
+  /* ── Phase E13: SSO redirect flow ─────────────────────────────────────
+   * loginWithSso() sends the browser to the IdP. completeSsoLogin() is
+   * called by the /auth/callback route with the query string the IdP
+   * redirected back with. Both report failures as { ok:false, error } so
+   * the caller can show a real message rather than a blank screen. */
+
+  const loginWithSso = useCallback(async () => {
+    if (!sso?.enabled) {
+      return { ok: false, error: sso?.reason || "Single sign-on is not configured for this deployment." };
+    }
+
+    const verifier = randomUrlSafe();
+    const challenge = await pkceChallenge(verifier);
+    if (!challenge) {
+      return {
+        ok: false,
+        error:
+          "This browser does not expose WebCrypto (SHA-256), which PKCE requires. " +
+          "Serve the console over HTTPS, or sign in with a pasted token.",
+      };
+    }
+
+    const state = randomUrlSafe(16);
+    sessionStorage.setItem(PKCE_VERIFIER_KEY, verifier);
+    sessionStorage.setItem(OIDC_STATE_KEY, state);
+
+    const redirectUri = sso.redirect_uri || `${window.location.origin}/auth/callback`;
+    const params = new URLSearchParams({
+      response_type: sso.response_type || "code",
+      client_id: sso.client_id,
+      redirect_uri: redirectUri,
+      scope: sso.scopes || "openid profile email",
+      state,
+      code_challenge: challenge,
+      code_challenge_method: "S256",
+    });
+
+    window.location.assign(`${sso.authorization_endpoint}?${params.toString()}`);
+    return { ok: true };
+  }, [sso]);
+
+  const completeSsoLogin = useCallback(async (search) => {
+    const params = new URLSearchParams(search || "");
+    const verifier = sessionStorage.getItem(PKCE_VERIFIER_KEY) || "";
+    const expectedState = sessionStorage.getItem(OIDC_STATE_KEY) || "";
+    // Single-use: cleared before any early return so a failed attempt can
+    // never be replayed with the same verifier.
+    sessionStorage.removeItem(PKCE_VERIFIER_KEY);
+    sessionStorage.removeItem(OIDC_STATE_KEY);
+
+    const idpError = params.get("error");
+    if (idpError) {
+      return { ok: false, error: params.get("error_description") || idpError };
+    }
+
+    const code = params.get("code");
+    if (!code) return { ok: false, error: "The identity provider returned no authorization code." };
+
+    const returnedState = params.get("state") || "";
+    if (expectedState && returnedState !== expectedState) {
+      return { ok: false, error: "Sign-in state did not match. Start the sign-in again." };
+    }
+
+    let body;
+    try {
+      const res = await fetch("/api/v1/auth/sso/callback", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          code,
+          code_verifier: verifier,
+          redirect_uri: sso?.redirect_uri || `${window.location.origin}/auth/callback`,
+        }),
+      });
+      body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        return { ok: false, error: body?.detail || `Sign-in failed (HTTP ${res.status}).` };
+      }
+    } catch {
+      return { ok: false, error: "Could not reach AEAM to complete sign-in." };
+    }
+
+    if (!body?.access_token) return { ok: false, error: "No access token was issued." };
+
+    const decoded = decodeJwtPayload(body.access_token);
+    if (!decoded) return { ok: false, error: "The identity provider issued a token this console cannot read." };
+    if (isExpired(decoded)) return { ok: false, error: "The issued token is already expired." };
+
+    applyToken(body.access_token);
+    return { ok: true };
+  }, [applyToken, sso]);
+
   // Boot sequence: try dev auto-login first (no-op outside development via
   // the endpoint's own 404 gate), then fall back to a previously pasted
-  // token still valid in this tab's sessionStorage.
+  // token still valid in this tab's sessionStorage. The SSO probe runs in
+  // both cases -- a dev-posture session should still be able to show what
+  // the deployment's identity configuration is.
   useEffect(() => {
     let cancelled = false;
+
+    (async () => {
+      try {
+        const res = await fetch("/api/v1/auth/sso/config");
+        const body = res.ok ? await res.json() : null;
+        if (!cancelled) {
+          setSso(
+            body && typeof body.enabled === "boolean"
+              ? body
+              : { enabled: false, reason: "The SSO configuration endpoint is unavailable." }
+          );
+        }
+      } catch {
+        if (!cancelled) {
+          setSso({ enabled: false, reason: "AEAM is unreachable; SSO status is unknown." });
+        }
+      }
+    })();
+
     (async () => {
       try {
         const res = await fetch("/api/v1/auth/dev-token", {
@@ -146,6 +304,7 @@ export function AuthProvider({ children }) {
       if (stored) applyToken(stored);
       setBooting(false);
     })();
+
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -175,6 +334,12 @@ export function AuthProvider({ children }) {
     booting,
     login,
     logout,
+    // Phase E13. `sso` is null until the probe answers, then always an
+    // object carrying `enabled` and, when disabled, the honest `reason`.
+    sso,
+    ssoEnabled: Boolean(sso?.enabled),
+    loginWithSso,
+    completeSsoLogin,
     hasPermission: (resource, action) => hasPermission(claims?.roles || [], resource, action),
   };
 
@@ -189,7 +354,11 @@ export function useAuth() {
     return {
       token: null, claims: null, sub: null, roles: [], isAuthenticated: false,
       isDev: false, booting: false, login: () => ({ ok: false, error: "No AuthProvider." }),
-      logout() {}, hasPermission: () => false,
+      logout() {},
+      sso: null, ssoEnabled: false,
+      loginWithSso: async () => ({ ok: false, error: "No AuthProvider." }),
+      completeSsoLogin: async () => ({ ok: false, error: "No AuthProvider." }),
+      hasPermission: () => false,
     };
   }
   return ctx;

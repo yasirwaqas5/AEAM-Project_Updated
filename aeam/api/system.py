@@ -165,6 +165,105 @@ def get_rule_engine_status(request: Request) -> JSONResponse:
         return JSONResponse(status_code=500, content={"detail": "Failed to load Rule Engine configuration."})
 
 
+@router.get(
+    "/compliance",
+    summary="Declared enterprise posture (tenancy, data classification, identity, retention)",
+    response_description="The postures this deployment declares, as configured.",
+)
+def get_compliance_posture(request: Request) -> JSONResponse:
+    """
+    Return this deployment's declared enterprise posture.
+
+    Phase E13 (Article XVI). Three of the checklist's governance items are
+    *declarations*: the multi-tenancy position, the data-classification /
+    PII posture, and the identity posture. A declaration that lives only in
+    a document drifts from what the deployment actually runs, so this
+    endpoint reports the configured values — the same fields the
+    certification pack quotes — straight from Settings.
+
+    It states positions; it does not enforce them, and it says so. The
+    enforcement for each item lives where the roadmap put it: single-tenant
+    isolation is achieved by deploying separately (no tenant discriminator
+    exists in any store), retention is the posture documented in
+    ``docs/persistence_and_retention.md``, and identity is enforced by
+    ``SecurityMiddleware``.
+
+    Returns:
+        ``200`` — JSON posture dict::
+
+            {
+              "tenancy": {"model": "single-tenant", "enforced_by": "...", "note": "..."},
+              "data_classification": {"level": "internal", "pii_posture": "not-expected"},
+              "identity": {"mode": "static-key" | "enterprise-sso",
+                           "issuer": str|null, "is_identity_provider": false},
+              "retention": {"declared_in": "docs/persistence_and_retention.md",
+                            "backup_runbook": "docs/DISASTER_RECOVERY.md"},
+              "evidence_pack": "docs/ENTERPRISE_CERTIFICATION.md"
+            }
+
+        ``500`` — If settings cannot be read from the container.
+
+    Note:
+        Read-only. Mapped to ``logs:view`` through the ``/api/v1/system``
+        RBAC prefix, so the auditor role reaches it by construction.
+    """
+    try:
+        settings = request.app.state.container.settings
+
+        oidc_enabled = bool(getattr(settings, "OIDC_ENABLED", False))
+        tenancy_model = str(getattr(settings, "TENANCY_MODEL", "single-tenant"))
+
+        payload: dict[str, Any] = {
+            "tenancy": {
+                "model": tenancy_model,
+                "enforced_by": (
+                    "deployment separation — no tenant discriminator exists in any "
+                    "table, Qdrant collection, or Redis key namespace"
+                    if tenancy_model == "single-tenant"
+                    else "per-store tenant discriminator"
+                ),
+                "note": (
+                    "AEAM implements no tenant partitioning; one deployment serves "
+                    "one organization. This is a declaration, not an enforcement "
+                    "mechanism."
+                ),
+            },
+            "data_classification": {
+                "level": str(getattr(settings, "DATA_CLASSIFICATION", "internal")),
+                "pii_posture": str(getattr(settings, "PII_POSTURE", "not-expected")),
+                "scope": ["incidents", "documents", "enterprise_memory", "audit_logs"],
+                "declared_in": "docs/ENTERPRISE_CERTIFICATION.md",
+            },
+            "identity": {
+                "mode": "enterprise-sso" if oidc_enabled else "static-key",
+                "issuer": (
+                    str(getattr(settings, "OIDC_ISSUER", "") or "").strip() or None
+                    if oidc_enabled
+                    else (getattr(settings, "JWT_ISSUER", None) or None)
+                ),
+                "is_identity_provider": False,
+                "note": (
+                    "AEAM validates tokens issued by the organization's identity "
+                    "provider. It never issues enterprise credentials."
+                ),
+            },
+            "retention": {
+                "declared_in": "docs/persistence_and_retention.md",
+                "backup_runbook": "docs/DISASTER_RECOVERY.md",
+            },
+            "evidence_pack": "docs/ENTERPRISE_CERTIFICATION.md",
+        }
+
+        return JSONResponse(status_code=200, content=payload)
+
+    except Exception as exc:  # noqa: BLE001
+        logger.error("get_compliance_posture | unexpected error: %s", exc)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Failed to read the declared compliance posture."},
+        )
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------

@@ -48,9 +48,22 @@ _INTERNAL_PREFIX: str = "/internal"
 # verified bearer token in any non-development environment (no RBAC
 # resource mapping is needed since it grants no permission beyond "prove
 # who you are").
+#
+# Phase E13: the two SSO endpoints are pre-auth by necessity -- they are the
+# path by which a caller acquires a token from the enterprise IdP, so
+# requiring a token to reach them would be circular. Neither is a security
+# hole under SEC-1's deny-by-default rule: /sso/config returns only values
+# that travel in the browser's address bar during a normal sign-in (client
+# id, redirect URI, authorization URL) and never the client secret, and
+# /sso/callback only forwards an authorization code to the IdP -- it grants
+# nothing on its own, because whatever token it returns must still pass the
+# full JWTAuth signature/issuer/audience/expiry check on the caller's next
+# request. Both endpoints read and write no platform state.
 _PUBLIC_PATHS: frozenset[str] = frozenset({
     "/", "/health", "/docs", "/openapi.json", "/redoc", "/favicon.ico",
     "/api/v1/auth/dev-token",
+    "/api/v1/auth/sso/config",
+    "/api/v1/auth/sso/callback",
 })
 
 # ---------------------------------------------------------------------------

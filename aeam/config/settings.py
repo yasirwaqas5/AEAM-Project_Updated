@@ -901,6 +901,187 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Enterprise SSO / OIDC federation (Phase E13, SEC-1/SEC-4) ---
+    #
+    # E13 federates identity onto the *same* E3 verification path rather
+    # than building a second one: when OIDC is enabled, JWTAuth resolves
+    # signing keys from the IdP's JWKS document instead of a static PEM,
+    # and everything downstream (RBAC, rate limiting, audit) is untouched.
+    # AEAM remains a relying party — it validates tokens the enterprise
+    # IdP issued and never mints enterprise credentials itself.
+    #
+    # Every field defaults to disabled/empty, so an unset deployment keeps
+    # the exact E3 static-key posture (COMPAT-2/COMPAT-3). Turning OIDC on
+    # without the fields it requires aborts startup (SEC-4 fail-closed,
+    # enforced in main._build_jwt_auth) rather than silently falling back
+    # to a posture the operator did not ask for.
+
+    OIDC_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "Phase E13 (SEC-1): master switch for enterprise SSO. False "
+            "(the default) keeps the E3 static-PEM verification posture "
+            "byte-for-byte. True requires OIDC_ISSUER and OIDC_CLIENT_ID; "
+            "startup aborts if either is missing (SEC-4)."
+        ),
+    )
+
+    OIDC_ISSUER: str = Field(
+        default="",
+        description=(
+            "Phase E13: the IdP's issuer URL (e.g. "
+            "'https://login.microsoftonline.com/<tenant>/v2.0'). Used both "
+            "for OIDC discovery (<issuer>/.well-known/openid-configuration) "
+            "and as the expected 'iss' claim when JWT_ISSUER is unset."
+        ),
+    )
+
+    OIDC_CLIENT_ID: str = Field(
+        default="",
+        description=(
+            "Phase E13: the client id the console is registered as at the "
+            "IdP. Also the expected 'aud' claim when JWT_AUDIENCE is unset "
+            "— an access token minted for a different application must not "
+            "be accepted here."
+        ),
+    )
+
+    OIDC_CLIENT_SECRET: str = Field(
+        default="",
+        description=(
+            "Phase E13 (SEC-5): client secret for the authorization-code "
+            "exchange, resolved via SecretManager. LEAVE EMPTY for the "
+            "recommended public-client + PKCE posture — the console is a "
+            "browser app and PKCE is the flow it should use. The value is "
+            "never logged and never returned by any endpoint."
+        ),
+    )
+
+    OIDC_REDIRECT_URI: str = Field(
+        default="",
+        description=(
+            "Phase E13: the console callback URL registered at the IdP "
+            "(e.g. 'https://aeam.example.com/auth/callback'). Empty means "
+            "the console derives it from its own origin; set it explicitly "
+            "when the console is served behind a proxy whose public origin "
+            "differs from the browser's."
+        ),
+    )
+
+    OIDC_SCOPES: str = Field(
+        default="openid profile email",
+        description=(
+            "Phase E13: space-separated scopes requested at the "
+            "authorization endpoint. The default is the minimum an OIDC "
+            "sign-in needs; add the IdP-specific scope that carries role "
+            "claims if yours requires one."
+        ),
+    )
+
+    OIDC_ROLES_CLAIM: str = Field(
+        default="roles",
+        description=(
+            "Phase E13: the token claim carrying the caller's AEAM roles. "
+            "Default matches the E3/E10 token shape ('roles'); enterprise "
+            "IdPs often use 'groups' or a namespaced claim. The claim's "
+            "values must be members of aeam.security.rbac's vocabulary — "
+            "unknown roles simply grant nothing (deny by default, SEC-1)."
+        ),
+    )
+
+    OIDC_ALGORITHMS: str = Field(
+        default="",
+        description=(
+            "Phase E13 (ENG-6): comma-separated signature-algorithm "
+            "allow-list overriding jwt_auth.py's engine-owned default "
+            "('RS256'). Empty keeps the default. Same comma-separated "
+            "convention as CORS_ALLOWED_ORIGINS."
+        ),
+    )
+
+    OIDC_JWKS_URL: str = Field(
+        default="",
+        description=(
+            "Phase E13: explicit JWKS endpoint, bypassing discovery. Empty "
+            "(the default) means the URL is read from the IdP's "
+            "openid-configuration document. Set this for IdPs that do not "
+            "publish discovery, or to pin the endpoint."
+        ),
+    )
+
+    OIDC_AUTHORIZATION_ENDPOINT: str = Field(
+        default="",
+        description=(
+            "Phase E13: explicit authorization endpoint, bypassing "
+            "discovery. Empty = read from the discovery document."
+        ),
+    )
+
+    OIDC_TOKEN_ENDPOINT: str = Field(
+        default="",
+        description=(
+            "Phase E13: explicit token endpoint, bypassing discovery. "
+            "Empty = read from the discovery document."
+        ),
+    )
+
+    OIDC_DISCOVERY_TIMEOUT_SECONDS: float = Field(
+        default=5.0,
+        description=(
+            "Phase E13 (PHIL-5): timeout for the discovery and token-"
+            "exchange HTTP calls to the IdP. A slow IdP must degrade "
+            "sign-in, never hang a worker."
+        ),
+    )
+
+    # --- Tenancy & data classification declaration (Phase E13, Article XVI) ---
+    #
+    # Article XVI requires both positions to be *stated*, not necessarily
+    # to take a particular value: "single-tenant by declaration" is an
+    # honest, acceptable answer (PHIL-1). These fields exist so the
+    # deployment's answer is machine-readable and surfaced by the platform
+    # itself rather than living only in a document that can drift.
+
+    TENANCY_MODEL: str = Field(
+        default="single-tenant",
+        description=(
+            "Phase E13 (Article XVI): this deployment's tenancy position. "
+            "'single-tenant' — one organization per deployment; no "
+            "tenant discriminator exists in any table, collection, or "
+            "cache key, and isolation is achieved by deploying separately. "
+            "'multi-tenant' must not be declared unless every store "
+            "carries a tenant discriminator (AEAM does not implement one "
+            "today, so declaring it would be dishonest)."
+        ),
+    )
+
+    DATA_CLASSIFICATION: str = Field(
+        default="internal",
+        description=(
+            "Phase E13 (Article XVI): the highest data classification this "
+            "deployment's stores are approved to hold — e.g. 'public', "
+            "'internal', 'confidential', 'restricted'. Surfaced by "
+            "GET /api/v1/system/compliance so an operator can see the "
+            "declared posture rather than infer it. See "
+            "docs/ENTERPRISE_CERTIFICATION.md for the per-store statement."
+        ),
+    )
+
+    PII_POSTURE: str = Field(
+        default="not-expected",
+        description=(
+            "Phase E13 (Article XVI): the PII posture for incidents, "
+            "documents and memory. 'not-expected' — the platform is fed "
+            "operational metrics and runbooks, and no field is designated "
+            "to hold personal data; free-text fields (evidence, reviewer "
+            "reasons) may incidentally contain it, which is why the "
+            "retention posture in docs/persistence_and_retention.md "
+            "applies to them. 'contains-pii' declares the opposite and "
+            "obliges the operator to the handling described in the "
+            "certification pack."
+        ),
+    )
+
     # --- Configuration persistence disclosure (Phase E4, PHIL-1 / PHIL-5) ---
     #
     # The Enterprise Configuration Engine (D5) writes to the project .env
@@ -943,4 +1124,16 @@ class Settings(BaseSettings):
         value = v.lower()
         if value not in allowed:
             raise ValueError(f"ENVIRONMENT must be one of {allowed}. Got: '{v}'")
+        return value
+
+    @field_validator("TENANCY_MODEL")
+    @classmethod
+    def validate_tenancy_model(cls, v: str) -> str:
+        """Phase E13 (Article XVI): a tenancy declaration must be one of the
+        two positions the platform can actually honour. A free-text answer
+        would let a deployment claim isolation it does not implement."""
+        allowed = {"single-tenant", "multi-tenant"}
+        value = (v or "").strip().lower()
+        if value not in allowed:
+            raise ValueError(f"TENANCY_MODEL must be one of {allowed}. Got: '{v}'")
         return value

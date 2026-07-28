@@ -3,13 +3,32 @@
 # .github/workflows/deploy.yml
 #
 # Triggers: push to main, pull requests
-# Stages:   test → build → deploy (main only)
+# Stages:   test ─┬─ supply-chain ─┐
+#                 ├─ performance ──┼─→ build → deploy (main only)
+#                 └────────────────┘
 #
 # Phase E1: the test job is a REAL gate — no `|| true`.
 # Service containers provide Postgres and Redis so tests that
 # need them (data-center, action-agent idempotency) can run.
 # Tests that self-skip when a service is absent (Qdrant) still
 # skip cleanly; all others must pass for the pipeline to green.
+#
+# Phase E13 (Article XVI "CI gates on tests; dependency and image
+# scanning in the pipeline") adds two more real gates:
+#
+#   * supply-chain — dependency audit (pip-audit), SBOM generation
+#     (CycloneDX), and container image scanning (Trivy). All three
+#     BLOCK: no `|| true`, no `continue-on-error`. The job also runs
+#     pip-audit against a deliberately vulnerable fixture and fails
+#     if that scan *passes*, so a misconfigured scanner cannot
+#     masquerade as a clean bill of health.
+#   * performance — the recorded budgets in
+#     aeam/tests/fixtures/performance_budgets.json, asserted by
+#     aeam/tests/test_phase_e13_performance.py. A regression past a
+#     stated budget fails the pipeline like any other test.
+#
+# Both are `needs: test`, so they cost nothing on a run whose unit
+# suite is already red.
 # ============================================================
 
 name: AEAM CI/CD
@@ -93,13 +112,144 @@ jobs:
           HF_HOME: "${{ runner.temp }}/hf_cache"
 
   # ────────────────────────────────────────────────────────
-  # Stage 2: Build Docker image
-  # Runs only after tests pass, on main branch only
+  # Stage 2a: Supply-chain hardening (Phase E13)
+  #
+  # Article XVI: "dependency and image scanning in the pipeline".
+  # Every step here is blocking. The fixture step is the proof the
+  # gate works — see deploy/security/vulnerable-fixture-requirements.txt.
+  # ────────────────────────────────────────────────────────
+  supply-chain:
+    name: Supply Chain (audit + SBOM + image scan)
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install supply-chain tooling
+        run: |
+          pip install --upgrade pip
+          pip install pip-audit cyclonedx-bom
+
+      # NEGATIVE TEST FIRST. If pip-audit cannot detect a package with a
+      # published CVE, its verdict on requirements.txt is worthless — so
+      # prove it fails before trusting it to pass.
+      #
+      # A non-zero exit alone is NOT sufficient evidence: pip-audit also
+      # exits non-zero when it merely fails to resolve a requirements file,
+      # which would let a broken fixture masquerade as a working gate. The
+      # output must actually name an advisory.
+      - name: Prove the dependency gate blocks a known-vulnerable package
+        run: |
+          set +e
+          output=$(pip-audit --requirement deploy/security/vulnerable-fixture-requirements.txt --strict 2>&1)
+          status=$?
+          set -e
+          echo "$output"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::pip-audit reported the known-vulnerable fixture as CLEAN."
+            echo "The dependency gate is not functioning; refusing to trust its verdict."
+            exit 1
+          fi
+          if ! echo "$output" | grep -qi "known vulnerabilit"; then
+            echo "::error::pip-audit failed on the fixture WITHOUT reporting a vulnerability."
+            echo "That is a resolution/tooling failure, not a working gate. Re-pin the fixture."
+            exit 1
+          fi
+          echo "Dependency gate verified: fixture scan exited $status and named a real advisory."
+
+      - name: Audit declared dependencies
+        run: pip-audit --requirement requirements.txt --strict
+
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          pip install -r requirements.txt
+          cyclonedx-py environment --output-format JSON --outfile aeam-sbom.json
+          python -c "import json,sys; d=json.load(open('aeam-sbom.json')); n=len(d.get('components',[])); print(f'SBOM components: {n}'); sys.exit(0 if n>0 else 1)"
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aeam-sbom
+          path: aeam-sbom.json
+          retention-days: 90
+
+      - name: Build image for scanning
+        run: docker build -t aeam:scan .
+
+      - name: Scan image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: aeam:scan
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+  # ────────────────────────────────────────────────────────
+  # Stage 2b: Performance baselines (Phase E13)
+  #
+  # The budgets are recorded in
+  # aeam/tests/fixtures/performance_budgets.json and asserted by the
+  # E13 performance suite. Each budget states its own measurement
+  # semantics (OBS-2), so a failure names what regressed and against
+  # what number.
+  # ────────────────────────────────────────────────────────
+  performance:
+    name: Performance Baselines
+    runs-on: ubuntu-latest
+    needs: test
+
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run performance baseline suite
+        run: python -m pytest aeam/tests/test_phase_e13_performance.py -v
+        env:
+          REDIS_URL: "redis://localhost:6379/0"
+          ENVIRONMENT: "test"
+          LLM_ENABLED: "false"
+          HF_HOME: "${{ runner.temp }}/hf_cache"
+
+  # ────────────────────────────────────────────────────────
+  # Stage 3: Build Docker image
+  # Runs only after tests AND the E13 gates pass, on main branch only
   # ────────────────────────────────────────────────────────
   build:
     name: Build Docker Image
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, supply-chain, performance]
     if: github.ref == 'refs/heads/main'
 
     steps:
@@ -114,7 +264,7 @@ jobs:
           docker build -t aeam:latest -t aeam:${{ github.sha }} .
 
   # ────────────────────────────────────────────────────────
-  # Stage 3: Deploy to Cloud Run (stubbed)
+  # Stage 4: Deploy to Cloud Run (stubbed)
   # Runs only after build passes, on main branch only
   # ────────────────────────────────────────────────────────
   deploy:

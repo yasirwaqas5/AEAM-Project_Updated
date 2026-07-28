@@ -1,0 +1,90 @@
+{
+  "_readme": [
+    "Phase E13 \u2014 recorded performance budgets (Article XVI: 'UI usable at a",
+    "year of incident volume'; roadmap: 'Performance baselines with recorded",
+    "budgets').",
+    "",
+    "Every budget states its own measurement semantics (OBS-2): what is",
+    "measured, over what window, from what source, and on what hardware the",
+    "number was recorded. A budget without those is a number nobody can",
+    "reproduce or refute.",
+    "",
+    "Budgets are CEILINGS FOR CI, not observed averages. They are set with",
+    "deliberate headroom \u2014 an order of magnitude in places \u2014 over the measured",
+    "local figure, so the suite fails on a structural regression (an accidental",
+    "O(n^2), a per-row query, a lost index) and not on a noisy 2-core shared",
+    "runner. The 'observed_local' field records what the machine below actually",
+    "measured on the date stated, so the headroom is visible rather than",
+    "implied, and a future tightening can be argued from real numbers.",
+    "",
+    "The budgets are asserted by aeam/tests/test_phase_e13_performance.py and",
+    "gated by the 'performance' job in .github/workflows/deploy.yml. See",
+    "docs/PERFORMANCE_BASELINES.md for the methodology and the recorded run."
+  ],
+  "baseline_environment": {
+    "recorded_on": "2026-07-28",
+    "hardware": "8-core x86-64 developer workstation, 16 GB RAM",
+    "python": "3.11",
+    "database": "SQLite (file-backed, tmp_path) \u2014 the CI-portable substitute for PostgreSQL",
+    "llm": "disabled (LLM_ENABLED=false) \u2014 all budgets measure AEAM's own code paths, never provider latency",
+    "note": "GitHub-hosted runners are 2-core and shared; the headroom below exists for exactly that gap."
+  },
+  "concurrent_investigation_throughput": {
+    "what": "Orchestrator.handle_event() executed concurrently across worker threads, from dispatch to finalize_incident().",
+    "why": "Phase E2 proved per-incident state isolation under concurrency; this budget proves that isolation did not cost throughput.",
+    "source": "In-process wall clock around a ThreadPoolExecutor of 16 events, no DB/Redis/Qdrant.",
+    "window": "one measured burst per run",
+    "events": 16,
+    "workers": 8,
+    "max_total_seconds": 10.0,
+    "min_events_per_second": 2.0,
+    "observed_local": {
+      "total_seconds": 0.01,
+      "events_per_second": 1657.5
+    }
+  },
+  "ingestion_throughput": {
+    "what": "Document text extraction + chunking \u2014 the CPU-bound half of the ingestion pipeline.",
+    "why": "Embedding cost is a model property (TECH-6), not AEAM's; what AEAM owns is extraction and chunking, so that is what is budgeted.",
+    "source": "In-process wall clock around extraction.extract_text() + TextChunker.chunk_text().",
+    "window": "one measured batch per run",
+    "documents": 25,
+    "document_size_bytes": 40000,
+    "max_total_seconds": 10.0,
+    "min_documents_per_second": 5.0,
+    "observed_local": {
+      "total_seconds": 0.018,
+      "documents_per_second": 1355.7
+    }
+  },
+  "console_query_at_volume": {
+    "what": "GET /api/v1/incidents/ paged response latency against a populated incidents table.",
+    "why": "Article XVI: 'Unbounded endpoints paginated; UI usable at a year of incident volume.' 5,000 incidents is a year at ~14/day.",
+    "source": "FastAPI TestClient wall clock, real SQLite, E6 pagination path.",
+    "window": "per-request, worst of N requests",
+    "seeded_incidents": 5000,
+    "page_size": 50,
+    "max_page_seconds": 2.0,
+    "max_unpaged_seconds": 10.0,
+    "requests_sampled": 5,
+    "observed_local": {
+      "page_seconds": 0.012,
+      "unpaged_seconds": 0.258,
+      "seed_seconds": 0.624
+    }
+  },
+  "autonomous_loop_stability": {
+    "what": "MonitorAgent poll-loop cycle cadence and heartbeat freshness over consecutive cycles.",
+    "why": "Phase E7 made the loop supervised; a loop that drifts or stalls is the failure mode supervision exists to catch.",
+    "source": "HeartbeatTracker ages sampled across cycles, with a stubbed poll body.",
+    "window": "10 consecutive cycles",
+    "cycles": 10,
+    "interval_seconds": 0.05,
+    "max_cycle_drift_ratio": 6.0,
+    "max_heartbeat_age_seconds": 5.0,
+    "observed_local": {
+      "cycle_drift_ratio": 1.02,
+      "max_heartbeat_age_seconds": 0.0002
+    }
+  }
+}
