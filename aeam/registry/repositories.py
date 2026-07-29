@@ -21,6 +21,8 @@ from typing import Any
 from aeam.integrations.database import DatabaseClient
 from aeam.registry.models import (
     AssetStatus,
+    CompiledRule,
+    CompiledRuleStatus,
     Dataset,
     Document,
     IncidentApproval,
@@ -340,6 +342,101 @@ class PolicyRepository(BaseRepository):
             key = row.get("status") or PolicyStatus.ACTIVE
             counts[key] = counts.get(key, 0) + int(row.get("n") or 0)
         return counts
+
+
+# ---------------------------------------------------------------------------
+# Phase F3 — Policy Compilation, Validation & the Policy Agent
+# ---------------------------------------------------------------------------
+
+class CompiledRuleRepository(BaseRepository):
+    """Registry access for compiled-rule proposals (Phase F3, SEC-7)."""
+
+    table, pk, model_cls = "compiled_rules", "rule_id", CompiledRule
+
+    def create_from_candidate(self, candidate: Any, created_by: str) -> str:
+        """
+        Persist a :class:`~aeam.intelligence.rule_compiler.CompiledRuleCandidate`
+        as a new PROPOSED row.
+
+        Args:
+            candidate:   A compilable candidate (caller — the Policy Agent —
+                        has already checked ``candidate.compilable``).
+            created_by: The principal that requested compilation.
+
+        Returns:
+            The new row's ``rule_id``.
+        """
+        rule = CompiledRule(
+            policy_id=candidate.source_policy_id or "",
+            domain=candidate.domain or "",
+            rule_key=candidate.rule_key or "",
+            comparison=candidate.comparison,
+            value=candidate.value,
+            rationale=candidate.reason,
+            status=CompiledRuleStatus.PROPOSED,
+            created_by=created_by,
+        )
+        return self.create(rule)
+
+    def list_by_policy(self, policy_id: str) -> list[CompiledRule]:
+        return self._query("policy_id = :p", {"p": policy_id})
+
+    def list_by_status(self, status: str) -> list[CompiledRule]:
+        return self._query("status = :s", {"s": status})
+
+    def list_adopted(self) -> list[CompiledRule]:
+        """Every currently-APPROVED (adopted) compiled rule.
+
+        This is the exact set the composition root (``aeam/main.py``) reads
+        at startup to build :class:`~aeam.agents.kpi.rule_engine.RuleEngine`'s
+        ``overrides`` — a rejected or retired rule is never included, and a
+        merely-proposed one never is either. Matches
+        :class:`CompiledRuleStatus`'s ``ADOPTED`` set exactly (currently just
+        ``{"approved"}``), read from SQL so future additions to that set
+        require touching only one place.
+        """
+        return self.list_by_status(CompiledRuleStatus.APPROVED)
+
+    def decide(
+        self,
+        rule_id: str,
+        status: str,
+        *,
+        reviewer_id: str,
+        reviewer_roles: list[str] | None = None,
+        attribution_source: str | None = None,
+        note: str | None = None,
+    ) -> None:
+        """Record a human verdict on a proposed rule (approve/reject).
+
+        Raises:
+            ValueError: If ``status`` is not ``approved``/``rejected``.
+        """
+        if status not in (CompiledRuleStatus.APPROVED, CompiledRuleStatus.REJECTED):
+            raise ValueError(
+                f"decide() status must be 'approved' or 'rejected'. Got: {status!r}."
+            )
+        self.update(rule_id, {
+            "status": status,
+            "reviewer_id": reviewer_id,
+            "reviewer_roles": reviewer_roles or [],
+            "attribution_source": attribution_source,
+            "note": note,
+            "decided_at": _now_iso(),
+        })
+
+    def retire(self, rule_id: str, *, retired_by: str, reason: str | None = None) -> None:
+        """Withdraw a previously APPROVED rule — the named F3 rollback path.
+
+        Sets status to RETIRED so the next startup's override load excludes
+        it, restoring prior deterministic behaviour for that key.
+        """
+        self.update(rule_id, {
+            "status": CompiledRuleStatus.RETIRED,
+            "retired_at": _now_iso(),
+            "retired_by": retired_by,
+            "retired_reason": reason,
+        })
 
 
 # ---------------------------------------------------------------------------

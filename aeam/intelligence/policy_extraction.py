@@ -115,6 +115,83 @@ _STRING_FIELDS = (
 )
 _LIST_FIELDS = ("actions", "related_metrics")
 
+# ---------------------------------------------------------------------------
+# Phase F3 — Tier-3 extraction (tabular / nested-conditional structure)
+# ---------------------------------------------------------------------------
+#
+# Tier-1/2 extraction (above) uses a prompt written for FLAT, sentence-shaped
+# policy statements ("if X then Y"). Fed a table — the shape a PDF's
+# extracted text degrades tables into most often: rows of short cells with
+# no explicit "if/then" language at all — that prompt has no instruction
+# telling the model rows belong together, so it either recovers only the
+# first row, merges every row into one vague policy, or drops the table
+# entirely as "not a recognizable policy". None of that is a prompt BUG; it
+# is simply a prompt that was never told tables exist.
+#
+# Tier-3 is the same LLM boundary, the same guardrails, the same JSON
+# parser, and the same chunk-attribution logic — the ONLY difference is a
+# prompt that explicitly instructs the model to treat each table row (or
+# each branch of a nested if/elif/else) as its OWN policy, linked to its
+# siblings by a shared `table_group` id. This is additive: `extract()`
+# above is completely unchanged, and a caller who never invokes
+# `extract_tabular()` sees byte-identical Tier-1/2 behaviour (COMPAT-2).
+
+_TIER3_EXTRACTION_PROMPT_TEMPLATE = """You are extracting structured BUSINESS POLICIES from an internal company \
+document. This text may contain a TABLE (rows of short cells, possibly with \
+lost column alignment from PDF extraction) or a NESTED CONDITIONAL \
+structure (if / else if / otherwise branches, or severity tiers). Treat \
+EACH ROW of a table, and EACH BRANCH of a nested conditional, as its OWN \
+separate policy — do NOT merge multiple rows/branches into one policy, and \
+do NOT extract only the first row.
+
+Only extract a policy if it is EXPLICITLY stated in the text below. Do NOT \
+invent, generalize, or infer a policy that is not directly stated in the \
+text. If the document contains no recognizable policy, return exactly \
+{{"policies": []}}.
+
+For each policy you find, include ONLY the fields that are actually present \
+in the text — omit a field entirely (do not guess, default, or leave a \
+placeholder) if the text does not specify it.
+
+Every policy that came from the SAME table or the SAME nested conditional \
+block MUST share the identical "table_group" string (e.g. "table_1"), and \
+each MUST carry its own "table_row" integer (0-based, in the row/branch \
+order it appeared in the text). A policy that did not come from a \
+table/nested block must omit both fields.
+
+Return STRICT JSON only, no prose, no markdown fence, in exactly this shape:
+{{
+  "policies": [
+    {{
+      "raw_text": "<verbatim row/branch text this policy is based on>",
+      "business_rule": "<short human-readable summary>",
+      "condition": "<the trigger condition, e.g. 'severity == high'>",
+      "threshold": "<numeric or qualitative threshold, if any>",
+      "actions": ["<action_1>", "<action_2>"],
+      "escalation_rule": "<escalation condition/path, if stated>",
+      "approval_required": true or false,
+      "department": "<department name, if stated>",
+      "role": "<responsible role/title, if stated>",
+      "time_constraint": "<deadline/SLA/time window, if stated>",
+      "priority": "<low|medium|high|critical, only if stated or unambiguously implied>",
+      "related_metrics": ["<metric_name>"],
+      "table_group": "<shared id for sibling rows/branches, omit if not applicable>",
+      "table_row": <0-based row/branch index, omit if not applicable>
+    }}
+  ]
+}}
+
+DOCUMENT TEXT:
+\"\"\"
+{text}
+\"\"\"
+"""
+
+#: Additive to `_STRING_FIELDS`/`_LIST_FIELDS` — only ever populated by
+#: `extract_tabular()`; `extract()` never emits these keys.
+_TIER3_INT_FIELDS = ("table_row",)
+_TIER3_STRING_FIELDS = ("table_group",)
+
 
 class PolicyExtractionError(Exception):
     """Raised only for a structural misuse of this module (e.g. no text)."""
@@ -227,6 +304,88 @@ class PolicyExtractor:
         logger.info("PolicyExtractor | extracted %d polic%s", len(results), "y" if len(results) == 1 else "ies")
         return results
 
+    def extract_tabular(
+        self,
+        text: str,
+        chunk_ids: list[str] | None = None,
+        chunk_metadata: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Tier-3 extraction: recover tabular / nested-conditional policy
+        structure that :meth:`extract`'s flat prompt misses.
+
+        Identical contract to :meth:`extract` in every respect — same
+        sanitize/validate/parse pipeline, same chunk attribution, same
+        empty-list-on-nothing-found honesty — the ONLY difference is the
+        prompt (see :data:`_TIER3_EXTRACTION_PROMPT_TEMPLATE`), which
+        explicitly instructs the model to treat each table row or
+        conditional branch as its own policy rather than merging them.
+
+        Results additionally carry ``table_group``/``table_row`` when the
+        source text was recognised as a table/nested-conditional block —
+        both fields are simply absent (never fabricated) for a policy that
+        was not part of one.
+
+        Args:
+            text:           Same as :meth:`extract`.
+            chunk_ids:      Same as :meth:`extract`.
+            chunk_metadata: Same as :meth:`extract`.
+
+        Returns:
+            List of policy dicts, exactly as :meth:`extract` returns them,
+            with the two additive table fields where applicable.
+        """
+        if not text or not text.strip():
+            return []
+
+        # Same E8 (AI-1) injection-surface handling as extract().
+        sanitized_text = sanitize_input(text.strip())
+        prompt = _TIER3_EXTRACTION_PROMPT_TEMPLATE.format(text=sanitized_text[:_MAX_PROMPT_CHARS])
+
+        try:
+            raw_response = self._llm.query(prompt, temperature=0.0, max_tokens=2000)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("PolicyExtractor.extract_tabular | LLM call failed: %s", exc)
+            return []
+
+        if not validate_output(raw_response):
+            logger.warning(
+                "PolicyExtractor.extract_tabular | LLM output failed validate_output "
+                "(sensitive pattern detected) — rejecting extraction."
+            )
+            return []
+
+        parsed = parse_llm_json(raw_response)
+        if not isinstance(parsed, dict):
+            logger.warning("PolicyExtractor.extract_tabular | LLM response could not be parsed as JSON.")
+            return []
+
+        raw_policies = parsed.get("policies")
+        if not isinstance(raw_policies, list):
+            return []
+
+        chunks = self._rechunk_for_attribution(text, chunk_metadata) if chunk_ids else []
+
+        results: list[dict[str, Any]] = []
+        for item in raw_policies:
+            if not isinstance(item, dict):
+                continue
+            policy = _sanitize_policy(
+                item,
+                extra_string_fields=_TIER3_STRING_FIELDS,
+                extra_int_fields=_TIER3_INT_FIELDS,
+            )
+            if policy is None:
+                continue
+            policy["source_chunk"] = _attribute_chunk(policy.get("raw_text"), chunks, chunk_ids)
+            results.append(policy)
+
+        logger.info(
+            "PolicyExtractor.extract_tabular | extracted %d polic%s (tier-3)",
+            len(results), "y" if len(results) == 1 else "ies",
+        )
+        return results
+
     def _rechunk_for_attribution(
         self, text: str, chunk_metadata: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
@@ -243,19 +402,42 @@ class PolicyExtractor:
             return []
 
 
-def _sanitize_policy(item: dict[str, Any]) -> dict[str, Any] | None:
+def _sanitize_policy(
+    item: dict[str, Any],
+    extra_string_fields: tuple[str, ...] = (),
+    extra_int_fields: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
     """
     Keep only the recognised fields, coerce them to the right shape, and
     drop the entry entirely if it carries no genuine content (defends
     against a stray near-empty object in the LLM's response — never turned
     into a fabricated "policy" with no actual rule in it).
+
+    Args:
+        item: One raw policy dict from the LLM's parsed JSON.
+        extra_string_fields: Phase F3 additive — extra string keys to keep
+                             beyond `_STRING_FIELDS` (e.g. ``"table_group"``).
+                             Empty by default, so `extract()`'s Tier-1/2
+                             behaviour is exactly what it always was.
+        extra_int_fields: Phase F3 additive — extra integer keys to keep
+                          (e.g. ``"table_row"``). Same default-empty
+                          contract as above.
     """
     policy: dict[str, Any] = {}
 
-    for key in _STRING_FIELDS:
+    for key in _STRING_FIELDS + extra_string_fields:
         value = item.get(key)
         if isinstance(value, str) and value.strip():
             policy[key] = value.strip()
+
+    for key in extra_int_fields:
+        value = item.get(key)
+        if isinstance(value, bool):
+            continue  # bool is an int subclass in Python; never mistaken for a row index
+        if isinstance(value, int):
+            policy[key] = value
+        elif isinstance(value, str) and value.strip().lstrip("-").isdigit():
+            policy[key] = int(value.strip())
 
     for key in _LIST_FIELDS:
         value = item.get(key)

@@ -134,6 +134,20 @@ class RuleEngine:
         rules_path: Path to the YAML rules file. Defaults to
                     ``aeam/config/detection_rules.yaml`` relative to the
                     package root.
+        overrides:  Phase F3 (COMPAT-2). Optional
+                    ``{domain: {rule_key: value}}`` merged over the
+                    YAML-loaded config after it loads. ``None`` (the
+                    default) leaves every domain's config byte-identical to
+                    the YAML file — this parameter exists solely so
+                    adopted, human-approved compiled rules (see
+                    :class:`~aeam.agents.policy.policy_agent.PolicyAgent`)
+                    can take effect through the SAME evaluators below
+                    without a second rule-evaluation code path (ENG-6).
+                    An override only ever changes the *value* an existing
+                    evaluator reads for a key it already knows how to
+                    read — it can never introduce a new domain or a new
+                    rule shape, because ``evaluate()`` still dispatches
+                    only to the three hardcoded evaluator methods below.
 
     Raises:
         FileNotFoundError: If the rules file does not exist at ``rules_path``.
@@ -144,18 +158,26 @@ class RuleEngine:
     def __init__(
         self,
         rules_path: str | Path = _DEFAULT_RULES_PATH,
+        overrides: dict[str, dict[str, float]] | None = None,
     ) -> None:
         """
-        Load detection rules from ``rules_path``.
+        Load detection rules from ``rules_path``, optionally overridden.
 
         Args:
             rules_path: Absolute or relative path to the YAML config file.
+            overrides:  See the class docstring. Applied AFTER the YAML
+                       loads, so an override always wins over the file for
+                       the specific ``(domain, key)`` pairs it names, and
+                       every other key is untouched.
 
         Raises:
             FileNotFoundError: If the file does not exist.
             ValueError:        If the YAML parses to a non-dict or is empty.
         """
         self._rules: dict[str, Any] = self._load_rules(Path(rules_path))
+        if overrides:
+            for domain, domain_overrides in overrides.items():
+                self._rules.setdefault(domain, {}).update(domain_overrides)
 
     # ------------------------------------------------------------------
     # Public API

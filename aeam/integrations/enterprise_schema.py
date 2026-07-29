@@ -274,6 +274,29 @@ CREATE TABLE IF NOT EXISTS learning_proposals (
 );
 """
 
+_COMPILED_RULES = """
+CREATE TABLE IF NOT EXISTS compiled_rules (
+    rule_id             TEXT PRIMARY KEY,
+    policy_id           TEXT,
+    domain              TEXT NOT NULL,
+    rule_key            TEXT NOT NULL,
+    comparison          TEXT,
+    value               DOUBLE PRECISION,
+    rationale           TEXT,
+    status              TEXT DEFAULT 'proposed',  -- 'proposed'|'approved'|'rejected'|'retired'
+    created_at          TIMESTAMP,
+    created_by          TEXT,
+    reviewer_id         TEXT,
+    reviewer_roles      JSONB,
+    attribution_source  TEXT,
+    note                TEXT,
+    decided_at          TIMESTAMP,
+    retired_at          TIMESTAMP,
+    retired_by          TEXT,
+    retired_reason      TEXT
+);
+"""
+
 _DDL: tuple[str, ...] = (
     _SOURCES, _DOCUMENTS, _DATASETS, _SCHEMAS, _VERSIONS, _INGESTION_JOBS, _POLICIES,
     _INCIDENT_APPROVALS, _REVIEW_VERDICTS,
@@ -282,6 +305,9 @@ _DDL: tuple[str, ...] = (
     # Phase F2 — versioned calibration state and advisory learning
     # proposals (AGENT-5: proposals never self-apply).
     _CALIBRATION_MODELS, _LEARNING_PROPOSALS,
+    # Phase F3 — compiled rule proposals (AGENT-5/SEC-7: never enforced
+    # without a recorded human approval).
+    _COMPILED_RULES,
 )
 
 # Helpful lookup indexes for the query patterns later phases rely on.
@@ -310,6 +336,12 @@ _INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_calibration_models_status ON calibration_models (status, version);",
     "CREATE INDEX IF NOT EXISTS idx_calibration_models_version ON calibration_models (version);",
     "CREATE INDEX IF NOT EXISTS idx_learning_proposals_status ON learning_proposals (status, created_at);",
+    # Phase F3 — "which rules are adopted?" (startup override load), "every
+    # rule proposed from this policy", and "is this domain+key already
+    # colliding?" (checked at propose-time, before the corpus-wide report).
+    "CREATE INDEX IF NOT EXISTS idx_compiled_rules_status ON compiled_rules (status);",
+    "CREATE INDEX IF NOT EXISTS idx_compiled_rules_policy ON compiled_rules (policy_id);",
+    "CREATE INDEX IF NOT EXISTS idx_compiled_rules_domain_key ON compiled_rules (domain, rule_key, status);",
 )
 
 

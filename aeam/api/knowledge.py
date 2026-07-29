@@ -67,10 +67,11 @@ from aeam.ingestion.extraction import ExtractionError, UnsupportedCategoryError,
 from aeam.ingestion.schema_inference import SchemaInferenceError, read_primary_table
 from aeam.ingestion.validation import SUPPORTED_EXTENSIONS
 from aeam.registry.models import (
-    AssetStatus, Dataset, Document, IngestionJob, JobStatus, JobType, ParentType,
-    PolicyStatus, Schema, SemanticDocType, Version,
+    AssetStatus, CompiledRuleStatus, Dataset, Document, IngestionJob, JobStatus, JobType,
+    ParentType, PolicyStatus, Schema, SemanticDocType, Version,
 )
 from aeam.registry.repositories import (
+    CompiledRuleRepository,
     DatasetRepository,
     DocumentRepository,
     IngestionJobRepository,
@@ -1102,6 +1103,319 @@ def set_policy_status(
         "policy": _policy_to_dict(updated) if updated else None,
         "matches_new_investigations": body.status in PolicyStatus.MATCHABLE,
     })
+
+
+# ---------------------------------------------------------------------------
+# Phase F3 — Policy Compilation, Validation & the Policy Agent
+#
+# Reads (compile preview, corpus conflicts, rule list) live under the
+# generic /api/v1/knowledge prefix, same as /policies above — mapped to
+# documents:search. Writes (propose/decide/retire) live under /curate/rules,
+# already covered by the SAME admin:config entry that guards every other
+# curation write in this file — no RBAC map change needed for either half.
+# ---------------------------------------------------------------------------
+
+
+class RuleProposeRequest(BaseModel):
+    """Request body for compiling+proposing a rule (Phase F3, SEC-7)."""
+
+    actor_id: str | None = Field(
+        default=None,
+        description="Acting principal. Ignored when the middleware established a verified identity.",
+    )
+
+
+class RuleDecisionRequest(BaseModel):
+    """A human verdict on a proposed compiled rule (Phase F3, AGENT-5 / SEC-7)."""
+
+    verdict: str = Field(description="'approved' or 'rejected'.")
+    note: str = Field(default="", description="Free-text rationale for the decision.")
+    reviewer_id: str | None = Field(default=None, description="See RuleProposeRequest.actor_id.")
+
+
+class RuleRetireRequest(BaseModel):
+    """Withdraw a previously approved rule (Phase F3 rollback path)."""
+
+    reason: str = Field(
+        min_length=1,
+        description="Why the rule is being retired. REQUIRED — an unexplained rollback is exactly what this lifecycle exists to prevent.",
+    )
+    actor_id: str | None = Field(default=None, description="See RuleProposeRequest.actor_id.")
+
+
+def _policy_agent(container: Any) -> Any:
+    """Build a :class:`PolicyAgent` over the container's repositories.
+
+    Constructed per request, exactly like the Learning Agent is in
+    ``aeam/api/learning.py`` — it is stateless over the database, so
+    per-request construction costs nothing and keeps the composition root
+    from growing another long-lived object (ARCH-1).
+    """
+    from aeam.agents.policy.policy_agent import PolicyAgent
+
+    return PolicyAgent(
+        policy_repository=PolicyRepository(container.db),
+        compiled_rule_repository=CompiledRuleRepository(container.db),
+    )
+
+
+def _compiled_rule_to_dict(rule: Any) -> dict[str, Any]:
+    # created_at/decided_at/retired_at arrive as native datetime objects on
+    # PostgreSQL (TIMESTAMP columns) but as strings on SQLite — the same
+    # driver-shape divergence CompiledRule.created_at already accepts as a
+    # str-typed field. str() normalises both to the ISO-ish form Python's
+    # datetime.__str__ produces, which json.dumps can always serialise;
+    # this was caught by a live run against real PostgreSQL, not SQLite.
+    return {
+        "rule_id": rule.rule_id,
+        "policy_id": rule.policy_id,
+        "domain": rule.domain,
+        "rule_key": rule.rule_key,
+        "comparison": rule.comparison,
+        "value": rule.value,
+        "rationale": rule.rationale,
+        "status": rule.status,
+        "created_at": str(rule.created_at) if rule.created_at else None,
+        "created_by": rule.created_by,
+        "reviewer_id": rule.reviewer_id,
+        "reviewer_roles": rule.reviewer_roles,
+        "attribution_source": rule.attribution_source,
+        "note": rule.note,
+        "decided_at": str(rule.decided_at) if rule.decided_at else None,
+        "retired_at": str(rule.retired_at) if rule.retired_at else None,
+        "retired_by": rule.retired_by,
+        "retired_reason": rule.retired_reason,
+        "adopted": rule.status == CompiledRuleStatus.APPROVED,
+    }
+
+
+@router.get(
+    "/policies/{policy_id}/compile",
+    summary="Preview compiling a policy into a RuleEngine-shaped candidate (Phase F3)",
+)
+def preview_compiled_rule(request: Request, policy_id: str) -> JSONResponse:
+    """
+    Run the deterministic Rule Compiler over ``policy_id`` WITHOUT
+    persisting anything.
+
+    Always returns 200 with a ``compilable`` boolean — an uncompilable
+    policy is a normal, fully-explained outcome (its ``reason`` states
+    exactly what signal was missing), not an error.
+    """
+    from aeam.agents.policy.policy_agent import PolicyNotFoundError
+
+    container = request.app.state.container
+    agent = _policy_agent(container)
+
+    try:
+        candidate = agent.compile_preview(policy_id)
+    except PolicyNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return JSONResponse(status_code=200, content=candidate.to_dict())
+
+
+@router.get(
+    "/policies/conflicts",
+    summary="Static conflict analysis over the matchable policy corpus (Phase F3)",
+)
+def get_policy_conflicts(request: Request) -> JSONResponse:
+    """
+    Run the deterministic Policy Validator over every currently matchable
+    policy and return every detected inconsistency.
+
+    Purely static — no LLM call, computed fresh on every request (mirrors
+    :class:`~aeam.intelligence.policy_registry.PolicyRegistry`'s own
+    load-fresh-every-call posture), so the report can never be stale
+    between a policy edit and the next read.
+    """
+    container = request.app.state.container
+    agent = _policy_agent(container)
+    conflicts = agent.validate_corpus()
+
+    return JSONResponse(status_code=200, content={
+        "conflicts": [c.to_dict() for c in conflicts],
+        "count": len(conflicts),
+        "conflict_types": sorted({c.conflict_type for c in conflicts}),
+    })
+
+
+@router.get("/rules", summary="List compiled rule proposals (Phase F3)")
+def list_compiled_rules(
+    request: Request,
+    status: str | None = Query(
+        default=None,
+        description="Filter by lifecycle status: 'proposed', 'approved', 'rejected', or 'retired'.",
+    ),
+) -> JSONResponse:
+    """Return compiled rules, optionally filtered by lifecycle status."""
+    if status is not None and status not in CompiledRuleStatus.ALL:
+        raise HTTPException(
+            status_code=422,
+            detail=f"invalid status {status!r}. Must be one of {sorted(CompiledRuleStatus.ALL)}.",
+        )
+
+    container = request.app.state.container
+    agent = _policy_agent(container)
+    rules = agent.list_rules(status=status)
+
+    return JSONResponse(status_code=200, content={
+        "rules": [_compiled_rule_to_dict(r) for r in rules],
+        "count": len(rules),
+        "lifecycle": {
+            "statuses": sorted(CompiledRuleStatus.ALL),
+            "adopted": sorted(CompiledRuleStatus.ADOPTED),
+            "note": (
+                "Only an APPROVED rule is included in the overrides RuleEngine loads at "
+                "startup — proposing or approving a rule changes nothing until the next "
+                "restart (the same restart-applied posture Phase D4's config engine uses)."
+            ),
+        },
+    })
+
+
+@router.post(
+    "/curate/rules/{policy_id}/propose",
+    summary="Compile a policy and persist it as a proposed rule (Phase F3, privileged)",
+)
+def propose_compiled_rule(request: Request, policy_id: str, body: RuleProposeRequest) -> JSONResponse:
+    """
+    Compile ``policy_id`` and persist the candidate as a PROPOSED rule.
+
+    Proposing changes nothing about detection behaviour — see
+    :meth:`~aeam.agents.policy.policy_agent.PolicyAgent.propose_rule`.
+
+    Raises:
+        HTTPException: ``404`` if the policy does not exist, ``409`` if it
+                       is retired, ``422`` if the compiler could not
+                       produce a candidate (the detail names the reason).
+    """
+    from aeam.agents.policy.policy_agent import (
+        NotCompilableError, PolicyNotFoundError, RuleConflictError,
+    )
+
+    container = request.app.state.container
+    _require_curation_enabled(container)
+
+    actor, attribution_source = _acting_principal(request)
+    if body.actor_id and attribution_source != "jwt":
+        actor = body.actor_id
+
+    agent = _policy_agent(container)
+    try:
+        result = agent.propose_rule(policy_id, created_by=actor)
+    except PolicyNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuleConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except NotCompilableError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    _write_curation_audit(
+        request,
+        action="rule_proposed",
+        endpoint=f"/api/v1/knowledge/curate/rules/{policy_id}/propose",
+        detail={**result, "actor": actor, "attribution_source": attribution_source},
+    )
+    logger.info(
+        "propose_compiled_rule | policy_id=%s | rule_id=%s | actor=%s",
+        policy_id, result["rule_id"], actor,
+    )
+    return JSONResponse(status_code=200, content=result)
+
+
+@router.post(
+    "/curate/rules/{rule_id}/decide",
+    summary="Approve or reject a proposed rule (Phase F3, privileged)",
+)
+def decide_compiled_rule(request: Request, rule_id: str, body: RuleDecisionRequest) -> JSONResponse:
+    """
+    Record a human verdict on a proposed rule.
+
+    **Approval does not itself change any running process's behaviour.**
+    The response's ``effective`` field says so explicitly, matching F2's
+    ``"applied": false`` honesty pattern — an adopted override reaches
+    :class:`~aeam.agents.kpi.rule_engine.RuleEngine` only at the next
+    container construction.
+
+    Raises:
+        HTTPException: ``400`` for an unrecognised verdict, ``404`` if the
+                       rule does not exist, ``409`` if it was already
+                       decided.
+    """
+    from aeam.agents.policy.policy_agent import RuleConflictError, RuleNotFoundError
+
+    container = request.app.state.container
+    _require_curation_enabled(container)
+
+    actor, attribution_source = _acting_principal(request)
+    if body.reviewer_id and attribution_source != "jwt":
+        actor = body.reviewer_id
+
+    agent = _policy_agent(container)
+    try:
+        result = agent.decide_rule(
+            rule_id, body.verdict, reviewer_id=actor,
+            reviewer_roles=list(getattr(request.state, "roles", None) or []),
+            attribution_source=attribution_source, note=body.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuleNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuleConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    _write_curation_audit(
+        request,
+        action="rule_decided",
+        endpoint=f"/api/v1/knowledge/curate/rules/{rule_id}/decide",
+        detail={**result, "actor": actor, "attribution_source": attribution_source},
+    )
+    logger.warning(
+        "decide_compiled_rule | rule_id=%s | verdict=%s | actor=%s",
+        rule_id, result["status"], actor,
+    )
+    return JSONResponse(status_code=200, content=result)
+
+
+@router.post(
+    "/curate/rules/{rule_id}/retire",
+    summary="Withdraw a previously approved rule (Phase F3, privileged rollback)",
+)
+def retire_compiled_rule(request: Request, rule_id: str, body: RuleRetireRequest) -> JSONResponse:
+    """
+    Retire a previously APPROVED rule — the named F3 rollback path.
+
+    Raises:
+        HTTPException: ``404`` if the rule does not exist, ``409`` if it is
+                       not currently approved.
+    """
+    from aeam.agents.policy.policy_agent import RuleConflictError, RuleNotFoundError
+
+    container = request.app.state.container
+    _require_curation_enabled(container)
+
+    actor, attribution_source = _acting_principal(request)
+    if body.actor_id and attribution_source != "jwt":
+        actor = body.actor_id
+
+    agent = _policy_agent(container)
+    try:
+        result = agent.retire_rule(rule_id, retired_by=actor, reason=body.reason)
+    except RuleNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuleConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    _write_curation_audit(
+        request,
+        action="rule_retired",
+        endpoint=f"/api/v1/knowledge/curate/rules/{rule_id}/retire",
+        detail={**result, "reason": body.reason, "actor": actor, "attribution_source": attribution_source},
+    )
+    logger.warning("retire_compiled_rule | rule_id=%s | actor=%s | reason=%s", rule_id, actor, body.reason)
+    return JSONResponse(status_code=200, content=result)
 
 
 @router.post(

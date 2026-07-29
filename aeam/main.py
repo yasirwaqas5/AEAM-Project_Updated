@@ -40,6 +40,7 @@ from aeam.registry.repositories import (
     SchemaRepository,
     VersionRepository,
     PolicyRepository,
+    CompiledRuleRepository,
     IncidentApprovalRepository,
     ReviewVerdictRepository,
 )
@@ -66,6 +67,7 @@ from aeam.agents.rag.retrieval_pipeline import RetrievalPipeline
 from aeam.memory.enterprise_memory import EnterpriseMemoryEngine
 from aeam.intelligence.policy_extraction import PolicyExtractor
 from aeam.intelligence.policy_registry import PolicyRegistry
+from aeam.agents.policy.policy_agent import PolicyAgent
 from aeam.intelligence.cross_dataset_analyzer import CrossDatasetAnalyzer
 from aeam.intelligence.adaptive_detection import AdaptiveDetectionEngine
 from aeam.intelligence.execution_planning import ExecutionPlanningEngine
@@ -749,7 +751,32 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # dataset_activation instance already driving CompositeKPISource above —
     # one activation list, in lockstep, for both what is fetched and what is
     # monitored.
-    composite_rule_engine = CompositeRuleEngine(base=RuleEngine())
+    # Phase F3 (SEC-7, AGENT-5, MOD-6): adopted compiled-rule overrides are
+    # read ONCE here, at construction, and merged into the base RuleEngine's
+    # config — the same "restart-applied configuration" trade-off Phase D4's
+    # Enterprise Configuration Engine already documents, reused rather than
+    # introducing a second one. A fresh deployment (zero approved rules) —
+    # or F3 simply never used — produces an empty overrides dict, which
+    # RuleEngine treats as byte-identical to no overrides at all: the F3
+    # acceptance criterion that the deterministic decision path is
+    # unchanged for any policy that has not been adopted as a rule.
+    policy_agent = PolicyAgent(
+        policy_repository=PolicyRepository(container.db),
+        compiled_rule_repository=CompiledRuleRepository(container.db),
+    )
+    try:
+        rule_overrides = policy_agent.active_overrides()
+    except Exception as exc:  # noqa: BLE001
+        # A read failure here must never block startup — the platform has
+        # simply not yet adopted any compiled rule, which is the same
+        # posture as a fresh deployment.
+        logger.warning("PolicyAgent.active_overrides() failed at startup: %s", exc)
+        rule_overrides = {}
+    if rule_overrides:
+        logger.info("Adopted compiled-rule overrides loaded | %s", rule_overrides)
+    container.policy_agent = policy_agent
+
+    composite_rule_engine = CompositeRuleEngine(base=RuleEngine(overrides=rule_overrides))
     composite_rule_engine.add_domain_provider(
         "datasets",
         lambda: dataset_intelligence.list_monitorable_metric_names(

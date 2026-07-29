@@ -100,6 +100,7 @@ BACKED_UP_TABLES: tuple[str, ...] = (
     "forecast_backtests",   # F1 forecast model quality history
     "calibration_models",   # F2 versioned calibration state (the rollback ledger)
     "learning_proposals",   # F2 governance decisions on threshold changes
+    "compiled_rules",       # F3 rule compilation proposals and their approvals
 )
 
 # Redis posture, stated rather than implemented (MEM-6).

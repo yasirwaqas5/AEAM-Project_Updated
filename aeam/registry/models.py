@@ -85,6 +85,34 @@ class PolicyStatus:
     MATCHABLE = {ACTIVE, PENDING_REVIEW}
 
 
+class CompiledRuleStatus:
+    """
+    Lifecycle of a compiled rule proposal (Phase F3, AGENT-5 / SEC-7).
+
+    Deliberately separate from :class:`PolicyStatus`: a policy's lifecycle
+    answers "is this document-derived knowledge still trustworthy?"; a
+    compiled rule's lifecycle answers "has a human authorized this
+    THRESHOLD to actually gate detection?" — a strictly narrower, more
+    consequential question, which is why it needs its own, more guarded
+    vocabulary rather than reusing the policy one.
+
+    ``PROPOSED`` is the ONLY state a newly compiled rule can start in — an
+    override is never enforced (never included in
+    :class:`~aeam.agents.kpi.rule_engine.RuleEngine`'s ``overrides``) until
+    it is ``APPROVED``. ``REJECTED`` and ``RETIRED`` are both terminal-ish:
+    a rejected proposal is dead (propose again to try a different value); a
+    retired rule was once approved and is being deliberately withdrawn —
+    the named F3 rollback path.
+    """
+    PROPOSED = "proposed"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    RETIRED = "retired"
+    ALL = {PROPOSED, APPROVED, REJECTED, RETIRED}
+    #: The only status whose override is loaded into RuleEngine at startup.
+    ADOPTED = {APPROVED}
+
+
 class SemanticDocType:
     """
     DECLARED semantic document type (Phase E12, MOD-4 / RAG-7).
@@ -457,6 +485,51 @@ class Policy(_Asset):
             except (ValueError, TypeError):
                 policy.embedding = None
         return policy
+
+
+@dataclass
+class CompiledRule(_Asset):
+    """
+    A candidate RuleEngine override compiled from one policy (Phase F3).
+
+    Always begins ``PROPOSED``. Nothing about its existence changes any
+    investigation's deterministic decision path — that only happens once a
+    human approves it (SEC-7, AGENT-5) AND the platform restarts, so the
+    approved override can be merged into
+    :class:`~aeam.agents.kpi.rule_engine.RuleEngine`'s config at
+    construction time (the same "restart-applied configuration" trade-off
+    Phase D4's Enterprise Configuration Engine already documents — this
+    reuses that posture rather than introducing a new one).
+
+    Retained forever, like :class:`Policy` and :class:`IncidentApproval`:
+    a rejected or retired row stays queryable so "why was this threshold
+    ever proposed, and who decided against it" remains answerable.
+    """
+    rule_id: str = field(default_factory=_new_id)
+    policy_id: str = ""                # -> policies.policy_id (unenforced)
+    domain: str = ""                   # RuleEngine domain, e.g. "sales"
+    rule_key: str = ""                 # e.g. "daily_drop_percent"
+    comparison: str | None = None      # documentation only; RuleEngine's own evaluator acts
+    value: float | None = None
+    rationale: str | None = None       # the compiler's own explanation
+    status: str = CompiledRuleStatus.PROPOSED
+    created_at: str = field(default_factory=_now_iso)
+    created_by: str | None = None
+    reviewer_id: str | None = None
+    reviewer_roles: list[str] = field(default_factory=list)
+    attribution_source: str | None = None
+    note: str | None = None
+    decided_at: str | None = None
+    retired_at: str | None = None
+    retired_by: str | None = None
+    retired_reason: str | None = None
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "CompiledRule":
+        rule = _Asset._base_from_row(cls, row, ("reviewer_roles",))
+        if not rule.status:
+            rule.status = CompiledRuleStatus.PROPOSED
+        return rule
 
 
 @dataclass
