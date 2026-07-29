@@ -304,6 +304,95 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Correlation Intelligence & Business Graph (Phase F4) ---
+    #
+    # The graph is an ADVISORY evidence source and ships off. With the flag
+    # false, no graph finding is appended, CrossDatasetAnalyzer runs its
+    # exact Phase C4 pairwise path, and the graph tables sit empty and
+    # inert — the F4 rollback posture, and the reason turning this on is a
+    # deliberate operator act rather than a default.
+
+    BUSINESS_GRAPH_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "Phase F4: when true, the Orchestrator appends a 'graph' "
+            "advisory finding from the persisted business graph and "
+            "CrossDatasetAnalyzer consults known relationships. False (the "
+            "default) restores pairwise Phase C4 correlation exactly. The "
+            "graph never overrides RuleEngine/StatisticalDetector/KPIAgent/"
+            "ForecastAgent in either state."
+        ),
+    )
+
+    GRAPH_MAX_DEPTH: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description=(
+            "Phase F4 (E6): maximum traversal hops from the incident's "
+            "metric. Two is the default because one hop is what C4 already "
+            "sees; the second is the compounding this phase adds. The "
+            "ceiling is enforced in business_graph.py as well, so this "
+            "setting can lower the bound but never remove it."
+        ),
+    )
+
+    GRAPH_MAX_NODES: int = Field(
+        default=100,
+        ge=1,
+        le=1000,
+        description=(
+            "Phase F4 (E6): maximum distinct nodes one traversal may visit. "
+            "Reaching it truncates the answer and the finding says so."
+        ),
+    )
+
+    GRAPH_MAX_EDGES: int = Field(
+        default=300,
+        ge=1,
+        le=5000,
+        description=(
+            "Phase F4 (E6): maximum edges one traversal may read, across "
+            "all hops. This is the cost bound that keeps a hub node with "
+            "tens of thousands of edges from turning an investigation into "
+            "a full table scan."
+        ),
+    )
+
+    GRAPH_MIN_EDGE_CONFIDENCE: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Phase F4: edges below this confidence are not traversed. Zero "
+            "(the default) traverses every persisted edge — every edge is "
+            "already evidence-grounded, so filtering is an operator's "
+            "signal-to-noise preference, not a correctness requirement."
+        ),
+    )
+
+    GRAPH_BUILD_INCIDENT_LIMIT: int = Field(
+        default=5000,
+        ge=1,
+        description=(
+            "Phase F4 (E6): maximum incidents one graph build reads, most "
+            "recent first. Bounds the build the same way "
+            "LEARNING_HISTORY_LIMIT bounds a recalibration run."
+        ),
+    )
+
+    GRAPH_MIN_CORRELATION: float = Field(
+        default=0.7,
+        gt=0.0,
+        le=1.0,
+        description=(
+            "Phase F4: minimum |Pearson r| a persisted cross-dataset "
+            "observation must show before it becomes a 'correlates_with' "
+            "edge. Defaults to C4's own reporting threshold — the graph "
+            "does not relax the bar the measurement was made against."
+        ),
+    )
+
     # --- Autonomous operations supervision (Phase E7, OBS-3/4) ---
 
     HEARTBEAT_STALE_SECONDS: int = Field(

@@ -113,6 +113,68 @@ class CompiledRuleStatus:
     ADOPTED = {APPROVED}
 
 
+class GraphNodeType:
+    """
+    The entity types the business graph can represent (Phase F4).
+
+    A CLOSED vocabulary, deliberately: the graph exists to relate signals
+    the platform already holds evidence about, so a node type that no
+    existing record can ground would be an invitation to invent entities.
+    Every type below maps to a concrete row the platform already stores:
+
+    * ``METRIC``   — a measure column ``DatasetIntelligenceService``
+      discovered, or an ``incidents.metric`` value.
+    * ``DATASET``  — a ``datasets`` registry row.
+    * ``SERVICE``  — a ``sources`` registry row: the upstream system of
+      record a dataset was ingested from. This is what "service" means
+      here, stated plainly rather than left to imply a service mesh the
+      platform has no evidence of.
+    * ``POLICY``   — a ``policies`` registry row (C2/C3 extraction).
+    * ``INCIDENT`` — an ``incidents`` row.
+    """
+    METRIC = "metric"
+    DATASET = "dataset"
+    SERVICE = "service"
+    POLICY = "policy"
+    INCIDENT = "incident"
+    ALL = {METRIC, DATASET, SERVICE, POLICY, INCIDENT}
+
+
+class GraphEdgeType:
+    """
+    The relationship types the business graph can represent (Phase F4).
+
+    Also closed, and for a stronger reason: an edge is a claim that two
+    business signals are related, and an unfalsifiable claim of that kind
+    is exactly the fabrication EXPL forbids. Each type names the ONE
+    evidence source that may produce it — see
+    :class:`~aeam.intelligence.business_graph.BusinessGraphBuilder`, where
+    each derivation rule is implemented once and nowhere else:
+
+    * ``DERIVED_FROM``           — structural containment, grounded in the
+      registry: a metric is a measure OF a dataset; a dataset was ingested
+      FROM a source. Confidence is always 1.0 because this is a recorded
+      fact, not an inference.
+    * ``GOVERNED_BY``            — a policy names this metric in its
+      ``related_metrics``. Grounded in the policies table.
+    * ``CORRELATES_WITH``        — C4 already measured a strong Pearson
+      correlation between two metrics during a real investigation.
+      Grounded in persisted ``cross_dataset`` findings; confidence is the
+      mean |r| actually observed.
+    * ``CO_OCCURRED_IN_INCIDENT`` — an incident's investigation cited this
+      metric (as its own metric, or as supporting cross-dataset evidence).
+      Grounded in the incidents table.
+
+    There is no "similar-to", "probably-related", or "inferred" edge type,
+    and none may be added without an evidence source that can produce it.
+    """
+    CORRELATES_WITH = "correlates_with"
+    GOVERNED_BY = "governed_by"
+    DERIVED_FROM = "derived_from"
+    CO_OCCURRED_IN_INCIDENT = "co_occurred_in_incident"
+    ALL = {CORRELATES_WITH, GOVERNED_BY, DERIVED_FROM, CO_OCCURRED_IN_INCIDENT}
+
+
 class SemanticDocType:
     """
     DECLARED semantic document type (Phase E12, MOD-4 / RAG-7).
@@ -530,6 +592,130 @@ class CompiledRule(_Asset):
         if not rule.status:
             rule.status = CompiledRuleStatus.PROPOSED
         return rule
+
+
+# ---------------------------------------------------------------------------
+# Phase F4 — Correlation Intelligence & Business Graph
+# ---------------------------------------------------------------------------
+
+#: Namespace for the graph's DETERMINISTIC identifiers. Node and edge
+#: primary keys are UUID5 hashes of the natural key rather than random
+#: UUID4s, which buys three properties F4 explicitly requires:
+#:
+#: 1. **Deterministic evolution** — rebuilding the graph from the same
+#:    evidence produces byte-identical rows, so "the graph changed" always
+#:    means "the evidence changed".
+#: 2. **Concurrency safety (ARCH-8)** — two builders racing on the same
+#:    edge compute the same primary key, so the database's own uniqueness
+#:    constraint resolves the race instead of producing duplicate edges.
+#: 3. **Stable citation** — a finding that cites an edge id still resolves
+#:    to the same edge after a rebuild.
+_GRAPH_ID_NAMESPACE: uuid.UUID = uuid.uuid5(uuid.NAMESPACE_URL, "aeam:business-graph")
+
+
+def graph_node_key(node_type: str, identity: str) -> str:
+    """The canonical natural key for a graph node, e.g. ``metric:sales``.
+
+    Lower-cased and stripped so the same entity referenced with different
+    casing by two evidence sources (a dataset schema column vs. an
+    ``incidents.metric`` value) resolves to ONE node rather than two.
+    """
+    return f"{(node_type or '').strip().lower()}:{(identity or '').strip().lower()}"
+
+
+def graph_node_id(node_key: str) -> str:
+    """Deterministic primary key for a node, derived from its natural key."""
+    return str(uuid.uuid5(_GRAPH_ID_NAMESPACE, f"node|{node_key}"))
+
+
+def graph_edge_id(source_key: str, edge_type: str, target_key: str) -> str:
+    """Deterministic primary key for an edge, derived from its natural key."""
+    return str(uuid.uuid5(_GRAPH_ID_NAMESPACE, f"edge|{source_key}|{edge_type}|{target_key}"))
+
+
+@dataclass
+class GraphNode(_Asset):
+    """
+    One typed entity in the business graph (Phase F4).
+
+    A node is never speculative: it exists because a registry row, a
+    dataset profile, or an incident record named it. ``evidence_source``
+    records WHICH of those, so an operator looking at an unexpected node
+    can go read the thing that produced it.
+
+    ``first_seen_at`` is preserved across rebuilds while ``last_seen_at``
+    advances — together they answer "how long has the platform known about
+    this signal?" without mutating anything an investigation depends on.
+    """
+    node_key: str = ""                 # natural key, e.g. "metric:sales"
+    node_id: str = ""                  # deterministic UUID5 of node_key
+    node_type: str = GraphNodeType.METRIC
+    label: str = ""                    # human-facing name
+    #: Non-authoritative descriptive detail (dataset id, policy document,
+    #: incident severity …). Never used to derive an edge.
+    attributes: dict[str, Any] = field(default_factory=dict)
+    #: The evidence source that produced this node, e.g. "dataset_registry".
+    evidence_source: str = ""
+    first_seen_at: str = field(default_factory=_now_iso)
+    last_seen_at: str = field(default_factory=_now_iso)
+
+    def __post_init__(self) -> None:
+        if not self.node_key:
+            self.node_key = graph_node_key(self.node_type, self.label)
+        if not self.node_id:
+            self.node_id = graph_node_id(self.node_key)
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "GraphNode":
+        return _Asset._base_from_row(cls, row, ("attributes",))
+
+
+@dataclass
+class GraphEdge(_Asset):
+    """
+    One typed, weighted, evidence-grounded relationship (Phase F4).
+
+    Every field below exists to make the edge *falsifiable*:
+
+    * ``edge_type`` names the derivation rule that may produce it
+      (:class:`GraphEdgeType`);
+    * ``confidence`` is the measured strength — for a structural edge it
+      is 1.0 because the relationship is recorded fact, and for a
+      correlation edge it is the mean |Pearson r| C4 actually observed,
+      never a hand-assigned weight;
+    * ``observation_count`` is how many independent observations backed it,
+      so a single lucky correlation is visibly different from one seen
+      across twenty incidents;
+    * ``evidence`` carries the pointers (incident ids, policy ids, dataset
+      ids) an operator follows to check the claim.
+
+    Edges are stored by NATURAL key (``source_key``/``target_key``) rather
+    than by node primary key. Traversal is then a single indexed lookup
+    with no join, which is what keeps the bounded-query budget meaningful.
+    """
+    source_key: str = ""               # -> graph_nodes.node_key
+    target_key: str = ""               # -> graph_nodes.node_key
+    edge_type: str = GraphEdgeType.DERIVED_FROM
+    edge_id: str = ""                  # deterministic UUID5 of the natural key
+    confidence: float = 1.0
+    observation_count: int = 1
+    evidence: dict[str, Any] = field(default_factory=dict)
+    evidence_source: str = ""
+    first_seen_at: str = field(default_factory=_now_iso)
+    last_seen_at: str = field(default_factory=_now_iso)
+
+    def __post_init__(self) -> None:
+        if not self.edge_id:
+            self.edge_id = graph_edge_id(self.source_key, self.edge_type, self.target_key)
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "GraphEdge":
+        edge = _Asset._base_from_row(cls, row, ("evidence",))
+        # SQLite/PostgreSQL both hand numerics back in their own types;
+        # normalise so callers never have to defend against a Decimal.
+        edge.confidence = float(edge.confidence) if edge.confidence is not None else 0.0
+        edge.observation_count = int(edge.observation_count or 0)
+        return edge
 
 
 @dataclass

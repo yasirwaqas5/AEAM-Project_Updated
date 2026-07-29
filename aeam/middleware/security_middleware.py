@@ -102,6 +102,25 @@ _ENDPOINT_RBAC_MAP: list[tuple[str, str, str]] = [
     ("/api/v1/learning/proposals", "logs",  "view"),
     ("/api/v1/learning",           "admin", "config"),
 
+    # --- Business graph (Phase F4, SEC-3 / SEC-7).
+    #
+    # Rebuilding the graph changes what every subsequent investigation's
+    # advisory graph finding says — platform-wide state, so it sits in the
+    # strictest tier alongside the other configuration writes. The three
+    # read surfaces map to documents:search: the graph is derived from the
+    # same governed knowledge (datasets, policies, incident history) that
+    # grant already covers, so an analyst who may search the corpus may
+    # also ask what relates to what.
+    #
+    # Same shape as /learning above and for the same reason: reads are
+    # listed individually with longer, distinct prefixes, and everything
+    # else under /graph falls through to admin:config, so a write surface
+    # added later is guarded by default (SEC-1).
+    ("/api/v1/graph/stats",        "documents", "search"),
+    ("/api/v1/graph/nodes",        "documents", "search"),
+    ("/api/v1/graph/neighborhood", "documents", "search"),
+    ("/api/v1/graph",              "admin",     "config"),
+
     # --- Actions (approve is stricter than execute).
     ("/api/v1/actions/approve",   "actions",   "approve"),
     ("/api/v1/actions",           "actions",   "execute"),

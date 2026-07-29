@@ -25,6 +25,8 @@ from aeam.registry.models import (
     CompiledRuleStatus,
     Dataset,
     Document,
+    GraphEdge,
+    GraphNode,
     IncidentApproval,
     IngestionJob,
     JobStatus,
@@ -437,6 +439,237 @@ class CompiledRuleRepository(BaseRepository):
             "retired_by": retired_by,
             "retired_reason": reason,
         })
+
+
+# ---------------------------------------------------------------------------
+# Phase F4 — Correlation Intelligence & Business Graph
+# ---------------------------------------------------------------------------
+
+class GraphNodeRepository(BaseRepository):
+    """Registry access for business-graph nodes (Phase F4).
+
+    Same thin-CRUD contract as every repository above — no traversal logic
+    lives here (that is
+    :class:`~aeam.intelligence.business_graph.BusinessGraphStore`), and no
+    derivation logic (that is ``BusinessGraphBuilder``). This class only
+    reads and writes rows.
+    """
+
+    table, pk, model_cls = "graph_nodes", "node_id", GraphNode
+
+    def upsert(self, node: GraphNode, build_id: str | None = None) -> str:
+        """Insert ``node``, or refresh an existing one, keyed on its
+        DETERMINISTIC ``node_id``.
+
+        ``first_seen_at`` is deliberately NOT updated on conflict: how long
+        the platform has known about a signal is a fact about history, and
+        overwriting it on every rebuild would erase it. ``last_seen_at``
+        advances instead, which is also what
+        :meth:`BusinessGraphStore.sweep_stale` uses to retire nodes whose
+        evidence has disappeared.
+
+        Concurrency (ARCH-8): two builders racing on the same node compute
+        the same primary key, so the database's own uniqueness constraint
+        resolves the race — the loser updates rather than duplicating.
+        """
+        row = node.to_row()
+        row["attributes"] = json.dumps(row.get("attributes") or {})
+        row["build_id"] = build_id
+        columns = list(row)
+        self._db.execute(
+            f"INSERT INTO graph_nodes ({', '.join(columns)}) "
+            f"VALUES ({', '.join(':' + c for c in columns)}) "
+            "ON CONFLICT (node_id) DO UPDATE SET "
+            "  node_key = EXCLUDED.node_key,"
+            "  node_type = EXCLUDED.node_type,"
+            "  label = EXCLUDED.label,"
+            "  attributes = EXCLUDED.attributes,"
+            "  evidence_source = EXCLUDED.evidence_source,"
+            "  last_seen_at = EXCLUDED.last_seen_at,"
+            "  build_id = EXCLUDED.build_id",
+            row,
+        )
+        return node.node_id
+
+    def get_by_key(self, node_key: str) -> GraphNode | None:
+        rows = self._query("node_key = :k", {"k": node_key})
+        return rows[0] if rows else None
+
+    def list_by_keys(self, node_keys: list[str]) -> list[GraphNode]:
+        """Fetch several nodes in ONE query — the traversal's label lookup.
+
+        An empty input returns an empty list without touching the database
+        (``IN ()`` is a syntax error on some dialects, and a round-trip for
+        nothing is waste on a per-investigation path).
+        """
+        if not node_keys:
+            return []
+        params = {f"k{i}": key for i, key in enumerate(node_keys)}
+        placeholders = ", ".join(f":{name}" for name in params)
+        return self._query(f"node_key IN ({placeholders})", params)
+
+    def list_by_type(
+        self, node_type: str, limit: int | None = None, offset: int = 0
+    ) -> list[GraphNode]:
+        query = (
+            "SELECT * FROM graph_nodes WHERE node_type = :t "
+            "ORDER BY node_key ASC"
+        )
+        params: dict[str, Any] = {"t": node_type}
+        if limit is not None:
+            query += " LIMIT :limit OFFSET :offset"
+            params["limit"] = int(limit)
+            params["offset"] = max(0, int(offset))
+        return [GraphNode.from_row(r) for r in self._db.fetch_all(query, params)]
+
+    def search(self, term: str, limit: int = 50) -> list[GraphNode]:
+        """Case-insensitive substring search over node keys and labels.
+
+        Always bounded (E6): the caller cannot ask for the whole graph by
+        supplying an empty term.
+        """
+        pattern = f"%{(term or '').strip().lower()}%"
+        return [
+            GraphNode.from_row(r)
+            for r in self._db.fetch_all(
+                "SELECT * FROM graph_nodes "
+                "WHERE LOWER(node_key) LIKE :p OR LOWER(label) LIKE :p "
+                "ORDER BY node_key ASC LIMIT :limit",
+                {"p": pattern, "limit": max(1, int(limit))},
+            )
+        ]
+
+    def count_by_type(self) -> dict[str, int]:
+        rows = self._db.fetch_all(
+            "SELECT node_type, COUNT(*) AS n FROM graph_nodes GROUP BY node_type"
+        )
+        return {str(r["node_type"]): int(r["n"] or 0) for r in rows}
+
+    def delete_stale(self, cutoff_iso: str) -> int:
+        """Remove nodes not re-confirmed since ``cutoff_iso``; return the count.
+
+        The cutoff (not a build id) is the sweep key deliberately: a node
+        written concurrently by another builder carries a ``last_seen_at``
+        at or after the cutoff and therefore survives, so two builds racing
+        can never delete each other's work (ARCH-8).
+        """
+        row = self._db.fetch_one(
+            "SELECT COUNT(*) AS n FROM graph_nodes WHERE last_seen_at < :cutoff",
+            {"cutoff": cutoff_iso},
+        )
+        removed = int(row["n"] or 0) if row else 0
+        self._db.execute(
+            "DELETE FROM graph_nodes WHERE last_seen_at < :cutoff", {"cutoff": cutoff_iso}
+        )
+        return removed
+
+
+class GraphEdgeRepository(BaseRepository):
+    """Registry access for business-graph edges (Phase F4)."""
+
+    table, pk, model_cls = "graph_edges", "edge_id", GraphEdge
+
+    def upsert(self, edge: GraphEdge, build_id: str | None = None) -> str:
+        """Insert ``edge``, or refresh an existing one, keyed on its
+        DETERMINISTIC ``edge_id``.
+
+        ``confidence``/``observation_count``/``evidence`` are REPLACED, not
+        accumulated, on conflict. That is what makes graph evolution
+        deterministic: the builder recomputes each edge's strength from the
+        complete evidence set every time, so a rebuild converges on the
+        same numbers instead of drifting upward with each run.
+        """
+        row = edge.to_row()
+        row["evidence"] = json.dumps(row.get("evidence") or {})
+        row["build_id"] = build_id
+        columns = list(row)
+        self._db.execute(
+            f"INSERT INTO graph_edges ({', '.join(columns)}) "
+            f"VALUES ({', '.join(':' + c for c in columns)}) "
+            "ON CONFLICT (edge_id) DO UPDATE SET "
+            "  source_key = EXCLUDED.source_key,"
+            "  target_key = EXCLUDED.target_key,"
+            "  edge_type = EXCLUDED.edge_type,"
+            "  confidence = EXCLUDED.confidence,"
+            "  observation_count = EXCLUDED.observation_count,"
+            "  evidence = EXCLUDED.evidence,"
+            "  evidence_source = EXCLUDED.evidence_source,"
+            "  last_seen_at = EXCLUDED.last_seen_at,"
+            "  build_id = EXCLUDED.build_id",
+            row,
+        )
+        return edge.edge_id
+
+    def list_touching(
+        self,
+        node_keys: list[str],
+        *,
+        limit: int,
+        min_confidence: float = 0.0,
+        edge_types: list[str] | None = None,
+    ) -> list[GraphEdge]:
+        """Every edge with one endpoint in ``node_keys``, hard-bounded.
+
+        This is the ONE query a traversal hop makes — the whole frontier in
+        a single round trip, with ``LIMIT`` applied in SQL rather than in
+        Python. That is what makes the traversal's cost bound real: a hop
+        into a hub node with fifty thousand edges reads ``limit`` rows, not
+        fifty thousand.
+
+        Ordering is ``confidence DESC, observation_count DESC, edge_id ASC``
+        — strongest evidence first, with ``edge_id`` as a deterministic
+        tie-break so a truncated traversal returns the SAME edges on every
+        run rather than whatever the storage engine happened to yield.
+        """
+        if not node_keys or limit <= 0:
+            return []
+        params: dict[str, Any] = {
+            f"k{i}": key for i, key in enumerate(node_keys)
+        }
+        placeholders = ", ".join(f":{name}" for name in params)
+        where = (
+            f"(source_key IN ({placeholders}) OR target_key IN ({placeholders})) "
+            "AND confidence >= :min_conf"
+        )
+        params["min_conf"] = float(min_confidence)
+        if edge_types:
+            type_params = {f"t{i}": t for i, t in enumerate(edge_types)}
+            params.update(type_params)
+            where += f" AND edge_type IN ({', '.join(':' + n for n in type_params)})"
+        params["limit"] = int(limit)
+        return [
+            GraphEdge.from_row(r)
+            for r in self._db.fetch_all(
+                f"SELECT * FROM graph_edges WHERE {where} "
+                "ORDER BY confidence DESC, observation_count DESC, edge_id ASC "
+                "LIMIT :limit",
+                params,
+            )
+        ]
+
+    def count_by_type(self) -> dict[str, int]:
+        rows = self._db.fetch_all(
+            "SELECT edge_type, COUNT(*) AS n FROM graph_edges GROUP BY edge_type"
+        )
+        return {str(r["edge_type"]): int(r["n"] or 0) for r in rows}
+
+    def delete_stale(self, cutoff_iso: str) -> int:
+        """Remove edges not re-confirmed since ``cutoff_iso``; return the count.
+
+        This is how an edge whose grounding evidence disappeared (a dataset
+        de-registered, a policy's ``related_metrics`` corrected) leaves the
+        graph. Edges are never invented, and they are never kept alive past
+        the evidence that justified them.
+        """
+        row = self._db.fetch_one(
+            "SELECT COUNT(*) AS n FROM graph_edges WHERE last_seen_at < :cutoff",
+            {"cutoff": cutoff_iso},
+        )
+        removed = int(row["n"] or 0) if row else 0
+        self._db.execute(
+            "DELETE FROM graph_edges WHERE last_seen_at < :cutoff", {"cutoff": cutoff_iso}
+        )
+        return removed
 
 
 # ---------------------------------------------------------------------------

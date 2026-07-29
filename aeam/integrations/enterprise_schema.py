@@ -42,6 +42,9 @@ ENTERPRISE_TABLES: tuple[str, ...] = (
     # Phase E9 — Human-in-the-Loop Enforcement.
     "incident_approvals",
     "review_verdicts",
+    # Phase F4 — Correlation Intelligence & Business Graph.
+    "graph_nodes",
+    "graph_edges",
 )
 
 # ---------------------------------------------------------------------------
@@ -297,6 +300,36 @@ CREATE TABLE IF NOT EXISTS compiled_rules (
 );
 """
 
+_GRAPH_NODES = """
+CREATE TABLE IF NOT EXISTS graph_nodes (
+    node_id          TEXT PRIMARY KEY,   -- deterministic UUID5 of node_key
+    node_key         TEXT NOT NULL,      -- natural key, e.g. 'metric:sales'
+    node_type        TEXT NOT NULL,      -- 'metric'|'dataset'|'service'|'policy'|'incident'
+    label            TEXT,
+    attributes       JSONB,              -- descriptive only; never derives an edge
+    evidence_source  TEXT,               -- which registry/record produced this node
+    first_seen_at    TIMESTAMP,
+    last_seen_at     TIMESTAMP,
+    build_id         TEXT
+);
+"""
+
+_GRAPH_EDGES = """
+CREATE TABLE IF NOT EXISTS graph_edges (
+    edge_id            TEXT PRIMARY KEY, -- deterministic UUID5 of the natural key
+    source_key         TEXT NOT NULL,    -- -> graph_nodes.node_key
+    target_key         TEXT NOT NULL,    -- -> graph_nodes.node_key
+    edge_type          TEXT NOT NULL,    -- 'correlates_with'|'governed_by'|'derived_from'|'co_occurred_in_incident'
+    confidence         DOUBLE PRECISION,
+    observation_count  INTEGER,
+    evidence           JSONB,            -- pointers an operator follows to check the claim
+    evidence_source    TEXT,
+    first_seen_at      TIMESTAMP,
+    last_seen_at       TIMESTAMP,
+    build_id           TEXT
+);
+"""
+
 _DDL: tuple[str, ...] = (
     _SOURCES, _DOCUMENTS, _DATASETS, _SCHEMAS, _VERSIONS, _INGESTION_JOBS, _POLICIES,
     _INCIDENT_APPROVALS, _REVIEW_VERDICTS,
@@ -308,6 +341,9 @@ _DDL: tuple[str, ...] = (
     # Phase F3 — compiled rule proposals (AGENT-5/SEC-7: never enforced
     # without a recorded human approval).
     _COMPILED_RULES,
+    # Phase F4 — the business graph (advisory evidence source; inert until
+    # an operator runs a build).
+    _GRAPH_NODES, _GRAPH_EDGES,
 )
 
 # Helpful lookup indexes for the query patterns later phases rely on.
@@ -342,6 +378,20 @@ _INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS idx_compiled_rules_status ON compiled_rules (status);",
     "CREATE INDEX IF NOT EXISTS idx_compiled_rules_policy ON compiled_rules (policy_id);",
     "CREATE INDEX IF NOT EXISTS idx_compiled_rules_domain_key ON compiled_rules (domain, rule_key, status);",
+    # Phase F4 — the business graph. node_key is UNIQUE because it is the
+    # natural key every edge references: two rows claiming to be
+    # 'metric:sales' would silently split the graph in half.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_nodes_key ON graph_nodes (node_key);",
+    "CREATE INDEX IF NOT EXISTS idx_graph_nodes_type ON graph_nodes (node_type);",
+    # The two hot traversal reads: "edges out of this frontier" and "edges
+    # into it". Confidence is in the index so the ORDER BY that makes a
+    # truncated traversal deterministic does not force a full sort.
+    "CREATE INDEX IF NOT EXISTS idx_graph_edges_source ON graph_edges (source_key, confidence);",
+    "CREATE INDEX IF NOT EXISTS idx_graph_edges_target ON graph_edges (target_key, confidence);",
+    "CREATE INDEX IF NOT EXISTS idx_graph_edges_type ON graph_edges (edge_type);",
+    # The mark-and-sweep that retires edges whose evidence disappeared.
+    "CREATE INDEX IF NOT EXISTS idx_graph_edges_last_seen ON graph_edges (last_seen_at);",
+    "CREATE INDEX IF NOT EXISTS idx_graph_nodes_last_seen ON graph_nodes (last_seen_at);",
 )
 
 

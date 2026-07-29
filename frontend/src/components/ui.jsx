@@ -244,6 +244,38 @@ export function getCrossDatasetData(incident) {
 }
 
 /**
+ * The Business Graph finding (type "graph", Phase F4) — a structurally
+ * distinct evidence source: what the platform ALREADY KNOWS relates to
+ * this incident's metric, read from the persisted business graph rather
+ * than re-measured. Complementary to Cross-Dataset Intelligence, which
+ * scans the currently-activated datasets pairwise right now; the graph can
+ * reach a metric whose dataset is not currently activated, and can reach
+ * two hops out. See aeam/intelligence/graph_correlation.py: advisory only,
+ * never capable of altering a deterministic decision.
+ *
+ * Shape: {available, reason, origin_key, origin_label, budget, truncated,
+ *  truncation_reason, depth_reached, nodes_visited, edges_traversed,
+ *  correlated_metrics, governing_policies, related_datasets,
+ *  related_services, prior_incidents, related_total}. Every entry in every
+ * list carries {path, edges, edge_confidences, depth, path_confidence,
+ * relation, direct}.
+ *
+ * Returns null if the graph was never consulted for this investigation
+ * (an older incident, or BUSINESS_GRAPH_ENABLED was off at the time) —
+ * which is distinct from having run and found the metric absent from the
+ * graph (available: false), and distinct again from having run and found
+ * the metric present but unconnected.
+ */
+export function getBusinessGraphData(incident) {
+  const findings = getFindings(incident);
+  let latest = null;
+  for (const entry of findings) {
+    if (entry?.type === "graph" && entry.data) latest = entry.data;
+  }
+  return latest;
+}
+
+/**
  * The Adaptive Detection Engine finding (type "adaptive", Phase C5) — a
  * FIFTH, structurally distinct evidence source: a longer-horizon rolling
  * baseline plus day-of-week seasonality judgement for the incident's own

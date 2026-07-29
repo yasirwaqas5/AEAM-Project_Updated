@@ -40,9 +40,31 @@ Honesty contract:
   differently-sized/differently-sampled datasets) and finding at least
   ``MIN_CORRELATION_POINTS`` genuinely overlapping dates.
 - A dataset is only called "related" via an inspectable structural fact —
-  it shares the incident's own metric name, or it shares a dimension
-  column name with the origin dataset — never an invented semantic
-  similarity.
+  it shares the incident's own metric name, it shares a dimension column
+  name with the origin dataset, or (Phase F4) the business graph already
+  records a measured behavioural relationship between the two metrics —
+  never an invented semantic similarity.
+
+Phase F4 — graph awareness (additive, default off)
+--------------------------------------------------
+``graph_store`` is optional and defaults to ``None``. When it is ``None``
+this class behaves EXACTLY as it did in Phase C4: same queries, same
+comparisons, same result keys, same values. That is the F4 rollback
+posture — turning the graph off restores pairwise C4 precisely.
+
+When a store IS supplied, the analyzer gains one capability and only one:
+before scanning, it asks the graph which metrics are ALREADY KNOWN to
+relate to the incident's metric (from measured correlations and incident
+co-occurrence — never from structure or governance, which say nothing
+about whether two signals move together). A candidate whose measure
+appears in that set is recognised as genuinely related instead of being
+filed under the generic ``activated_dataset`` catch-all and dropped when
+it happens to look normal. The known-relationship's traversal path and
+edge confidences travel with the entry, so the claim stays checkable.
+
+The analyzer still never writes to the graph. Correlation evidence reaches
+the graph only through an explicit, privileged build that re-reads the
+findings this analyzer already persisted.
 """
 
 from __future__ import annotations
@@ -87,6 +109,12 @@ class CrossDatasetAnalyzer:
                             MonitorAgent itself uses.
         correlation_threshold: Minimum |Pearson r| to report a "strong
                             correlation". Defaults to 0.7.
+        graph_store:        Phase F4, optional. A
+                            :class:`~aeam.intelligence.business_graph.BusinessGraphStore`
+                            to consult for already-known relationships.
+                            ``None`` (the default) reproduces Phase C4
+                            behaviour exactly, including the result dict's
+                            exact key set.
 
     Raises:
         ValueError: If any required dependency is ``None``.
@@ -99,6 +127,7 @@ class CrossDatasetAnalyzer:
         kpi_source: DatasetKPISource,
         statistical_detector: StatisticalDetector | None = None,
         correlation_threshold: float = DEFAULT_CORRELATION_THRESHOLD,
+        graph_store: Any | None = None,
     ) -> None:
         if dataset_activation is None:
             raise ValueError("dataset_activation must not be None.")
@@ -111,6 +140,7 @@ class CrossDatasetAnalyzer:
         self._kpi_source = kpi_source
         self._detector = statistical_detector or StatisticalDetector(window_size=7)
         self._correlation_threshold = correlation_threshold
+        self._graph_store = graph_store
 
     # ------------------------------------------------------------------
     # Public API
@@ -195,16 +225,35 @@ class CrossDatasetAnalyzer:
 
         origin_dims = {d.lower() for d in (origin_profile.dimensions if origin_profile else [])}
 
+        # Phase F4: one bounded traversal for the whole analysis, not one
+        # per candidate. Empty dict when no store is wired, which is what
+        # keeps every branch below on its exact C4 path.
+        known_related = self._known_related_metrics(metric)
+
         for dataset_id, profile in profiles.items():
             if dataset_id == origin_id:
                 continue
 
             shares_metric_name = metric_norm and metric_norm in {m.lower() for m in profile.measures}
             shared_dims = sorted(origin_dims & {d.lower() for d in profile.dimensions}) if origin_dims else []
+            # A metric this dataset measures that the graph already relates
+            # to the incident's metric. Structural facts still win: if the
+            # dataset shares the metric name or a dimension, that is the
+            # more specific and more directly checkable statement.
+            graph_match = next(
+                (
+                    (m, known_related[m.lower()])
+                    for m in profile.measures
+                    if m.lower() in known_related
+                ),
+                None,
+            )
             if shares_metric_name:
                 relation = "shared_metric_name"
             elif shared_dims:
                 relation = f"shared_dimension:{shared_dims[0]}"
+            elif graph_match is not None:
+                relation = f"graph_{graph_match[1].get('relation') or 'related'}"
             else:
                 relation = "activated_dataset"
 
@@ -245,6 +294,23 @@ class CrossDatasetAnalyzer:
                 })
                 continue
 
+            # Phase F4 (EXPL): when the graph is what made this dataset
+            # relevant, the entry carries the traversal that says so — the
+            # metric it matched, how far away it is, the edges walked, and
+            # each edge's own confidence. A reader can check the claim
+            # without leaving the finding.
+            if graph_match is not None:
+                matched_metric, known = graph_match
+                best_entry["graph_relation"] = {
+                    "matched_metric": matched_metric,
+                    "node_key": known.get("node_key"),
+                    "relation": known.get("relation"),
+                    "depth": known.get("depth"),
+                    "path": known.get("path"),
+                    "path_confidence": known.get("path_confidence"),
+                    "edges": known.get("edges"),
+                }
+
             if best_entry["statistical_anomaly"]:
                 supporting.append(best_entry)
             elif relation != "activated_dataset":
@@ -273,7 +339,7 @@ class CrossDatasetAnalyzer:
                             "overlapping_dates": len(overlap_dates),
                         })
 
-        return {
+        result = {
             "insufficient_data": False,
             "reason": None,
             "origin_dataset_id": origin_id,
@@ -284,6 +350,34 @@ class CrossDatasetAnalyzer:
             "strong_correlations": strong_correlations,
             "missing_signals": missing_signals,
         }
+        # Phase F4: these keys appear ONLY when a graph store is wired, so
+        # a flag-off result is key-for-key identical to Phase C4's.
+        if self._graph_store is not None:
+            result["graph_aware"] = True
+            result["graph_known_metrics"] = sorted(known_related)
+        return result
+
+    def _known_related_metrics(self, metric: str) -> dict[str, dict[str, Any]]:
+        """Metrics the graph already relates to ``metric`` (Phase F4).
+
+        Returns ``{}`` when no store is wired — the single condition every
+        graph-aware branch above tests, so "no graph" and "graph knows
+        nothing about this metric" take the same, unchanged C4 code path.
+        The import is local so a deployment that never wires a graph never
+        loads the graph modules at all.
+        """
+        if self._graph_store is None:
+            return {}
+        try:
+            from aeam.intelligence.graph_correlation import known_related_metrics
+
+            return known_related_metrics(self._graph_store, metric)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "CrossDatasetAnalyzer | graph lookup failed for metric=%s (falling "
+                "back to pairwise-only): %s", metric, exc,
+            )
+            return {}
 
     @staticmethod
     def _series_values(rows: list[dict[str, Any]], measure: str) -> list[float]:
@@ -341,7 +435,10 @@ class CrossDatasetAnalyzer:
         }
 
     def __repr__(self) -> str:
-        return f"CrossDatasetAnalyzer(correlation_threshold={self._correlation_threshold})"
+        return (
+            f"CrossDatasetAnalyzer(correlation_threshold={self._correlation_threshold}, "
+            f"graph_aware={self._graph_store is not None})"
+        )
 
 
 def _to_date_key(value: Any) -> str | None:

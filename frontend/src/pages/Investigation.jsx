@@ -54,6 +54,7 @@ import EvidencePanel from "../components/EvidencePanel";
 import MemoryPanel from "../components/MemoryPanel";
 import PolicyMatchPanel from "../components/PolicyMatchPanel";
 import CrossDatasetPanel from "../components/CrossDatasetPanel";
+import BusinessGraphPanel from "../components/BusinessGraphPanel";
 import AdaptiveDetectionPanel from "../components/AdaptiveDetectionPanel";
 import ExecutionPlanPanel from "../components/ExecutionPlanPanel";
 import ExplainabilityPanel from "../components/ExplainabilityPanel";
@@ -531,7 +532,10 @@ export default function Investigation() {
                 {tab === "signals" && (
                   <div className="aeam-tabpanel aeam-grid-2" style={{ alignItems: "start" }}>
                     <Panel title="Cross-Dataset Analysis" icon="branch"><CrossDatasetPanel incident={selected} /></Panel>
-                    <Panel title="Adaptive Detection" icon="activity"><AdaptiveDetectionPanel incident={selected} /></Panel>
+                    <div style={{ display: "flex", flexDirection: "column", gap: "1.2rem" }}>
+                      <Panel title="Adaptive Detection" icon="activity"><AdaptiveDetectionPanel incident={selected} /></Panel>
+                      <Panel title="Business Graph — known relationships" icon="branch"><BusinessGraphPanel incident={selected} /></Panel>
+                    </div>
                   </div>
                 )}
 

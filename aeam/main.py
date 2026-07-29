@@ -41,6 +41,8 @@ from aeam.registry.repositories import (
     VersionRepository,
     PolicyRepository,
     CompiledRuleRepository,
+    GraphEdgeRepository,
+    GraphNodeRepository,
     IncidentApprovalRepository,
     ReviewVerdictRepository,
 )
@@ -69,6 +71,8 @@ from aeam.intelligence.policy_extraction import PolicyExtractor
 from aeam.intelligence.policy_registry import PolicyRegistry
 from aeam.agents.policy.policy_agent import PolicyAgent
 from aeam.intelligence.cross_dataset_analyzer import CrossDatasetAnalyzer
+from aeam.intelligence.business_graph import BusinessGraphStore, TraversalBudget
+from aeam.intelligence.graph_correlation import GraphCorrelationEngine
 from aeam.intelligence.adaptive_detection import AdaptiveDetectionEngine
 from aeam.intelligence.execution_planning import ExecutionPlanningEngine
 from aeam.governance.human_review import HumanReviewService
@@ -133,6 +137,7 @@ from aeam.api.review import router as review_router
 from aeam.api.auth import router as auth_router, resolve_oidc_endpoints
 from aeam.api.audit import router as audit_router
 from aeam.api.learning import router as learning_router
+from aeam.api.graph import router as graph_router
 
 # ---------------------------------------------------------------------------
 # Logging bootstrap
@@ -898,9 +903,50 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # detector implementation).
     # Phase D4: correlation_threshold's own signature default (0.7, set in
     # Phase C4) is not Optional -- only override when explicitly configured.
+    # --- Business Graph (Phase F4) ---
+    # The store is constructed whenever a database exists, because the
+    # read-only /api/v1/graph surface must be able to report an empty graph
+    # honestly rather than 503 on a deployment that has simply never run a
+    # build. What BUSINESS_GRAPH_ENABLED gates is narrower and more
+    # consequential: whether the graph participates in an INVESTIGATION —
+    # whether the Orchestrator appends a graph finding, and whether
+    # CrossDatasetAnalyzer consults known relationships. Flag off, both are
+    # None/absent and the investigation path is byte-identical to F3's.
+    #
+    # Nothing here builds the graph. Building is an explicit, privileged,
+    # audited act via POST /api/v1/graph/build — no startup build, no
+    # timer, no agent deciding on its own that the graph should change.
+    business_graph_store = BusinessGraphStore(
+        node_repo=GraphNodeRepository(container.db),
+        edge_repo=GraphEdgeRepository(container.db),
+    )
+    container.business_graph_store = business_graph_store
+    container.dataset_intelligence = dataset_intelligence
+
+    graph_budget = TraversalBudget.clamped(
+        max_depth=settings.GRAPH_MAX_DEPTH,
+        max_nodes=settings.GRAPH_MAX_NODES,
+        max_edges=settings.GRAPH_MAX_EDGES,
+        min_confidence=settings.GRAPH_MIN_EDGE_CONFIDENCE,
+    )
+    business_graph_engine = (
+        GraphCorrelationEngine(store=business_graph_store, budget=graph_budget)
+        if settings.BUSINESS_GRAPH_ENABLED
+        else None
+    )
+    logger.info(
+        "Business graph | enabled=%s | budget=%s",
+        settings.BUSINESS_GRAPH_ENABLED, graph_budget.as_dict(),
+    )
+
     _cross_dataset_kwargs = {}
     if settings.CROSS_DATASET_CORRELATION_THRESHOLD is not None:
         _cross_dataset_kwargs["correlation_threshold"] = settings.CROSS_DATASET_CORRELATION_THRESHOLD
+    # Phase F4: the graph store reaches C4 only when the flag is on. Passed
+    # as None otherwise, which CrossDatasetAnalyzer treats as "no graph" —
+    # the same code path, the same result keys, the same values as C4.
+    if settings.BUSINESS_GRAPH_ENABLED:
+        _cross_dataset_kwargs["graph_store"] = business_graph_store
     cross_dataset_analyzer = CrossDatasetAnalyzer(
         dataset_activation=dataset_activation,
         intelligence=dataset_intelligence,
@@ -1003,6 +1049,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         explainability_engine=explainability_engine,
         ai_evaluation_engine=ai_evaluation_engine,
         human_review_service=human_review_service,
+        business_graph_engine=business_graph_engine,
     )
 
     # Register wildcard handler
@@ -1450,6 +1497,7 @@ def create_app() -> FastAPI:
     application.include_router(auth_router)
     application.include_router(audit_router)
     application.include_router(learning_router)
+    application.include_router(graph_router)
 
     _register_routes(application)
     _mount_frontend_build(application)

@@ -207,6 +207,7 @@ class Orchestrator:
         explainability_engine: Any | None = None,  # Phase D1 — Enterprise Explainability Engine
         ai_evaluation_engine: Any | None = None,  # Phase D2 — Enterprise AI Evaluation & Quality Engine
         human_review_service: Any | None = None,  # Phase E9 — Human-in-the-Loop Enforcement
+        business_graph_engine: Any | None = None,  # Phase F4 — Business Graph (advisory)
         kpi_agent: Any | None = None,  # Phase F1 — real KPI investigation pass
         learning_agent: Any | None = None,  # Phase F2 — confidence recalibration
         short_term_memory: ShortTermMemory | None = None,   # DEPRECATED (Phase E2) — see class docstring
@@ -223,6 +224,10 @@ class Orchestrator:
         self._memory = memory_engine  # Phase C1
         self._policy_registry = policy_registry  # Phase C3
         self._cross_dataset = cross_dataset_analyzer  # Phase C4
+        # Phase F4: None unless BUSINESS_GRAPH_ENABLED and a graph store
+        # was wired. None means the graph stage is skipped entirely and the
+        # investigation is byte-identical to F3's.
+        self._business_graph = business_graph_engine
         self._adaptive_detection = adaptive_detection_engine  # Phase C5
         self._execution_planner = execution_planning_engine  # Phase C7
         self._explainability_engine = explainability_engine  # Phase D1
@@ -582,6 +587,58 @@ class Orchestrator:
                 len(cross_dataset_result.get("contradicting", [])),
                 len(cross_dataset_result.get("strong_correlations", [])),
                 cross_incident_id,
+            )
+
+        # --- Business Graph (Phase F4) ---
+        # Same idempotency pattern as every advisory source above -- runs
+        # once per incident lifecycle. Traverses the PERSISTED business
+        # graph outward from this incident's metric, within a hard budget
+        # (depth/nodes/edges), and reports what the platform already knows
+        # relates to it: metrics correlated in past investigations,
+        # policies that govern it, its datasets and their source systems,
+        # and prior incidents that cited it.
+        #
+        # Three properties this stage deliberately has:
+        #   - It READS ONLY. An investigation never writes to the graph;
+        #     edges reach it solely through an explicit, privileged build
+        #     that re-reads findings already persisted. So the graph can
+        #     never grow from its own output.
+        #   - It never re-derives a measurement. Every correlation it
+        #     reports was measured by C4 at some earlier investigation and
+        #     is cited back with the incidents that produced it.
+        #   - It is advisory. Like memory/policy/cross_dataset/adaptive, it
+        #     is appended as its own findings entry and never fed into
+        #     RuleEngine/DecisionEngine/ActionAgent (AGENT-5).
+        if self._business_graph is not None and not self._has_graph_finding(ctx):
+            with investigation_span("evidence.business_graph", incident_id=ctx.incident_id):
+                try:
+                    graph_result = self._business_graph.analyze(metric=ctx.event.metric)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "investigate | business graph traversal failed | incident_id=%s | error=%s",
+                        ctx.incident_id, exc,
+                    )
+                    graph_result = {
+                        "available": False,
+                        "reason": f"Business graph traversal failed: {exc}",
+                        "origin_key": None, "origin_label": None, "budget": None,
+                        "truncated": False, "truncation_reason": None,
+                        "depth_reached": 0, "nodes_visited": 0, "edges_traversed": 0,
+                        "correlated_metrics": [], "governing_policies": [],
+                        "related_datasets": [], "related_services": [],
+                        "prior_incidents": [], "related_total": 0,
+                    }
+
+            ctx.stm.append("findings", {
+                "type": "graph",
+                "data": graph_result,
+            })
+            logger.info(
+                "investigate | business graph | available=%s | related=%d | "
+                "depth_reached=%d | truncated=%s | incident_id=%s",
+                graph_result.get("available"), graph_result.get("related_total", 0),
+                graph_result.get("depth_reached", 0), graph_result.get("truncated"),
+                ctx.stm.get("incident_id", "unknown"),
             )
 
         # --- Adaptive Detection Engine (Phase C5) ---
@@ -1737,6 +1794,19 @@ class Orchestrator:
         findings = ctx.stm.get("findings", []) or []
         return any(
             isinstance(entry, dict) and entry.get("type") == "cross_dataset"
+            for entry in findings
+        )
+
+    def _has_graph_finding(self, ctx: IncidentContext) -> bool:
+        """
+        True if the Business Graph has already run this incident lifecycle
+        -- same idempotency guard as _has_memory_finding()/
+        _has_policy_finding()/_has_cross_dataset_finding(), for the same
+        reason.
+        """
+        findings = ctx.stm.get("findings", []) or []
+        return any(
+            isinstance(entry, dict) and entry.get("type") == "graph"
             for entry in findings
         )
 
