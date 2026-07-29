@@ -262,6 +262,72 @@ Labels:
              the Phase E9 human-approval gate).
 """
 
+calibration_ece: Gauge = Gauge(
+    "calibration_ece",
+    "Expected calibration error of confidence, measured on held-out outcomes",
+    ["stage"],
+)
+"""
+Gauge holding the platform's confidence calibration error (Phase F2).
+
+Semantics (OBS-2), because an ECE without them is unreadable:
+
+* **What it measures:** the sample-weighted mean distance between stated
+  confidence and observed resolution rate across 10 buckets — the distance
+  of the reliability curve from the diagonal. 0.0 is perfect calibration.
+* **Window:** the held-out split of the most recent
+  ``LEARNING_HISTORY_LIMIT`` incidents carrying a labeled outcome, as of
+  the last recalibration run. It is NOT a live rolling figure: it updates
+  when a recalibration executes, and between runs it is a statement about
+  that run.
+* **Source:** E9 human verdicts where present, otherwise the incident's own
+  finalized ``investigation_status``.
+* **Reset behaviour:** process-lifetime Gauge, re-set on each recalibration
+  and on startup when an active calibration exists. It is not a counter and
+  carries no history; ``calibration_models`` is the history.
+
+Labels:
+    stage: ``"raw"`` (before the mapping) or ``"calibrated"`` (after).
+           Both are published because the gap between them IS the learning,
+           and publishing only the post-calibration number would make a
+           useless calibration indistinguishable from a good one.
+
+Usage::
+
+    calibration_ece.labels(stage="raw").set(0.2149)
+    calibration_ece.labels(stage="calibrated").set(0.0958)
+"""
+
+calibration_version: Gauge = Gauge(
+    "calibration_version",
+    "Version number of the currently active confidence calibration (0 = none)",
+)
+"""
+Gauge holding the active calibration's version (Phase F2).
+
+0 means no calibration is active and confidence is being reported raw —
+distinct from "version 1", and the distinction matters: an alert on this
+metric dropping to 0 catches a deployment that believes it is calibrated
+and is not. Set at startup and on every adoption or restore.
+"""
+
+calibration_samples: Gauge = Gauge(
+    "calibration_samples",
+    "Labeled outcome samples behind the active calibration, by split",
+    ["split"],
+)
+"""
+Gauge holding the sample counts behind the active calibration (Phase F2).
+
+Published alongside ``calibration_ece`` because an ECE is not comparable
+across sample sizes: 0.02 over 80 held-out samples and 0.02 over 8,000 are
+very different claims, and a dashboard showing only the error invites
+reading the first as the second.
+
+Labels:
+    split: ``"training"`` or ``"holdout"``.
+"""
+
 
 class IncidentCostScope:
     """

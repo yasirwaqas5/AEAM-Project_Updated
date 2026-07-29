@@ -4,6 +4,7 @@ import {
   PageHeader, Card, CardTitle, Field, Badge, ConfidenceBar,
   Skeleton, Icon, Button, stateColor, deriveStatus, getRetrievedCount, getRecommendedAction,
   fmtTime, fmtRelative, buildMeshLive, getRootCauseSource, rootCauseSourceBadge,
+  getCalibration, CalibrationNote,
 } from "../components/ui";
 import { PageContainer } from "../components/library";
 import { CountUp, Sparkline, ProgressRing } from "../components/charts";
@@ -236,6 +237,7 @@ export default function Dashboard() {
               <div style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
                 <span style={{ fontSize: "var(--fs-2xs)", textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--muted)" }}>Confidence</span>
                 <ConfidenceBar value={latest.confidence} />
+                <CalibrationNote calibration={getCalibration(latest)} />
               </div>
               <Field label="Recommended Action" value={getRecommendedAction(latest)} />
               <Field label="Investigation Status" value={latestStatus.label} color={latestStatus.color} />

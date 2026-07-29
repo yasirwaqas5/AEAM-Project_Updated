@@ -1,0 +1,62 @@
+{
+  "_readme": [
+    "Phase F2 — recorded confidence-calibration baseline.",
+    "",
+    "The F2 acceptance criterion is: 'on a held-out history, the calibration",
+    "curve (predicted vs. actual resolution) is measurably closer to the",
+    "diagonal after recalibration than before'. This file records that",
+    "measurement and the margin asserted in CI.",
+    "",
+    "The fixture models the failure mode a real deployment has: an",
+    "OVERCONFIDENT platform. Stated confidence rises with the strength of the",
+    "evidence, but at every level the actual resolution rate is well below the",
+    "number stated — a '0.9' resolves 55% of the time. That is the shape",
+    "AEAM's additive confidence produces (independent components each adding",
+    "a little, with nothing checking the total against reality), and it is why",
+    "confidence could not be used to set an automation threshold before F2.",
+    "",
+    "ECE is the sample-weighted mean distance between each bucket's stated",
+    "confidence and its observed rate — literally the distance of the",
+    "reliability curve from the diagonal. Brier accompanies it because ECE",
+    "alone can be gamed by a model that predicts the base rate for everything",
+    "(perfectly calibrated, entirely uninformative); Brier punishes exactly",
+    "that, so requiring BOTH to improve rules the degenerate solution out.",
+    "",
+    "Every number below is measured on the HELD-OUT split, which the isotonic",
+    "fit never saw. Measuring on training data would report a near-zero ECE",
+    "for any mapping and prove nothing."
+  ],
+
+  "fixture": {
+    "generator": "aeam/tests/test_phase_f2_learning.py::_overconfident_samples",
+    "seed": 42,
+    "samples": 400,
+    "stated_to_actual": {
+      "0.2": 0.15,
+      "0.4": 0.25,
+      "0.6": 0.35,
+      "0.8": 0.45,
+      "0.9": 0.55
+    },
+    "note": "Deterministic: the same commit always produces the same score, so a regression is unambiguous."
+  },
+
+  "recorded": {
+    "recorded_on": "2026-07-29",
+    "training_samples": 266,
+    "holdout_samples": 134,
+    "ece_before": 0.214925,
+    "ece_after": 0.095786,
+    "brier_before": 0.280746,
+    "brier_after": 0.225278,
+    "ece_relative_improvement": 0.5543,
+    "brier_relative_improvement": 0.1976
+  },
+
+  "required_margins": {
+    "_note": "Asserted by test_phase_f2_learning.py. Set below the measured values so ordinary variation does not fail the build, but high enough that a broken fit does.",
+    "min_ece_absolute_improvement": 0.05,
+    "min_ece_relative_improvement": 0.3,
+    "brier_must_not_regress": true
+  }
+}

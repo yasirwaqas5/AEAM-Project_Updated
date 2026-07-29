@@ -26,6 +26,7 @@ having.
 [`docs/persistence_and_retention.md`](persistence_and_retention.md) ·
 [`docs/human_in_the_loop.md`](human_in_the_loop.md) ·
 [`docs/ai_governance.md`](ai_governance.md) ·
+[`docs/adaptive_learning.md`](adaptive_learning.md) ·
 [`docs/autonomous_operations.md`](autonomous_operations.md) ·
 [`docs/KNOWLEDGE_GOVERNANCE.md`](KNOWLEDGE_GOVERNANCE.md) ·
 [`docs/ALERT_CATALOG.md`](ALERT_CATALOG.md) ·

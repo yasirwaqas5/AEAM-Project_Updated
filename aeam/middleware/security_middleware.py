@@ -83,6 +83,25 @@ _ENDPOINT_RBAC_MAP: list[tuple[str, str, str]] = [
     ("/api/v1/admin/config",      "admin",     "config"),
     ("/api/v1/debug/retrieval",   "admin",     "config"),
 
+    # --- Learning & calibration (Phase F2, SEC-3 / SEC-7).
+    #
+    # Recalibrating changes what every subsequent incident's confidence
+    # MEANS, and deciding a proposal is a governance act — both are
+    # configuration writes and sit in the strictest tier.
+    #
+    # The router's paths are deliberately shaped so read and write surfaces
+    # never share a prefix. This map matches on path alone, not method, so
+    # a read endpoint nested under a write prefix (or the reverse) would be
+    # graded by whichever entry happened to come first — which is how an
+    # auditor ends up able to approve a proposal. The three read paths are
+    # listed first and named distinctly; everything else under /learning
+    # falls through to admin:config, so a write surface added later is
+    # guarded by default rather than by remembering to map it (SEC-1).
+    ("/api/v1/learning/state",     "logs",  "view"),
+    ("/api/v1/learning/history",   "logs",  "view"),
+    ("/api/v1/learning/proposals", "logs",  "view"),
+    ("/api/v1/learning",           "admin", "config"),
+
     # --- Actions (approve is stricter than execute).
     ("/api/v1/actions/approve",   "actions",   "approve"),
     ("/api/v1/actions",           "actions",   "execute"),

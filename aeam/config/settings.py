@@ -242,6 +242,68 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Adaptive learning & confidence recalibration (Phase F2) ---
+    #
+    # Everything here defaults OFF. With the flag off the platform reports
+    # raw confidence exactly as it did through F1 — the phase's stated
+    # rollback posture — and the calibration tables stay empty and inert.
+    # Turning it on changes what `confidence` means on a finalized
+    # incident, which is a decision an operator makes deliberately after
+    # reviewing a recalibration's measured improvement, never a default.
+
+    LEARNING_CALIBRATION_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "Phase F2: when true, an active calibration mapping is applied "
+            "to confidence at finalize and BOTH values are disclosed "
+            "(raw retained in audit_summary.calibration.confidence_raw). "
+            "False (the default) reports raw confidence exactly as F1 did."
+        ),
+    )
+
+    LEARNING_HISTORY_LIMIT: int = Field(
+        default=5000,
+        ge=2,
+        description=(
+            "Phase F2: maximum incidents the Learning Agent reads per "
+            "recalibration run. Bounds the query the same way E6 bounds "
+            "every other read path."
+        ),
+    )
+
+    LEARNING_MIN_TRAINING_SAMPLES: int = Field(
+        default=60,
+        ge=2,
+        description=(
+            "Phase F2 (ENG-6): labeled samples required before a "
+            "calibration is fitted at all. Below this, isotonic regression "
+            "reproduces the training set and generalises to nothing, so "
+            "the engine refuses rather than shipping a confident-looking "
+            "bad mapping. Overrides calibration.py's engine-owned default."
+        ),
+    )
+
+    LEARNING_HOLDOUT_FRACTION: float = Field(
+        default=0.3,
+        gt=0.0,
+        lt=1.0,
+        description=(
+            "Phase F2: fraction of labeled samples withheld from the fit "
+            "and used to measure improvement. Every reported ECE gain is "
+            "measured on data the mapping never saw."
+        ),
+    )
+
+    LEARNING_MIN_ECE_IMPROVEMENT: float = Field(
+        default=0.01,
+        ge=0.0,
+        description=(
+            "Phase F2 (PHIL-1): minimum held-out ECE reduction that counts "
+            "as learning rather than noise. A fit below this is reported "
+            "as not improved and is NOT adopted."
+        ),
+    )
+
     # --- Autonomous operations supervision (Phase E7, OBS-3/4) ---
 
     HEARTBEAT_STALE_SECONDS: int = Field(

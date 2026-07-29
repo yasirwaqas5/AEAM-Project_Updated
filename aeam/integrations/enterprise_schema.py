@@ -232,11 +232,56 @@ CREATE TABLE IF NOT EXISTS forecast_backtests (
 );
 """
 
+_CALIBRATION_MODELS = """
+CREATE TABLE IF NOT EXISTS calibration_models (
+    calibration_id    TEXT PRIMARY KEY,
+    version           INTEGER NOT NULL,
+    status            TEXT DEFAULT 'active',   -- 'active' | 'superseded'
+    knots             JSONB,                   -- [[x, y], ...] isotonic mapping
+    training_samples  INTEGER,
+    holdout_samples   INTEGER,
+    ece_before        DOUBLE PRECISION,        -- held-out, pre-calibration
+    ece_after         DOUBLE PRECISION,        -- held-out, post-calibration
+    brier_before      DOUBLE PRECISION,
+    brier_after       DOUBLE PRECISION,
+    curve_before      JSONB,                   -- reliability diagram buckets
+    curve_after       JSONB,
+    skipped_counts    JSONB,                   -- why records were excluded
+    source_window     TEXT,
+    created_by        TEXT,
+    reason            TEXT,
+    created_at        TIMESTAMP,
+    superseded_at     TIMESTAMP
+);
+"""
+
+_LEARNING_PROPOSALS = """
+CREATE TABLE IF NOT EXISTS learning_proposals (
+    proposal_id        TEXT PRIMARY KEY,
+    proposal_type      TEXT,   -- e.g. 'automation_threshold'
+    subject            TEXT,   -- the setting the proposal concerns
+    current_value      TEXT,
+    proposed_value     TEXT,
+    rationale          TEXT,
+    evidence           JSONB,  -- the measurement that motivated it
+    status             TEXT DEFAULT 'pending',  -- 'pending'|'approved'|'rejected'
+    reviewer_id        TEXT,   -- acting principal (E3 identity)
+    reviewer_roles     JSONB,
+    attribution_source TEXT,   -- 'jwt'|'request'|'unattributed'
+    note               TEXT,
+    created_at         TIMESTAMP,
+    decided_at         TIMESTAMP
+);
+"""
+
 _DDL: tuple[str, ...] = (
     _SOURCES, _DOCUMENTS, _DATASETS, _SCHEMAS, _VERSIONS, _INGESTION_JOBS, _POLICIES,
     _INCIDENT_APPROVALS, _REVIEW_VERDICTS,
     # Phase F1 — forecast model quality tracking (TECH-6, OBS-2).
     _FORECAST_BACKTESTS,
+    # Phase F2 — versioned calibration state and advisory learning
+    # proposals (AGENT-5: proposals never self-apply).
+    _CALIBRATION_MODELS, _LEARNING_PROPOSALS,
 )
 
 # Helpful lookup indexes for the query patterns later phases rely on.
@@ -260,6 +305,11 @@ _INDEXES: tuple[str, ...] = (
     # models were refused" (the review after a metric stops forecasting).
     "CREATE INDEX IF NOT EXISTS idx_forecast_backtests_metric ON forecast_backtests (metric, created_at);",
     "CREATE INDEX IF NOT EXISTS idx_forecast_backtests_refused ON forecast_backtests (refused);",
+    # Phase F2 — "which calibration is live?" runs on every finalize when
+    # calibration is enabled; the other two serve rollback and governance.
+    "CREATE INDEX IF NOT EXISTS idx_calibration_models_status ON calibration_models (status, version);",
+    "CREATE INDEX IF NOT EXISTS idx_calibration_models_version ON calibration_models (version);",
+    "CREATE INDEX IF NOT EXISTS idx_learning_proposals_status ON learning_proposals (status, created_at);",
 )
 
 

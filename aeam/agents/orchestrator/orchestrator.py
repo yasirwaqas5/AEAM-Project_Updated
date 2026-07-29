@@ -37,6 +37,8 @@ from typing import TYPE_CHECKING, Any
 
 from aeam.agents.kpi.kpi_agent import _DEFAULT_HISTORY_LIMIT as _KPI_DEFAULT_HISTORY_LIMIT
 from aeam.agents.kpi.kpi_agent import KPIAgent
+from aeam.agents.learning.learning_agent import LearningAgent, calibrate_confidence
+from aeam.intelligence.calibration import CalibrationEngine
 from aeam.agents.orchestrator.decision_engine import DecisionEngine
 from aeam.agents.orchestrator.evaluation_engine import EvaluationEngine
 from aeam.agents.orchestrator.incident_context import IncidentContext
@@ -85,6 +87,41 @@ def _kpi_history_limit(settings: Any) -> int:
     if isinstance(value, int) and not isinstance(value, bool) and value >= 2:
         return value
     return _KPI_DEFAULT_HISTORY_LIMIT
+
+
+def _build_learning_agent(settings: Any, long_term_memory: Any) -> Any | None:
+    """Construct a LearningAgent from the composition root's own database.
+
+    Reaches the database client through LongTermMemory's injected client
+    rather than taking a second one: the Orchestrator already holds exactly
+    one path to the database and opening a second would be a second
+    persistence seam (ARCH-1).
+
+    Returns ``None`` when no client can be reached — calibration then
+    reports "no active calibration" and raw confidence stands, which is the
+    honest outcome for a deployment that enabled the flag without a
+    reachable store.
+    """
+    client = getattr(long_term_memory, "_db", None)
+    if client is None:
+        logger.warning(
+            "LEARNING_CALIBRATION_ENABLED is true but no database client is "
+            "reachable through LongTermMemory; confidence will be reported raw."
+        )
+        return None
+    try:
+        return LearningAgent(
+            database_client=client,
+            engine=CalibrationEngine(
+                min_training_samples=getattr(settings, "LEARNING_MIN_TRAINING_SAMPLES", 60),
+                holdout_fraction=getattr(settings, "LEARNING_HOLDOUT_FRACTION", 0.3),
+                min_improvement=getattr(settings, "LEARNING_MIN_ECE_IMPROVEMENT", 0.01),
+            ),
+            history_limit=getattr(settings, "LEARNING_HISTORY_LIMIT", 5000),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Learning Agent could not be constructed: %s", exc)
+        return None
 
 
 class Orchestrator:
@@ -171,6 +208,7 @@ class Orchestrator:
         ai_evaluation_engine: Any | None = None,  # Phase D2 — Enterprise AI Evaluation & Quality Engine
         human_review_service: Any | None = None,  # Phase E9 — Human-in-the-Loop Enforcement
         kpi_agent: Any | None = None,  # Phase F1 — real KPI investigation pass
+        learning_agent: Any | None = None,  # Phase F2 — confidence recalibration
         short_term_memory: ShortTermMemory | None = None,   # DEPRECATED (Phase E2) — see class docstring
         state_machine: IncidentStateMachine | None = None,  # DEPRECATED (Phase E2) — see class docstring
     ) -> None:
@@ -210,6 +248,19 @@ class Orchestrator:
                 long_term_memory=long_term_memory,
                 history_limit=_kpi_history_limit(settings),
             )
+
+        # Phase F2: the Learning Agent supplies the active calibration at
+        # finalize. It is wired ONLY when calibration is explicitly enabled
+        # -- with the flag off, `self._learning_agent` is None and the
+        # calibration block in _finalize_incident does not execute at all,
+        # so raw confidence is byte-identical to F1 (the stated rollback).
+        # An explicitly injected agent wins, for tests and for callers that
+        # assemble the graph themselves.
+        self._learning_agent = learning_agent
+        if self._learning_agent is None and getattr(
+            settings, "LEARNING_CALIBRATION_ENABLED", False
+        ) is True:
+            self._learning_agent = _build_learning_agent(settings, long_term_memory)
 
         # Phase E2, ARCH-8: no per-incident instance attributes. STM,
         # FSM, active event, and investigation_started_at all live on the
@@ -892,6 +943,43 @@ class Orchestrator:
         requires_human = bool(ctx.stm.get("requires_human"))
         confidence = ctx.stm.get("confidence")
 
+        # --- Phase F2: confidence recalibration (EXPL-4, PHIL-1) ---
+        # A disclosed, reversible post-processing step. The raw value is
+        # never discarded -- it is carried in the disclosure below and
+        # surfaced by the console alongside the calibrated one, because a
+        # number that silently moved is worse than an uncalibrated one:
+        # nobody can tell it moved.
+        #
+        # `calibration_disclosure` always exists and always states whether
+        # the adjustment was applied and, if not, why (EXPL-3). With
+        # LEARNING_CALIBRATION_ENABLED off -- the default -- `confidence`
+        # below is byte-identical to what F1 produced.
+        confidence_raw = confidence
+        calibration_disclosure: dict[str, Any] = {
+            "applied": False,
+            "reason": "Confidence recalibration is disabled for this deployment.",
+        }
+        if self._learning_agent is not None:
+            try:
+                confidence, calibration_disclosure = calibrate_confidence(
+                    confidence, self._learning_agent.active_calibration()
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Declared never-raise boundary: a calibration failure must
+                # never cost the platform an incident record. Raw
+                # confidence stands and the failure is stated.
+                logger.error(
+                    "finalize_incident | calibration failed, reporting raw confidence | "
+                    "incident_id=%s | error=%s",
+                    ctx.incident_id, exc,
+                )
+                confidence = confidence_raw
+                calibration_disclosure = {
+                    "applied": False,
+                    "reason": f"Calibration failed; raw confidence reported unchanged: {exc}",
+                    "confidence_raw": confidence_raw,
+                }
+
         # --- Derive validation status + latest RAG snapshot for reporting. ---
         latest_rag = self._latest_rag_finding(ctx)
         query_attempts = self._collect_query_attempts(ctx)
@@ -1315,6 +1403,11 @@ class Orchestrator:
             "recommended_actions": runbook["recommended_actions"],
             "executed_actions": executed_actions,
             "skipped_actions": skipped_actions,
+            # Phase F2 (EXPL-4/EXPL-5): the adjustment, its magnitude, its
+            # reason, and the raw value it was applied to. Additive, so
+            # every pre-F2 incident simply lacks the key and every reader
+            # that ignores unknown keys is unaffected (COMPAT-1/COMPAT-4).
+            "calibration": calibration_disclosure,
         }
 
         # --- Phase E11 additive fields (COMPAT-1: every existing reader

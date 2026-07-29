@@ -314,6 +314,42 @@ spec:
             # - name: APPROVAL_TIER_CHAIN_OVERRIDES
             #   value: "CRITICAL:analyst,manager,risk;HIGH:analyst,manager"
 
+            # ---------- Phase F1 (PHIL-1) — real KPI analysis ----------
+            # The KPI Agent replaces the placeholder F1 deleted. Declared
+            # explicitly even though it matches the Settings default,
+            # because "false" here does NOT restore the placeholder — it
+            # removes the KPI pass entirely.
+            - name: KPI_AGENT_ENABLED
+              value: "true"
+
+            # Detection uplift ships flag-gated with Phase-5 behaviour as
+            # the default. Enable per deployment after reviewing the
+            # benchmark in docs/PERFORMANCE_BASELINES.md and
+            # aeam/tests/fixtures/detection_baselines.json — the two
+            # detectors suit different metric shapes, which is why each
+            # has its own flag.
+            - name: DETECTION_CHANGEPOINT_ENABLED
+              value: "false"
+            - name: DETECTION_SEASONAL_HYBRID_ENABLED
+              value: "false"
+
+            # TECH-6 forecast re-validation. Off by default; turning it on
+            # backtests a newly trained model before it may serve.
+            - name: FORECAST_BACKTEST_ENABLED
+              value: "false"
+
+            # ---------- Phase F2 — confidence recalibration ----------
+            # OFF deliberately. Enabling this changes what `confidence`
+            # MEANS on every subsequent incident, so it is a decision an
+            # operator makes after reviewing a recalibration's measured
+            # held-out improvement (POST /api/v1/learning/recalibrate with
+            # dry_run=true), never a shipped default. Raw confidence is
+            # always retained alongside the calibrated value, and setting
+            # this back to "false" is the exact documented rollback.
+            # See docs/adaptive_learning.md.
+            - name: LEARNING_CALIBRATION_ENABLED
+              value: "false"
+
           # Liveness probe — restart container if /health fails.
           livenessProbe:
             httpGet:

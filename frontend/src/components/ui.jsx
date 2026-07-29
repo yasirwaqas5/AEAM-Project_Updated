@@ -374,6 +374,32 @@ export function getRootCauseSource(incident) {
 }
 
 /**
+ * The Phase F2 confidence-calibration disclosure for an incident.
+ *
+ * Returns `{applied, reason, raw, calibrated, adjustment, version}` or null
+ * for an incident recorded before F2 (COMPAT-1: pre-F2 records simply lack
+ * the key and must render exactly as they always did).
+ *
+ * `applied: false` is a first-class answer, not an absence — a deployment
+ * with calibration off, or one whose calibration could not be read, says so
+ * with its reason rather than silently showing a number whose meaning has
+ * quietly changed (EXPL-3/EXPL-4).
+ */
+export function getCalibration(incident) {
+  const audit = getAuditSummary(incident);
+  const calibration = audit?.calibration;
+  if (!calibration || typeof calibration.applied !== "boolean") return null;
+  return {
+    applied: calibration.applied,
+    reason: calibration.reason ?? null,
+    raw: calibration.confidence_raw ?? null,
+    calibrated: calibration.confidence_calibrated ?? null,
+    adjustment: calibration.adjustment ?? null,
+    version: calibration.calibration_version ?? null,
+  };
+}
+
+/**
  * Badge descriptor for a root cause's provenance, or null when the source
  * needs no qualifier (a chunk-cited RAG cause speaks for itself).
  *
@@ -786,6 +812,54 @@ export function ConfidenceBar({ value, width = "100%" }) {
       <span style={{ fontFamily: "var(--font-mono)", fontSize: "var(--fs-xs)", color, fontWeight: 700 }}>
         {value == null ? "—" : `${pct}%`}
       </span>
+    </div>
+  );
+}
+
+/**
+ * Phase F2 — the calibration disclosure that accompanies a confidence.
+ *
+ * Renders nothing for a pre-F2 incident (`calibration` is null), so those
+ * records display exactly as they always did. When calibration WAS applied
+ * it shows the raw value the number was adjusted from and by how much —
+ * EXPL-4 requires an adjustment to be reported with its magnitude and its
+ * reason, and a calibrated confidence shown alone is indistinguishable
+ * from an uncalibrated one.
+ *
+ * When it was not applied, the reason is shown rather than the row being
+ * omitted: "this confidence is raw, because <reason>" is information an
+ * operator setting an automation threshold needs.
+ */
+export function CalibrationNote({ calibration }) {
+  if (!calibration) return null;
+
+  if (!calibration.applied) {
+    return (
+      <div
+        title={calibration.reason || undefined}
+        style={{ fontSize: "var(--fs-2xs)", color: "var(--faint)", marginTop: "0.3rem" }}
+      >
+        Raw confidence — not calibrated
+      </div>
+    );
+  }
+
+  const delta = calibration.adjustment;
+  const arrow = delta == null ? "" : delta > 0 ? "▲" : delta < 0 ? "▼" : "=";
+  return (
+    <div
+      title={calibration.reason || undefined}
+      style={{ fontSize: "var(--fs-2xs)", color: "var(--muted)", marginTop: "0.3rem" }}
+    >
+      Calibrated{calibration.version != null ? ` (v${calibration.version})` : ""} — raw{" "}
+      <span style={{ fontFamily: "var(--font-mono)" }}>
+        {calibration.raw == null ? "—" : `${Math.round(calibration.raw * 100)}%`}
+      </span>
+      {delta != null && (
+        <span style={{ marginLeft: "0.35rem" }}>
+          {arrow} {Math.abs(Math.round(delta * 100))} pts
+        </span>
+      )}
     </div>
   );
 }

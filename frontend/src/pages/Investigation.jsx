@@ -5,7 +5,7 @@ import {
   fmtTime, fmtRelative, severityOf, deriveStatus,
   getAuditSummary, getRetrievedCount, getRecommendedActions, getActionOutcome,
   actionLabel, getValidationStatus, getEvidence, parseMaybeJSON, getRootCauseSource,
-  rootCauseSourceBadge,
+  rootCauseSourceBadge, getCalibration, CalibrationNote,
 } from "../components/ui";
 import {
   PageContainer, SplitLayout, Panel, EmptyState, LoadingState, ErrorState,
@@ -188,7 +188,10 @@ function InvestigationSummary({ incident }) {
       </div>
 
       <div style={{ display: "flex", gap: "1.6rem", alignItems: "center", flexWrap: "wrap" }}>
-        <ProgressRing value={incident.confidence ?? audit?.top_confidence} size={92} sublabel="Confidence" />
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
+          <ProgressRing value={incident.confidence ?? audit?.top_confidence} size={92} sublabel="Confidence" />
+          <CalibrationNote calibration={getCalibration(incident)} />
+        </div>
         <div className="aeam-grid-auto" style={{ flex: 1, minWidth: 260 }}>
           <div>
             <Field label="Root Cause" value={incident.root_cause || "Pending"} />
