@@ -77,6 +77,10 @@ from aeam.intelligence.graph_correlation import GraphCorrelationEngine
 from aeam.intelligence.observability import ObservabilityEngine
 from aeam.agents.planning.planning_agent import PlanningAgent
 from aeam.agents.supervisor.supervisor_agent import SupervisorAgent
+from aeam.connectors.health import ConnectorHealthReporter
+from aeam.connectors.registry import ConnectorRegistry
+from aeam.connectors.sync import ConnectorSyncEngine
+from aeam.ingestion.submission import IngestionSubmitter
 from aeam.intelligence.adaptive_detection import AdaptiveDetectionEngine
 from aeam.intelligence.execution_planning import ExecutionPlanningEngine
 from aeam.governance.human_review import HumanReviewService
@@ -144,6 +148,7 @@ from aeam.api.learning import router as learning_router
 from aeam.api.graph import router as graph_router
 from aeam.api.replay import router as replay_router
 from aeam.api.mesh import router as mesh_router
+from aeam.api.connectors import router as connectors_router
 
 # ---------------------------------------------------------------------------
 # Logging bootstrap
@@ -749,6 +754,75 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     if container.sheets_connector is not None:
         composite_kpi_source.add_passthrough(container.sheets_connector)
     composite_kpi_source.add_multi(dataset_kpi_source, dataset_activation.list_activated_dataset_ids)
+
+    # --- Enterprise Connector Framework (Phase F7) ---
+    # Constructed here, before MonitorAgent, because a METRICS connector joins
+    # the SAME CompositeKPISource the Sheets connector and activated datasets
+    # already feed. MonitorAgent receives one object satisfying the existing
+    # KPIRowSource protocol and never learns a connector exists — no agent
+    # change, no second KPI path, no second detector (ENG-6).
+    #
+    # With CONNECTORS_ENABLED false (the default) the registry reports zero
+    # enabled kinds, no member is added, and this is byte-identically the
+    # pre-F7 composition: upload + Sheets, unchanged (COMPAT-4).
+    # SEC-5: the ONE credential path every connector has. Held on the container
+    # so eight connectors share one resolver rather than each constructing its
+    # own — and so a connector has no way to read a credential except through it.
+    if getattr(container, "secret_manager", None) is None:
+        container.secret_manager = SecretManager(
+            settings=settings, project_id=getattr(settings, "GCP_PROJECT", None)
+        )
+    connector_registry = ConnectorRegistry(
+        settings=settings, secret_manager=container.secret_manager,
+    )
+    container.connector_registry = connector_registry
+
+    # The ONE ingestion entry point, shared with the upload API. The sync
+    # engine is given this object and has no other way to put content into the
+    # platform, so connector documents cannot travel a path of their own.
+    ingestion_submitter = IngestionSubmitter(db=container.db, blob_store=container.blob_store)
+    container.ingestion_submitter = ingestion_submitter
+    container.connector_sync = ConnectorSyncEngine(
+        db=container.db,
+        submitter=ingestion_submitter,
+        registry=connector_registry,
+        max_artifacts=settings.CONNECTOR_SYNC_MAX_ARTIFACTS,
+    )
+    container.connector_health = ConnectorHealthReporter(
+        db=container.db,
+        registry=connector_registry,
+        stale_after_seconds=settings.CONNECTOR_STALE_AFTER_SECONDS,
+    )
+
+    # Metrics connectors as ordinary CompositeKPISource members. Each is added
+    # in PASS-THROUGH mode with its own configured selector, so MonitorAgent's
+    # incoming selector (a sheet name by origin, meaningless to a warehouse) is
+    # replaced by the report/table the connector can actually answer.
+    #
+    # A connector that failed to authenticate is still added: its fetch_rows
+    # returns an empty list and never raises, which is the same no-op
+    # MonitorAgent already handles for a source with no data — so one broken
+    # connector cannot stop KPI collection for the others.
+    _metric_connectors: list[Any] = []
+    if connector_registry.enabled_kinds():
+        try:
+            _metric_connectors = connector_registry.build_metric_sources(
+                SourceRepository(container.db).list_all()
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Connector composition must never block startup.
+            logger.error("Connector metric composition failed (continuing): %s", exc)
+            _metric_connectors = []
+    for _connector in _metric_connectors:
+        composite_kpi_source.add_multi(
+            _connector, lambda c=_connector: [c.default_selector()] if c.default_selector() else []
+        )
+    container.metric_connectors = _metric_connectors
+    logger.info(
+        "Connector framework | enabled_kinds=%s | mock_mode=%s | metric_members=%d",
+        connector_registry.enabled_kinds(), connector_registry.mock_mode,
+        len(_metric_connectors),
+    )
     container.dataset_kpi_source = dataset_kpi_source
     container.dataset_activation = dataset_activation
     container.kpi_source = composite_kpi_source
@@ -1611,6 +1685,7 @@ def create_app() -> FastAPI:
     application.include_router(graph_router)
     application.include_router(replay_router)
     application.include_router(mesh_router)
+    application.include_router(connectors_router)
 
     _register_routes(application)
     _mount_frontend_build(application)

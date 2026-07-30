@@ -45,6 +45,9 @@ ENTERPRISE_TABLES: tuple[str, ...] = (
     # Phase F4 — Correlation Intelligence & Business Graph.
     "graph_nodes",
     "graph_edges",
+    # Phase F7 — Enterprise Connector Framework.
+    "connector_artifacts",
+    "connector_sync_runs",
 )
 
 # ---------------------------------------------------------------------------
@@ -330,6 +333,52 @@ CREATE TABLE IF NOT EXISTS graph_edges (
 );
 """
 
+_CONNECTOR_ARTIFACTS = """
+CREATE TABLE IF NOT EXISTS connector_artifacts (
+    artifact_id          TEXT PRIMARY KEY,
+    source_id            TEXT NOT NULL,   -- -> sources.source_id
+    external_id          TEXT NOT NULL,   -- the upstream system's own id
+    connector            TEXT,            -- denormalised sources.kind
+    source_type          TEXT,            -- upstream's own type, verbatim
+    title                TEXT,
+    source_url           TEXT,
+    source_timestamp     TIMESTAMP,       -- upstream last-modified, when exposed
+    source_version       TEXT,            -- upstream revision, when exposed
+    source_content_hash  TEXT,            -- change signal for incremental sync
+    semantic_type        TEXT,            -- E12 declared doc type, when known
+    parent_type          TEXT,            -- 'document' | 'dataset'
+    parent_id            TEXT,
+    last_job_id          TEXT,            -- -> ingestion_jobs.job_id
+    first_synced_at      TIMESTAMP,
+    last_synced_at       TIMESTAMP,
+    skip_count           INTEGER DEFAULT 0,
+    ingest_count         INTEGER DEFAULT 0,
+    extra                JSONB
+);
+"""
+
+_CONNECTOR_SYNC_RUNS = """
+CREATE TABLE IF NOT EXISTS connector_sync_runs (
+    run_id            TEXT PRIMARY KEY,
+    source_id         TEXT NOT NULL,      -- -> sources.source_id
+    connector         TEXT,
+    status            TEXT DEFAULT 'running',  -- 'running'|'succeeded'|'partial'|'failed'
+    started_at        TIMESTAMP,
+    finished_at       TIMESTAMP,
+    duration_seconds  DOUBLE PRECISION,
+    listed_count      INTEGER DEFAULT 0,
+    changed_count     INTEGER DEFAULT 0,
+    processed_count   INTEGER DEFAULT 0,
+    skipped_count     INTEGER DEFAULT 0,
+    failed_count      INTEGER DEFAULT 0,
+    error             TEXT,               -- sanitised; never carries a secret
+    cursor_from       TIMESTAMP,
+    cursor_to         TIMESTAMP,
+    triggered_by      TEXT,
+    extra             JSONB
+);
+"""
+
 _DDL: tuple[str, ...] = (
     _SOURCES, _DOCUMENTS, _DATASETS, _SCHEMAS, _VERSIONS, _INGESTION_JOBS, _POLICIES,
     _INCIDENT_APPROVALS, _REVIEW_VERDICTS,
@@ -344,6 +393,9 @@ _DDL: tuple[str, ...] = (
     # Phase F4 — the business graph (advisory evidence source; inert until
     # an operator runs a build).
     _GRAPH_NODES, _GRAPH_EDGES,
+    # Phase F7 — connector sync state/provenance and run history. Inert with
+    # no connectors configured (COMPAT-4).
+    _CONNECTOR_ARTIFACTS, _CONNECTOR_SYNC_RUNS,
 )
 
 # Helpful lookup indexes for the query patterns later phases rely on.
@@ -392,6 +444,20 @@ _INDEXES: tuple[str, ...] = (
     # The mark-and-sweep that retires edges whose evidence disappeared.
     "CREATE INDEX IF NOT EXISTS idx_graph_edges_last_seen ON graph_edges (last_seen_at);",
     "CREATE INDEX IF NOT EXISTS idx_graph_nodes_last_seen ON graph_nodes (last_seen_at);",
+    # Phase F7 — the hot incremental-sync read: "have we seen this upstream
+    # artifact before?", executed once per listed artifact per sync. UNIQUE
+    # because two rows for one upstream artifact would split its sync state
+    # and let a repeated sync re-ingest content it already had.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_connector_artifacts_external "
+    "ON connector_artifacts (source_id, external_id);",
+    "CREATE INDEX IF NOT EXISTS idx_connector_artifacts_parent "
+    "ON connector_artifacts (parent_type, parent_id);",
+    # Connector health reads the most recent run, and the most recent run in a
+    # given status ("last successful" vs "last failed" are separate facts).
+    "CREATE INDEX IF NOT EXISTS idx_connector_sync_runs_source "
+    "ON connector_sync_runs (source_id, started_at);",
+    "CREATE INDEX IF NOT EXISTS idx_connector_sync_runs_status "
+    "ON connector_sync_runs (source_id, status, started_at);",
 )
 
 

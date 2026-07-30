@@ -23,6 +23,8 @@ from aeam.registry.models import (
     AssetStatus,
     CompiledRule,
     CompiledRuleStatus,
+    ConnectorArtifact,
+    ConnectorSyncRun,
     Dataset,
     Document,
     GraphEdge,
@@ -37,6 +39,7 @@ from aeam.registry.models import (
     Schema,
     Source,
     SourceStatus,
+    SyncRunStatus,
     Verdict,
     Version,
     _now_iso,
@@ -670,6 +673,202 @@ class GraphEdgeRepository(BaseRepository):
             "DELETE FROM graph_edges WHERE last_seen_at < :cutoff", {"cutoff": cutoff_iso}
         )
         return removed
+
+
+# ---------------------------------------------------------------------------
+# Phase F7 — Enterprise Connector Framework
+# ---------------------------------------------------------------------------
+
+class ConnectorArtifactRepository(BaseRepository):
+    """Registry access for per-artifact connector sync state + provenance
+    (Phase F7).
+
+    Same thin-CRUD contract as every repository above: no sync logic lives
+    here (that is
+    :class:`~aeam.connectors.sync.ConnectorSyncEngine`), only the queries the
+    engine and the connector API need.
+    """
+
+    table, pk, model_cls = "connector_artifacts", "artifact_id", ConnectorArtifact
+
+    def get_by_external_id(self, source_id: str, external_id: str) -> ConnectorArtifact | None:
+        """The recorded state for one upstream artifact, or ``None`` when this
+        connector has never seen it.
+
+        ``None`` is what makes an artifact "new" — the engine treats absence
+        as "never ingested" rather than as an error, which is how a first sync
+        works without a special case.
+        """
+        rows = self._query(
+            "source_id = :sid AND external_id = :eid", {"sid": source_id, "eid": external_id}
+        )
+        return rows[0] if rows else None
+
+    def list_by_source(
+        self, source_id: str, limit: int | None = None, offset: int = 0
+    ) -> list[ConnectorArtifact]:
+        query = (
+            "SELECT * FROM connector_artifacts WHERE source_id = :sid "
+            "ORDER BY last_synced_at DESC"
+        )
+        params: dict[str, Any] = {"sid": source_id}
+        if limit is not None:
+            query += " LIMIT :limit OFFSET :offset"
+            params["limit"] = int(limit)
+            params["offset"] = max(0, int(offset))
+        return [ConnectorArtifact.from_row(r) for r in self._db.fetch_all(query, params)]
+
+    def count_by_source(self, source_id: str) -> int:
+        row = self._db.fetch_one(
+            "SELECT COUNT(*) AS n FROM connector_artifacts WHERE source_id = :sid",
+            {"sid": source_id},
+        )
+        return int(row["n"] or 0) if row else 0
+
+    def record_ingested(
+        self,
+        artifact: ConnectorArtifact,
+        *,
+        content_hash: str,
+        parent_type: str,
+        parent_id: str,
+        job_id: str | None,
+    ) -> str:
+        """Create or update the row for an artifact that was just ingested.
+
+        Upsert by natural key ``(source_id, external_id)``, so a re-sync
+        UPDATES the existing row rather than appending a second one — which is
+        what keeps repeated synchronization from accumulating duplicate
+        metadata. ``first_synced_at`` and ``ingest_count`` are preserved and
+        advanced respectively: how long we have known about an artifact, and
+        how often it has genuinely changed, are facts worth keeping.
+        """
+        existing = self.get_by_external_id(artifact.source_id, artifact.external_id)
+        now = _now_iso()
+        if existing is None:
+            artifact.source_content_hash = content_hash
+            artifact.parent_type = parent_type
+            artifact.parent_id = parent_id
+            artifact.last_job_id = job_id
+            artifact.first_synced_at = now
+            artifact.last_synced_at = now
+            artifact.ingest_count = 1
+            artifact.skip_count = 0
+            return self.create(artifact)
+
+        self.update(existing.artifact_id, {
+            "connector": artifact.connector,
+            "source_type": artifact.source_type,
+            "title": artifact.title,
+            "source_url": artifact.source_url,
+            "source_timestamp": artifact.source_timestamp,
+            "source_version": artifact.source_version,
+            "source_content_hash": content_hash,
+            "semantic_type": artifact.semantic_type or existing.semantic_type,
+            "parent_type": parent_type,
+            "parent_id": parent_id,
+            "last_job_id": job_id,
+            "last_synced_at": now,
+            "ingest_count": existing.ingest_count + 1,
+            "extra": artifact.extra or existing.extra,
+        })
+        return existing.artifact_id
+
+    def record_skipped(self, artifact_id: str, skip_count: int) -> None:
+        """Note that an artifact was seen unchanged and skipped.
+
+        Only the counters and ``last_synced_at`` move — the content hash,
+        provenance, and local asset ids are untouched, because nothing about
+        the artifact changed. This is the measurable evidence that incremental
+        sync avoided work.
+        """
+        self.update(artifact_id, {
+            "skip_count": skip_count + 1,
+            "last_synced_at": _now_iso(),
+        })
+
+
+class ConnectorSyncRunRepository(BaseRepository):
+    """Registry access for connector synchronization run history (Phase F7)."""
+
+    table, pk, model_cls = "connector_sync_runs", "run_id", ConnectorSyncRun
+
+    def list_by_source(self, source_id: str, limit: int = 20) -> list[ConnectorSyncRun]:
+        """Most recent runs for one connector, newest first and always bounded
+        (E6) — a connector synced every few minutes for a year must not be
+        able to return its whole history in one read."""
+        return [
+            ConnectorSyncRun.from_row(r)
+            for r in self._db.fetch_all(
+                "SELECT * FROM connector_sync_runs WHERE source_id = :sid "
+                "ORDER BY started_at DESC LIMIT :limit",
+                {"sid": source_id, "limit": max(1, int(limit))},
+            )
+        ]
+
+    def latest(self, source_id: str) -> ConnectorSyncRun | None:
+        runs = self.list_by_source(source_id, limit=1)
+        return runs[0] if runs else None
+
+    def latest_by_status(self, source_id: str, statuses: list[str]) -> ConnectorSyncRun | None:
+        """The most recent run in any of ``statuses``.
+
+        Connector health needs "last SUCCESSFUL sync" and "last FAILED sync"
+        as separate facts: a connector that succeeded an hour ago and failed a
+        minute ago is in a different state from one that has only ever
+        failed, and reporting a single "last sync" would conflate them.
+        """
+        if not statuses:
+            return None
+        params = {f"s{i}": status for i, status in enumerate(statuses)}
+        placeholders = ", ".join(f":{name}" for name in params)
+        params["sid"] = source_id
+        rows = self._db.fetch_all(
+            f"SELECT * FROM connector_sync_runs WHERE source_id = :sid "
+            f"AND status IN ({placeholders}) ORDER BY started_at DESC LIMIT 1",
+            params,
+        )
+        return ConnectorSyncRun.from_row(rows[0]) if rows else None
+
+    def finish(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        duration_seconds: float,
+        listed_count: int = 0,
+        changed_count: int = 0,
+        processed_count: int = 0,
+        skipped_count: int = 0,
+        failed_count: int = 0,
+        error: str | None = None,
+        cursor_to: str | None = None,
+    ) -> None:
+        """Close out a run with its measured outcome.
+
+        Raises:
+            ValueError: If ``status`` is not terminal. A run left in
+                        ``running`` forever would make every later health read
+                        claim a sync is in flight, so the transition is
+                        validated rather than trusted.
+        """
+        if status not in SyncRunStatus.TERMINAL:
+            raise ValueError(
+                f"finish() status must be terminal (one of {sorted(SyncRunStatus.TERMINAL)}). "
+                f"Got: {status!r}."
+            )
+        self.update(run_id, {
+            "status": status,
+            "finished_at": _now_iso(),
+            "duration_seconds": round(float(duration_seconds), 4),
+            "listed_count": int(listed_count),
+            "changed_count": int(changed_count),
+            "processed_count": int(processed_count),
+            "skipped_count": int(skipped_count),
+            "failed_count": int(failed_count),
+            "error": error,
+            "cursor_to": cursor_to,
+        })
 
 
 # ---------------------------------------------------------------------------

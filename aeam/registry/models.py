@@ -35,7 +35,68 @@ class SourceKind:
     DATABASE = "database"
     REST = "rest"
     GSHEET = "gsheet"
-    ALL = {UPLOAD, CONFLUENCE, SHAREPOINT, S3, AZURE_BLOB, DATABASE, REST, GSHEET}
+    # Phase F7 — the eight enterprise connectors. Additive: every value above
+    # keeps its meaning, and a deployment with no connectors configured has
+    # no rows of these kinds, so nothing changes for it (COMPAT-4).
+    GITHUB = "github"
+    GOOGLE_WORKSPACE = "google_workspace"
+    SAP = "sap"
+    SALESFORCE = "salesforce"
+    SNOWFLAKE = "snowflake"
+    BIGQUERY = "bigquery"
+    ALL = {
+        UPLOAD, CONFLUENCE, SHAREPOINT, S3, AZURE_BLOB, DATABASE, REST, GSHEET,
+        GITHUB, GOOGLE_WORKSPACE, SAP, SALESFORCE, SNOWFLAKE, BIGQUERY,
+    }
+    #: The kinds a Phase F7 connector implementation exists for. A ``sources``
+    #: row of any other kind is not connector-syncable, which the registry
+    #: reports honestly rather than attempting.
+    CONNECTOR_KINDS = {
+        SHAREPOINT, CONFLUENCE, GITHUB, GOOGLE_WORKSPACE,
+        SAP, SALESFORCE, SNOWFLAKE, BIGQUERY,
+    }
+
+
+class SyncRunStatus:
+    """
+    Lifecycle of one connector synchronization run (Phase F7, SEC-8).
+
+    ``RUNNING`` exists so an in-flight sync is distinguishable from a
+    finished one: a health surface that could only report success or failure
+    would have to describe a running sync as one or the other, and both would
+    be wrong. ``PARTIAL`` exists for the same reason at the artifact level —
+    a run where some artifacts ingested and others failed is neither a
+    success nor a failure, and collapsing it into either would misstate what
+    the connector actually did.
+    """
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    PARTIAL = "partial"
+    FAILED = "failed"
+    ALL = {RUNNING, SUCCEEDED, PARTIAL, FAILED}
+    #: Statuses from which a run can no longer transition.
+    TERMINAL = {SUCCEEDED, PARTIAL, FAILED}
+    #: Statuses that advance ``sources.last_synced_at``. A partial run counts:
+    #: the artifacts it did ingest are genuinely current as of that run.
+    ADVANCES_CURSOR = {SUCCEEDED, PARTIAL}
+
+
+class ConnectorCapability:
+    """
+    What a connector contributes to the platform (Phase F7).
+
+    A connector declares this, and the sync engine dispatches on the
+    declaration rather than on the connector's class — so "this connector
+    yields documents" is a fact stated once, in one place, and checkable.
+
+    ``DOCUMENTS`` connectors feed the existing ingestion pipeline (chunk →
+    embed → index). ``METRICS`` connectors feed the existing
+    ``CompositeKPISource``. Nothing else exists, because those are the only
+    two places content can enter the platform.
+    """
+    DOCUMENTS = "documents"
+    METRICS = "metrics"
+    ALL = {DOCUMENTS, METRICS}
 
 
 class SourceStatus:
@@ -716,6 +777,148 @@ class GraphEdge(_Asset):
         edge.confidence = float(edge.confidence) if edge.confidence is not None else 0.0
         edge.observation_count = int(edge.observation_count or 0)
         return edge
+
+
+# ---------------------------------------------------------------------------
+# Phase F7 — Enterprise Connector Framework
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ConnectorArtifact(_Asset):
+    """
+    One upstream artifact a connector has seen, with its provenance and the
+    state incremental sync compares against (Phase F7).
+
+    This row is the reason a repeated sync is cheap AND the reason a
+    connector-ingested document is traceable. Both needs are served by the
+    same record deliberately: sync state and provenance are the same facts
+    viewed twice — "what did we last see upstream" and "where did this
+    document come from" have identical answers.
+
+    **Incremental sync** compares ``source_content_hash`` /
+    ``source_timestamp`` / ``source_version`` against what the connector
+    reports now. Unchanged means no download, no chunking, no embedding, no
+    indexing — the artifact is skipped before any work happens.
+
+    **Provenance** is the rest: which connector, which upstream id, what type,
+    the URL an operator can open, when we synced it, when upstream last
+    changed it, and which local Document/Dataset it became. Nothing here is
+    derived or guessed — a field the upstream system does not expose is left
+    ``None`` rather than filled in.
+
+    Keyed on ``(source_id, external_id)``: one row per upstream artifact per
+    connector, so re-syncing updates in place instead of accumulating.
+    """
+    #: ``sources.source_id`` of the connector that produced this (unenforced FK).
+    source_id: str = ""
+    #: The upstream system's own identifier — a SharePoint item id, a
+    #: Confluence page id, a GitHub path@ref. Stable across syncs, which is
+    #: what makes this row's identity meaningful.
+    external_id: str = ""
+    artifact_id: str = field(default_factory=_new_id)
+    #: The connector kind, denormalised from ``sources.kind`` so a provenance
+    #: read needs no join and survives the source row being renamed.
+    connector: str = ""
+    #: What the upstream system calls this artifact's type ("page",
+    #: "file", "table"). Recorded verbatim; never mapped onto AEAM's own
+    #: vocabulary, because that mapping would be a guess.
+    source_type: str | None = None
+    title: str | None = None
+    source_url: str | None = None
+    #: Upstream's own last-modified time, when the system exposes one.
+    source_timestamp: str | None = None
+    #: Upstream's own version/revision identifier, when it exposes one.
+    source_version: str | None = None
+    #: Hash of the content as last ingested. The primary change signal.
+    source_content_hash: str | None = None
+    #: The declared E12 semantic doc type, when the connector can determine
+    #: one from upstream metadata. ``None`` means undeclared, exactly as for
+    #: an upload that declared nothing.
+    semantic_type: str | None = None
+    #: What this artifact became locally: 'document' or 'dataset'.
+    parent_type: str | None = None
+    parent_id: str | None = None
+    #: The ingestion job the last submission created, for traceability into
+    #: the existing job ledger.
+    last_job_id: str | None = None
+    first_synced_at: str = field(default_factory=_now_iso)
+    last_synced_at: str = field(default_factory=_now_iso)
+    #: Number of times this artifact was seen unchanged and skipped — the
+    #: measurable evidence that incremental sync is actually saving work.
+    skip_count: int = 0
+    #: Number of times upstream content changed and was re-ingested.
+    ingest_count: int = 0
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "ConnectorArtifact":
+        artifact = _Asset._base_from_row(cls, row, ("extra",))
+        artifact.skip_count = int(artifact.skip_count or 0)
+        artifact.ingest_count = int(artifact.ingest_count or 0)
+        return artifact
+
+
+@dataclass
+class ConnectorSyncRun(_Asset):
+    """
+    One synchronization run's outcome (Phase F7, SEC-8).
+
+    Deliberately a separate table from ``ingestion_jobs`` rather than a new
+    ``job_type`` row in it. ``IngestionWorker`` claims every QUEUED job it
+    finds, so a sync recorded as a job would put connector work on the
+    ingestion worker's thread — and a connector hanging on a slow upstream
+    call would then block document ingestion for everything else. Failure
+    isolation is the requirement; a separate ledger is what buys it.
+
+    The counts are what make connector health honest. ``processed`` is what
+    was fetched and submitted, ``skipped`` is what incremental sync
+    recognised as unchanged, ``changed`` is what upstream had actually
+    modified, and ``failed`` is what could not be ingested. A run reports all
+    four, so "nothing happened" is distinguishable from "nothing needed to".
+    """
+    #: ``sources.source_id`` of the connector this run belongs to.
+    source_id: str = ""
+    run_id: str = field(default_factory=_new_id)
+    connector: str = ""
+    status: str = SyncRunStatus.RUNNING
+    started_at: str = field(default_factory=_now_iso)
+    finished_at: str | None = None
+    duration_seconds: float | None = None
+    #: Artifacts listed upstream for this run.
+    listed_count: int = 0
+    #: Artifacts upstream reported as changed since the last cursor.
+    changed_count: int = 0
+    #: Artifacts actually fetched and submitted to the ingestion pipeline.
+    processed_count: int = 0
+    #: Artifacts recognised as unchanged and skipped without any work.
+    skipped_count: int = 0
+    #: Artifacts that could not be ingested. A non-zero value with a non-zero
+    #: ``processed_count`` is what makes a run PARTIAL rather than FAILED.
+    failed_count: int = 0
+    #: The failure reason, credential-free. Never carries a secret: the sync
+    #: engine sanitises before persisting (SEC-5).
+    error: str | None = None
+    #: The cursor this run started from, so an operator can see what "since"
+    #: meant for it. ``None`` for a first/full sync.
+    cursor_from: str | None = None
+    #: The cursor a successful run advanced to.
+    cursor_to: str | None = None
+    triggered_by: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> "ConnectorSyncRun":
+        run = _Asset._base_from_row(cls, row, ("extra",))
+        for field_name in (
+            "listed_count", "changed_count", "processed_count",
+            "skipped_count", "failed_count",
+        ):
+            setattr(run, field_name, int(getattr(run, field_name) or 0))
+        if run.duration_seconds is not None:
+            run.duration_seconds = float(run.duration_seconds)
+        if not run.status:
+            run.status = SyncRunStatus.RUNNING
+        return run
 
 
 @dataclass

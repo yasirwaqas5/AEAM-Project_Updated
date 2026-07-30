@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { PageHeader, Badge, Modal, Field, Skeleton, Button, Icon, fmtTime, fmtRelative } from "../components/ui";
 import { PageContainer, MetricCard, Panel, DataTable, LoadingState, ErrorState, EmptyState } from "../components/library";
+import ConnectorPanel from "../components/ConnectorPanel";
 import {
   fetchJSON, fetchDatasets, fetchDatasetDetail, fetchDatasetPreview, fetchVersions,
   reindexDataset, deleteDataset, pollJob, statusColor, StatusBadge, SearchBox,
@@ -26,6 +27,13 @@ import {
 // ─── Data Center-specific fetchers (new endpoints only) ─────────────────────
 
 const fetchActivation = () => fetchJSON("/api/v1/data-center/activation");
+// Phase F7: connector state and the explicit sync trigger. Read separately from
+// the dataset list so a connector-framework failure can never blank the page an
+// operator uses to manage datasets.
+const fetchConnectorHealth = () => fetchJSON("/api/v1/connectors/health");
+const syncConnector = (id) => fetchJSON(`/api/v1/connectors/sync/${id}`, {
+  method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+});
 const fetchDatasetProfile = (id) => fetchJSON(`/api/v1/data-center/datasets/${id}/profile`);
 const activateDataset = (id) => fetchJSON(`/api/v1/data-center/datasets/${id}/activate`, { method: "POST" });
 const deactivateDataset = (id) => fetchJSON(`/api/v1/data-center/datasets/${id}/deactivate`, { method: "POST" });
@@ -250,6 +258,8 @@ export default function DataCenter() {
   const [detailId, setDetailId] = useState(null);
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [rowBusy, setRowBusy] = useState(null);
+  const [connectorHealth, setConnectorHealth] = useState(null);
+  const [syncingConnector, setSyncingConnector] = useState(null);
 
   const load = useCallback(async (silent = false) => {
     if (!silent) { setLoading(true); setError(null); }
@@ -257,6 +267,15 @@ export default function DataCenter() {
       const [ds, activation] = await Promise.all([fetchDatasets(), fetchActivation()]);
       setDatasets(Array.isArray(ds) ? ds : []);
       setActivatedIds(activation?.activated_dataset_ids || []);
+      // Deliberately awaited separately and swallowed: a connector-framework
+      // problem must never take down dataset management. A failed read leaves
+      // connectorHealth null, which ConnectorPanel renders as "not queried"
+      // rather than as a healthy framework.
+      try {
+        setConnectorHealth(await fetchConnectorHealth());
+      } catch {
+        setConnectorHealth(null);
+      }
       if (silent) setError(null);
     } catch (e) {
       setError(e.message);
@@ -281,6 +300,25 @@ export default function DataCenter() {
   const activatedCount = datasets.filter((d) => activatedSet.has(d.dataset_id)).length;
   const totalMetrics = datasets.reduce((sum, d) => sum + (d.metric_columns || []).length, 0);
   const isEmpty = !loading && !error && datasets.length === 0;
+
+  const handleConnectorSync = async (sourceId) => {
+    setSyncingConnector(sourceId);
+    try {
+      await syncConnector(sourceId);
+    } catch {
+      // The endpoint returns 200 with a failed outcome for connector faults, so
+      // reaching here means a transport problem. Either way the refreshed health
+      // read below is what reports the connector's real state.
+    } finally {
+      try {
+        setConnectorHealth(await fetchConnectorHealth());
+      } catch {
+        setConnectorHealth(null);
+      }
+      setSyncingConnector(null);
+      load(true);
+    }
+  };
 
   const handleToggleActivation = async (dataset) => {
     setRowBusy(dataset.dataset_id);
@@ -358,6 +396,17 @@ export default function DataCenter() {
           UploadDropzone, reused verbatim) — an operator can register a CSV/Excel
           dataset directly from Data Center instead of being told to go elsewhere. */}
       <UploadDropzone onUploadsSettled={() => load(true)} currentPage="data" />
+
+      {/* Phase F7: the enterprise connectors. Content they sync reaches the
+          platform through the SAME ingestion pipeline as the upload surface
+          above, so a synced document is retrievable identically to an uploaded
+          one — which is why both live on this page. */}
+      <div style={{ marginBottom: "1.4rem" }}>
+        <Panel title="Enterprise Connectors" icon="database"
+          right={<span style={{ fontSize: "0.62rem", color: "var(--muted)", fontFamily: "var(--font-mono)" }}>credentials via SecretManager — never stored or shown</span>}>
+          <ConnectorPanel health={connectorHealth} onSync={handleConnectorSync} syncingId={syncingConnector} />
+        </Panel>
+      </div>
 
       {error && (
         <div style={{ marginBottom: "1.4rem" }}>

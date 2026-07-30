@@ -393,6 +393,88 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Enterprise Connector Framework (Phase F7) ---
+    #
+    # Every connector is independently flag-gated and ALL default off. A
+    # deployment that sets none of these behaves exactly as it did before this
+    # phase: manual upload plus the existing Google Sheets KPI connector,
+    # unchanged (COMPAT-4). That is the documented F7 rollback — the framework
+    # is inert with no connectors enabled.
+
+    CONNECTORS_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "Phase F7 master switch. False (the default) disables every "
+            "connector regardless of its own flag, restoring the exact "
+            "pre-F7 upload + Sheets posture in one setting."
+        ),
+    )
+
+    CONNECTOR_MOCK_MODE: bool = Field(
+        default=False,
+        description=(
+            "Phase F7: when true, every connector uses the deterministic "
+            "in-repo mock client instead of a real upstream. Lets an operator "
+            "watch a full sync — listing, change detection, ingestion, "
+            "retrieval — before any credential exists. Honest about itself: "
+            "connector health reports mock_mode=true and client_mode="
+            "'injected', so a mock sync can never be mistaken for a tenant one."
+        ),
+    )
+
+    CONNECTOR_SHAREPOINT_ENABLED: bool = Field(
+        default=False, description="Phase F7: enable the SharePoint document connector."
+    )
+    CONNECTOR_CONFLUENCE_ENABLED: bool = Field(
+        default=False, description="Phase F7: enable the Confluence document connector."
+    )
+    CONNECTOR_GITHUB_ENABLED: bool = Field(
+        default=False, description="Phase F7: enable the GitHub document connector."
+    )
+    CONNECTOR_GOOGLE_WORKSPACE_ENABLED: bool = Field(
+        default=False,
+        description=(
+            "Phase F7: enable the Google Workspace (Drive) DOCUMENT connector. "
+            "Independent of the existing Google Sheets KPI connector, which is "
+            "unchanged by this phase."
+        ),
+    )
+    CONNECTOR_SAP_ENABLED: bool = Field(
+        default=False, description="Phase F7: enable the SAP metric connector."
+    )
+    CONNECTOR_SALESFORCE_ENABLED: bool = Field(
+        default=False, description="Phase F7: enable the Salesforce metric connector."
+    )
+    CONNECTOR_SNOWFLAKE_ENABLED: bool = Field(
+        default=False, description="Phase F7: enable the Snowflake metric connector."
+    )
+    CONNECTOR_BIGQUERY_ENABLED: bool = Field(
+        default=False, description="Phase F7: enable the BigQuery metric connector."
+    )
+
+    CONNECTOR_SYNC_MAX_ARTIFACTS: int = Field(
+        default=500,
+        ge=1,
+        description=(
+            "Phase F7 (E6): maximum artifacts one sync run processes. A bound, "
+            "not a preference: an unbounded first sync against a very large "
+            "library would hold a request open indefinitely and flood the "
+            "ingestion queue. Hitting it is reported as truncated, and the "
+            "next run continues from the advanced cursor."
+        ),
+    )
+
+    CONNECTOR_STALE_AFTER_SECONDS: int = Field(
+        default=86_400,
+        ge=1,
+        description=(
+            "Phase F7 (SEC-8): age past which a connector's last successful "
+            "sync is reported stale. A connector that has NEVER synced reports "
+            "stale=null with a reason rather than false — unknown freshness is "
+            "never reported as fresh."
+        ),
+    )
+
     # --- Agent Mesh Formalization (Phase F6) ---
     #
     # Both agents are additive and flag-gated, and both default ON — the

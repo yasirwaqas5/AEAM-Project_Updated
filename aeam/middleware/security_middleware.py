@@ -179,6 +179,26 @@ _ENDPOINT_RBAC_MAP: list[tuple[str, str, str]] = [
     ("/api/v1/logs",              "logs",      "view"),
     ("/api/v1/observability",     "logs",      "view"),
 
+    # --- Enterprise connectors (Phase F7, SEC-3 / SEC-5).
+    #
+    # Running a sync fetches from an external system with organizational
+    # credentials and enqueues ingestion work, so it sits in the strictest
+    # tier — and it is the ONLY way connector content enters the platform
+    # (there is no timer and no autonomous poll), which makes it an operator
+    # action by design.
+    #
+    # The read surfaces are documents:ingest rather than documents:search:
+    # connector health and provenance describe the ingestion estate, which is
+    # the grant that already covers who may see how content arrives.
+    #
+    # Read paths are listed first with longer, distinct prefixes; everything
+    # else under /connectors falls through to admin:config, so a write surface
+    # added later is guarded by default rather than by remembering to map it
+    # (SEC-1).
+    ("/api/v1/connectors/health", "documents", "ingest"),
+    ("/api/v1/connectors/sync",   "admin",     "config"),
+    ("/api/v1/connectors",        "documents", "ingest"),
+
     # --- Agent mesh oversight (Phase F6, SEC-3 / OBS-4).
     #
     # The Supervisor's report is operational telemetry — the same material

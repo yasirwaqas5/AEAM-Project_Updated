@@ -147,6 +147,74 @@ Usage::
     heartbeat_tracker.record("monitor")   # updates both the tracker and this gauge
 """
 
+connector_up: Gauge = Gauge(
+    "connector_up",
+    "1 when an enterprise connector is enabled and authenticated, else 0",
+    ["connector", "source_id"],
+)
+"""
+Gauge holding whether one enterprise connector is currently usable
+(Phase F7, SEC-8).
+
+Deliberately 0 — not absent — for a connector that is enabled but cannot
+authenticate: an alert needs to distinguish "configured and broken" from
+"never configured", and a missing series looks the same as a healthy one to
+most alerting rules. A connector nobody has enabled publishes no series at
+all, which is the honest representation of "not part of this deployment".
+
+Labels:
+    connector: The ``SourceKind``, e.g. ``"sharepoint"``, ``"snowflake"``.
+    source_id: The ``sources`` row, so two SharePoint sites are distinguishable.
+"""
+
+connector_last_sync_timestamp_seconds: Gauge = Gauge(
+    "connector_last_sync_timestamp_seconds",
+    "Unix timestamp of a connector's last successful synchronization",
+    ["connector", "source_id"],
+)
+"""
+Gauge holding when a connector last completed a sync successfully
+(Phase F7, SEC-8). Absent until one has, so a staleness alert cannot fire
+against a fabricated zero — and cannot silently pass against one either.
+
+Labels:
+    connector: The ``SourceKind``.
+    source_id: The ``sources`` row.
+"""
+
+connector_sync_artifacts_total: Counter = Counter(
+    "connector_sync_artifacts_total",
+    "Artifacts a connector sync processed, skipped, or failed",
+    ["connector", "outcome"],
+)
+"""
+Counter of per-artifact sync outcomes (Phase F7).
+
+``outcome`` is ``processed`` / ``skipped`` / ``failed``. The ``skipped`` series
+is the measurable evidence that incremental sync is doing its job: a healthy
+steady state is a large and growing ``skipped`` count against a near-flat
+``processed`` count.
+
+Labels:
+    connector: The ``SourceKind``.
+    outcome:   ``"processed"`` | ``"skipped"`` | ``"failed"``.
+"""
+
+connector_sync_duration_seconds: Histogram = Histogram(
+    "connector_sync_duration_seconds",
+    "Wall-clock duration of one connector synchronization run",
+    ["connector"],
+)
+"""
+Histogram of connector sync durations (Phase F7). Observed once per completed
+run by the sync API, on the same instrument pattern
+:data:`agent_execution_time` already uses -- one metrics module, no second
+monitoring path.
+
+Labels:
+    connector: The ``SourceKind``.
+"""
+
 llm_calls_total: Counter = Counter(
     "llm_calls_total",
     "Total LLM calls, by provider and outcome",
