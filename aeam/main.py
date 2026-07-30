@@ -138,6 +138,7 @@ from aeam.api.auth import router as auth_router, resolve_oidc_endpoints
 from aeam.api.audit import router as audit_router
 from aeam.api.learning import router as learning_router
 from aeam.api.graph import router as graph_router
+from aeam.api.replay import router as replay_router
 
 # ---------------------------------------------------------------------------
 # Logging bootstrap
@@ -1498,6 +1499,7 @@ def create_app() -> FastAPI:
     application.include_router(audit_router)
     application.include_router(learning_router)
     application.include_router(graph_router)
+    application.include_router(replay_router)
 
     _register_routes(application)
     _mount_frontend_build(application)

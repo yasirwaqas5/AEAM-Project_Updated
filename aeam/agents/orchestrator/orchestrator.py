@@ -33,6 +33,8 @@ import json
 import logging
 import uuid
 import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 from aeam.agents.kpi.kpi_agent import _DEFAULT_HISTORY_LIMIT as _KPI_DEFAULT_HISTORY_LIMIT
@@ -122,6 +124,29 @@ def _build_learning_agent(settings: Any, long_term_memory: Any) -> Any | None:
     except Exception as exc:  # noqa: BLE001
         logger.error("Learning Agent could not be constructed: %s", exc)
         return None
+
+
+def _accumulate_stage_timing(ctx: IncidentContext, stage_key: str, elapsed: float) -> None:
+    """
+    Add ``elapsed`` to this incident's measured total for ``stage_key``
+    (Phase F5).
+
+    ACCUMULATES rather than overwrites, because ``_investigate`` recurses:
+    the decision, RAG, and evaluation stages legitimately run once per
+    investigation depth. Overwriting would silently report only the last
+    pass's time, and the per-stage figures would then not sum to the
+    persisted ``investigation_duration_seconds`` — a timeline built on them
+    would be quietly wrong.
+
+    The consequence is stated rather than hidden: ``stage_durations`` is a
+    per-stage TOTAL across every occurrence, so Timeline Replay attributes a
+    measured duration to an individual step only when that step occurs once
+    in the record, and reports the aggregate (with its occurrence count)
+    when it does not.
+    """
+    ctx.stage_timings[stage_key] = round(
+        ctx.stage_timings.get(stage_key, 0.0) + float(elapsed), 6
+    )
 
 
 class Orchestrator:
@@ -422,7 +447,7 @@ class Orchestrator:
 
         # --- Step 3: decide ---
         # Phase E11 (OBS-6): the first stage span of the investigation trace.
-        with investigation_span("decision", incident_id=ctx.incident_id, depth=depth):
+        with self._timed_stage(ctx, "decision", depth=depth):
             decision_result = self._decision.decide(
                 event=ctx.event,
                 memory=ctx.stm,
@@ -483,7 +508,7 @@ class Orchestrator:
         # logic. A missing/failed memory engine never blocks investigation.
         if self._memory is not None and not self._has_memory_finding(ctx):
             memory_incident_id = ctx.stm.get("incident_id", "unknown")
-            with investigation_span("evidence.memory", incident_id=ctx.incident_id):
+            with self._timed_stage(ctx, "memory", span_name="evidence.memory"):
                 try:
                     memory_query = RAGAgent._formulate_query(ctx.event)
                     similar_incidents = self._memory.recall_similar_incidents(
@@ -522,7 +547,7 @@ class Orchestrator:
         # deterministic rule.
         if self._policy_registry is not None and not self._has_policy_finding(ctx):
             policy_incident_id = ctx.stm.get("incident_id", "unknown")
-            with investigation_span("evidence.policy", incident_id=ctx.incident_id):
+            with self._timed_stage(ctx, "policy", span_name="evidence.policy"):
                 try:
                     policy_query = RAGAgent._formulate_query(ctx.event)
                     policy_matches = self._policy_registry.match_for_incident(
@@ -560,7 +585,7 @@ class Orchestrator:
         # entry, never fed back into RuleEngine/DecisionEngine/ActionAgent.
         if self._cross_dataset is not None and not self._has_cross_dataset_finding(ctx):
             cross_incident_id = ctx.stm.get("incident_id", "unknown")
-            with investigation_span("evidence.cross_dataset", incident_id=ctx.incident_id):
+            with self._timed_stage(ctx, "cross_dataset", span_name="evidence.cross_dataset"):
                 try:
                     cross_dataset_result = self._cross_dataset.analyze(metric=ctx.event.metric)
                 except Exception as exc:  # noqa: BLE001
@@ -610,7 +635,7 @@ class Orchestrator:
         #     is appended as its own findings entry and never fed into
         #     RuleEngine/DecisionEngine/ActionAgent (AGENT-5).
         if self._business_graph is not None and not self._has_graph_finding(ctx):
-            with investigation_span("evidence.business_graph", incident_id=ctx.incident_id):
+            with self._timed_stage(ctx, "graph", span_name="evidence.business_graph"):
                 try:
                     graph_result = self._business_graph.analyze(metric=ctx.event.metric)
                 except Exception as exc:  # noqa: BLE001
@@ -653,7 +678,7 @@ class Orchestrator:
         # into DecisionEngine/ActionAgent. Advisory only.
         if self._adaptive_detection is not None and not self._has_adaptive_finding(ctx):
             adaptive_incident_id = ctx.stm.get("incident_id", "unknown")
-            with investigation_span("evidence.adaptive_detection", incident_id=ctx.incident_id):
+            with self._timed_stage(ctx, "adaptive", span_name="evidence.adaptive_detection"):
                 try:
                     adaptive_result = self._adaptive_detection.analyze(
                         metric=ctx.event.metric,
@@ -700,7 +725,13 @@ class Orchestrator:
                     event=ctx.event,
                     memory=ctx.stm,
                 )
-            end_timer(agent_execution_time.labels(agent="rag"), t)
+            # Phase F5: the SAME measurement E11 already observes is also
+            # recorded per-incident, so Timeline Replay attributes RAG's
+            # time from this number rather than estimating it. Observed
+            # once, used twice -- never a second timer.
+            _accumulate_stage_timing(
+                ctx, "rag", end_timer(agent_execution_time.labels(agent="rag"), t)
+            )
 
             # RAG Agent actual contract (rag_agent.py:278-282):
             #   findings: dict with possible_causes/overall_confidence/etc.
@@ -1085,7 +1116,7 @@ class Orchestrator:
         # entry. ActionAgent.execute() and the action_plan loop below are
         # completely unchanged by this stage.
         if self._execution_planner is not None and not self._has_execution_plan_finding(ctx):
-            with investigation_span("planning", incident_id=ctx.incident_id):
+            with self._timed_stage(ctx, "execution_plan", span_name="planning"):
                 try:
                     execution_plan = self._execution_planner.plan(
                         event_type=event_data.get("event_type", ""),
@@ -1140,6 +1171,13 @@ class Orchestrator:
         # advisory findings entry. Never alters recommended_actions/root_cause/
         # confidence -- purely explanatory.
         if self._explainability_engine is not None and not self._has_explainability_finding(ctx):
+            # Phase F5: this stage had no span and therefore no measured
+            # duration before now. Timed on the SAME E11 histogram every
+            # other stage reports to, and recorded per-incident so the
+            # timeline attributes it from a measurement (see _timed_stage;
+            # the explicit pair is used here because the stage's body is a
+            # try/except rather than a single `with` block).
+            _explain_started = start_timer()
             execution_plan_data: dict[str, Any] = {}
             for entry in ctx.stm.get("findings", []) or []:
                 if isinstance(entry, dict) and entry.get("type") == "execution_plan":
@@ -1160,6 +1198,10 @@ class Orchestrator:
                     "lower_priority_justification": {}, "insufficient_evidence": True,
                 }
 
+            _accumulate_stage_timing(
+                ctx, "explainability",
+                end_timer(agent_execution_time.labels(agent="explainability"), _explain_started),
+            )
             ctx.stm.append("findings", {
                 "type": "explainability",
                 "data": explainability_result,
@@ -1182,6 +1224,7 @@ class Orchestrator:
         # explainability above and BEFORE the runbook action-execution loop.
         # Performs NO retrieval, NO detection, and calls no other engine.
         if self._ai_evaluator is not None and not self._has_ai_evaluation_finding(ctx):
+            _ai_eval_started = start_timer()  # Phase F5 — see explainability above.
             execution_plan_data_for_eval: dict[str, Any] = {}
             explainability_data_for_eval: dict[str, Any] | None = None
             for entry in ctx.stm.get("findings", []) or []:
@@ -1207,6 +1250,10 @@ class Orchestrator:
                     "quality_summary": f"AI evaluation failed: {exc}",
                 }
 
+            _accumulate_stage_timing(
+                ctx, "ai_evaluation",
+                end_timer(agent_execution_time.labels(agent="ai_evaluation"), _ai_eval_started),
+            )
             ctx.stm.append("findings", {
                 "type": "ai_evaluation",
                 "data": ai_evaluation_result,
@@ -1255,7 +1302,14 @@ class Orchestrator:
                         incident_id=incident_id,
                     )
             except Exception as exc:  # noqa: BLE001
-                end_timer(agent_execution_time.labels(agent=f"action:{registry_type}"), t)
+                # Phase F5: a FAILED action's elapsed time is a real
+                # measurement and is recorded, so the timeline can show
+                # "this action ran for 3s and then raised" rather than
+                # leaving the step untimed.
+                _accumulate_stage_timing(
+                    ctx, f"action.{step}",
+                    end_timer(agent_execution_time.labels(agent=f"action:{registry_type}"), t),
+                )
                 action_failure_total.labels(action_type=registry_type).inc()
                 skipped_actions.append({"action": step, "reason": str(exc)})
                 logger.error(
@@ -1264,7 +1318,14 @@ class Orchestrator:
                 )
                 return
 
-            end_timer(agent_execution_time.labels(agent=f"action:{registry_type}"), t)
+            # Phase F5: the SAME measurement E11 already observes, also
+            # recorded per-incident under the runbook STEP name (not the
+            # registry type) so the timeline lines up with the
+            # executed/skipped action lists, which are keyed by step.
+            _accumulate_stage_timing(
+                ctx, f"action.{step}",
+                end_timer(agent_execution_time.labels(agent=f"action:{registry_type}"), t),
+            )
 
             if result.get("status") == "SUCCESS":
                 action_success_total.labels(action_type=registry_type).inc()
@@ -1474,6 +1535,19 @@ class Orchestrator:
         # instead of silently backfilling a number it never measured).
         if investigation_duration_seconds is not None:
             audit_summary["investigation_duration_seconds"] = investigation_duration_seconds
+        # --- Phase F5 additive field (COMPAT-1) ---
+        # MEASURED per-stage elapsed seconds, keyed by the stage's findings
+        # type (plus ``action.<step>`` per dispatched action). This is what
+        # lets Timeline Replay attribute an investigation's time honestly:
+        # every number here was measured by ``_timed_stage`` (or the
+        # pre-existing RAG/action timers), so the timeline never has to
+        # divide up the total. A stage that did not run has no key, and an
+        # incident recorded before this phase has no ``stage_durations`` at
+        # all — both surface as an explicit "not recorded", never as 0.0.
+        if ctx.stage_timings:
+            audit_summary["stage_durations"] = {
+                key: round(value, 4) for key, value in ctx.stage_timings.items()
+            }
         if cost_snapshot is not None:
             audit_summary["cost"] = {
                 "llm_calls": cost_snapshot["llm_calls"],
@@ -1758,6 +1832,54 @@ class Orchestrator:
                     latest = data
         return latest
 
+    @contextmanager
+    def _timed_stage(
+        self,
+        ctx: IncidentContext,
+        stage_key: str,
+        *,
+        span_name: str | None = None,
+        **span_attributes: Any,
+    ) -> Iterator[Any]:
+        """
+        Open a stage's tracing span AND measure how long the stage took
+        (Phase F5, extending E11's instrument).
+
+        Two things happen here and nothing else:
+
+        1. the existing :func:`investigation_span` is entered unchanged, so
+           the trace shape every prior phase produces is untouched;
+        2. the elapsed time is observed on the EXISTING
+           ``agent_execution_time`` histogram (the same E11 metric the RAG,
+           action, and report stages already report to) and recorded on
+           ``ctx.stage_timings`` so ``finalize_incident`` can persist it.
+
+        Persisting per-stage time is what lets Timeline Replay attribute an
+        investigation's duration from MEASURED numbers. Without it, the only
+        persisted figure is the single ``investigation_duration_seconds``
+        total, and a per-stage timeline could only be produced by dividing
+        that total up — an estimate, which the timeline contract forbids.
+
+        A stage that raises still records its elapsed time before the
+        exception propagates: "this stage ran for 4s and then failed" is a
+        real measurement, and discarding it would leave the timeline
+        claiming the stage was never timed.
+
+        This changes no investigation behaviour: nothing here reads or
+        writes findings, alters a decision, or affects control flow.
+        """
+        started = start_timer()
+        try:
+            with investigation_span(
+                span_name or stage_key, incident_id=ctx.incident_id, **span_attributes
+            ) as span:
+                yield span
+        finally:
+            _accumulate_stage_timing(
+                ctx, stage_key,
+                end_timer(agent_execution_time.labels(agent=stage_key), started),
+            )
+
     def _has_memory_finding(self, ctx: IncidentContext) -> bool:
         """
         True if Enterprise Memory recall has already run this incident
@@ -1936,7 +2058,7 @@ class Orchestrator:
             })
             return
 
-        with investigation_span("evidence.kpi_analysis", incident_id=ctx.incident_id):
+        with self._timed_stage(ctx, "kpi_analysis", span_name="evidence.kpi_analysis"):
             result = self._kpi_agent.analyze(
                 metric=ctx.event.metric,
                 current_value=ctx.event.current_value,

@@ -65,6 +65,19 @@ class IncidentContext:
                        observe the ``investigation_duration`` histogram
                        — a strictly per-incident measurement, so it
                        lives here rather than on the Orchestrator.
+        stage_timings: Phase F5 (E11 extension). Measured elapsed seconds
+                       per investigation stage, keyed by the stage's
+                       findings type (``"memory"``, ``"rag"``,
+                       ``"execution_plan"``, …) plus ``"action.<step>"``
+                       for each dispatched action. Accumulated as each
+                       stage completes and snapshotted into
+                       ``audit_summary.stage_durations`` at finalize, so
+                       Timeline Replay can attribute an investigation's
+                       time from MEASURED numbers instead of estimating
+                       any of it. Per-incident, so it lives here for the
+                       same reason ``started_at`` does. A stage that never
+                       ran simply has no key — absence is what lets the
+                       timeline say "not recorded" rather than "0s".
     """
 
     incident_id: str
@@ -72,3 +85,4 @@ class IncidentContext:
     stm: ShortTermMemory
     state_machine: IncidentStateMachine
     started_at: float = field(default=0.0)
+    stage_timings: dict[str, float] = field(default_factory=dict)

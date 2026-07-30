@@ -188,6 +188,22 @@ _ENDPOINT_RBAC_MAP: list[tuple[str, str, str]] = [
     # existing read-only-observability tier is exactly the right tier, and
     # the router itself can only ever read.
     ("/api/v1/audit",             "logs",      "view"),
+
+    # --- Investigation & Timeline Replay (Phase F5, SEC-6).
+    #
+    # Replay reconstructs an incident's complete decision trail — the same
+    # material the audit log exposes — so it is graded by the audit tier
+    # rather than by incidents:view: an auditor must be able to walk an
+    # investigation, and nobody should reach the full trail with only the
+    # incident-list grant.
+    #
+    # ONE entry covers the whole prefix because the router has no write
+    # surface at all (every endpoint is a GET, and the module imports
+    # nothing that could execute or persist anything). Should that ever
+    # change, the write would inherit logs:view rather than a stricter
+    # tier — which is why the F5 test suite asserts the absence of any
+    # non-GET route under this prefix.
+    ("/api/v1/replay",            "logs",      "view"),
 ]
 
 # Rate limit configuration applied to all authenticated requests.

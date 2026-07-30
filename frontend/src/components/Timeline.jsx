@@ -72,9 +72,15 @@ function parseDetectionMethods(rawMethods) {
   };
 }
 
-// Exported (additive — no existing behaviour changed) so pages/Replay.jsx can
-// reuse the SAME stage-derivation logic for its step-through playback, rather
-// than duplicating this component's stage-building rules.
+// Exported (additive — no existing behaviour changed) for the pipeline strip
+// this component renders and for any page that wants the same display
+// narrative from an incident's summary fields.
+//
+// Phase F5 note: this is NOT the audit reconstruction. It derives a fixed
+// display pipeline from summary fields, which is the right thing for a
+// glanceable strip but says nothing about which stages were actually
+// recorded or in what order. Replay Workspace consumes
+// GET /api/v1/replay/{id} instead — see ReplayTimeline below.
 export function buildStages(incident) {
   const retrieved = getRetrievedCount(incident);
   const validation = getValidationStatus(incident);
@@ -146,6 +152,147 @@ export function buildStages(incident) {
     { key: "slack", icon: "message", label: "Slack", state: slack.state, detail: slack.detail },
     { key: "email", icon: "mail", label: "Email", state: email.state, detail: email.detail },
   ];
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Phase F5 — ReplayTimeline
+ *
+ * Renders GET /api/v1/replay/{id}/timeline: the BACKEND's reconstruction of
+ * an investigation against measured time. Deliberately separate from
+ * buildStages() above — that derives a display narrative from an incident's
+ * summary fields, which is the right thing for the pipeline strip, but it is
+ * not an audit reconstruction. This renders persisted numbers only.
+ *
+ * Three honesty rules the component must not break:
+ *  - a stage with no measured duration says so; it never shows 0s;
+ *  - a stage recorded more than once shows the aggregate LABELLED as an
+ *    aggregate, because the backend refuses to split it;
+ *  - time the instrumentation did not cover is shown as unattributed, not
+ *    folded into the stages.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+const CATEGORY_COLOR = {
+  decision: "var(--accent)",
+  evidence: "var(--info)",
+  planning: "var(--warn)",
+  explainability: "#a78bfa",
+  governance: "var(--warn)",
+  actions: "var(--ok)",
+  unrecognised: "var(--muted)",
+};
+
+function secondsLabel(value) {
+  if (value == null) return null;
+  return value < 1 ? `${Math.round(value * 1000)}ms` : `${Number(value).toFixed(2)}s`;
+}
+
+export function ReplayTimeline({ timeline }) {
+  if (!timeline) return null;
+  const entries = timeline.entries || [];
+  const widest = entries.reduce(
+    (max, e) => Math.max(max, e.stage_total_seconds ?? 0), 0
+  );
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "0.9rem" }}>
+      <div style={{ fontSize: "0.72rem", color: "var(--muted)", lineHeight: 1.6 }}>
+        Anchored at <strong style={{ color: "var(--text)" }}>{timeline.anchor_timestamp || "—"}</strong>{" "}
+        ({timeline.anchor_source}). {timeline.stages_with_duration} of {timeline.stages_total} recorded
+        stage(s) carry a measured duration.
+      </div>
+
+      {!timeline.timing_available && (
+        <div style={{
+          fontSize: "0.72rem", color: "var(--warn)", border: "1px solid var(--border)",
+          borderRadius: 8, padding: "0.5rem 0.7rem",
+        }}>
+          <Icon name="alert" size={12} color="var(--warn)" /> {timeline.timing_reason}
+        </div>
+      )}
+
+      {timeline.total_investigation_seconds != null && (
+        <div className="aeam-grid-auto" style={{ fontSize: "0.74rem" }}>
+          <div>
+            <div style={{ fontSize: "0.6rem", textTransform: "uppercase", letterSpacing: "0.1em", color: "var(--muted)" }}>Measured total</div>
+            <div style={{ fontFamily: "var(--font-mono)", color: "var(--text)" }}>{secondsLabel(timeline.total_investigation_seconds)}</div>
+          </div>
+          {timeline.measured_stage_seconds != null && (
+            <div>
+              <div style={{ fontSize: "0.6rem", textTransform: "uppercase", letterSpacing: "0.1em", color: "var(--muted)" }}>Attributed to stages</div>
+              <div style={{ fontFamily: "var(--font-mono)", color: "var(--text)" }}>{secondsLabel(timeline.measured_stage_seconds)}</div>
+            </div>
+          )}
+          {timeline.unattributed_seconds != null && (
+            <div title={timeline.unattributed_note}>
+              <div style={{ fontSize: "0.6rem", textTransform: "uppercase", letterSpacing: "0.1em", color: "var(--muted)" }}>Unattributed</div>
+              <div style={{ fontFamily: "var(--font-mono)", color: "var(--muted)" }}>{secondsLabel(timeline.unattributed_seconds)}</div>
+            </div>
+          )}
+        </div>
+      )}
+
+      <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem" }}>
+        {entries.map((e) => {
+          const color = CATEGORY_COLOR[e.category] || "var(--muted)";
+          const measured = e.stage_total_seconds;
+          const width = widest > 0 && measured != null ? Math.max(2, (measured / widest) * 100) : 0;
+          return (
+            <div key={`${e.sequence}-${e.key}`} style={{
+              border: "1px solid var(--border)", borderRadius: 8, padding: "0.5rem 0.7rem",
+              background: "rgba(255,255,255,0.015)",
+            }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "0.6rem", flexWrap: "wrap" }}>
+                <span style={{ fontSize: "0.78rem", fontWeight: 600, color: "var(--text)" }}>
+                  <span style={{ color: "var(--faint)", fontFamily: "var(--font-mono)", fontSize: "0.68rem" }}>#{e.sequence}</span>{" "}
+                  {e.label}
+                  {e.occurrences_total > 1 && (
+                    <span style={{ color: "var(--muted)", fontWeight: 400 }}>
+                      {" "}· pass {e.occurrence} of {e.occurrences_total}
+                    </span>
+                  )}
+                </span>
+                <span style={{ fontSize: "0.72rem", fontFamily: "var(--font-mono)", color: measured != null ? color : "var(--muted)" }}
+                  title={e.duration_note || undefined}>
+                  {measured != null
+                    ? `${secondsLabel(measured)}${e.occurrences_total > 1 ? " (stage total)" : ""}`
+                    : "not recorded"}
+                </span>
+              </div>
+              {width > 0 && (
+                <div style={{ marginTop: "0.35rem", height: 4, background: "var(--border)", borderRadius: 2 }}>
+                  <div style={{ width: `${width}%`, height: "100%", background: color, borderRadius: 2 }} />
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* Honest gaps from the backend reconstruction (EXPL-3 / COMPAT-1): stages
+   the record does not contain, with the phase that introduced them. Shown
+   so a pre-C7 incident reads as "planning was not recorded" rather than
+   silently rendering one stage fewer than a newer incident. */
+export function ReplayGaps({ gaps }) {
+  if (!gaps || gaps.length === 0) return null;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem" }}>
+      {gaps.map((g) => (
+        <div key={g.key} style={{
+          border: "1px dashed var(--border)", borderRadius: 8, padding: "0.5rem 0.7rem",
+          display: "flex", flexDirection: "column", gap: "0.2rem",
+        }}>
+          <span style={{ fontSize: "0.76rem", color: "var(--muted)", fontWeight: 600 }}>
+            {g.label}
+            <span style={{ fontWeight: 400, color: "var(--faint)" }}> · introduced in {g.introduced_in}</span>
+          </span>
+          <span style={{ fontSize: "0.68rem", color: "var(--faint)", lineHeight: 1.5 }}>{g.reason}</span>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function StageRow({ stage, last }) {
