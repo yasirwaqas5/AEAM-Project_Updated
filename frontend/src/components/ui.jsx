@@ -651,7 +651,7 @@ export function getMetadataFilterApplied(incident) {
  * come from real observability rates; anything unrecorded stays undefined so
  * the mesh renders "no recorded activity" instead of inventing one.
  */
-export function buildMeshLive(incidents = [], observability = null) {
+export function buildMeshLive(incidents = [], observability = null, mesh = null) {
   const types = {
     memory: "memory", policy: "policy", cross: "cross_dataset", adaptive: "adaptive",
     retrieval: "rag", plan: "execution_plan", explain: "explainability",
@@ -699,7 +699,42 @@ export function buildMeshLive(incidents = [], observability = null) {
   // Policy Intelligence runs at DOCUMENT INGESTION time, not per incident —
   // stated honestly rather than pretending an incident-level signal exists.
   out.policy_intel = { state: "standby", lastActivity: "runs at document ingestion" };
+
+  // Phase F6 — the Supervisor Agent. Its state cannot come from incident
+  // findings: it observes the mesh rather than contributing to an
+  // investigation, so it writes no finding and there is nothing here to
+  // derive from. It comes from the Supervisor's own report instead, and when
+  // that report was not fetched (or oversight is disabled) the node says so
+  // rather than borrowing another agent's activity.
+  out.supervisor = meshFromReport(mesh);
   return out;
+}
+
+/**
+ * The Supervisor node's live state, derived ONLY from GET /api/v1/mesh/health
+ * (Phase F6). Three distinct outcomes, deliberately not collapsed:
+ *  - no report was fetched      -> "unknown", stated as such;
+ *  - oversight is disabled      -> "idle" with the reason;
+ *  - oversight is running       -> "active", with the issue count it found
+ *                                  (zero issues is a real observation, not
+ *                                  an absence of one).
+ */
+function meshFromReport(mesh) {
+  if (!mesh) {
+    return { state: "idle", lastActivity: "mesh oversight not queried" };
+  }
+  if (mesh.supervisor_enabled === false) {
+    return { state: "idle", lastActivity: "disabled (SUPERVISOR_AGENT_ENABLED=false)" };
+  }
+  const issues = Array.isArray(mesh.issues) ? mesh.issues : [];
+  const score = mesh.mesh_health?.available ? mesh.mesh_health.score : null;
+  return {
+    state: "active",
+    health: score != null ? `${Math.round(score * 100)}% mesh health` : "mesh health not computable",
+    lastActivity: issues.length === 0
+      ? "observed — no anomalies"
+      : `observed — ${issues.length} issue${issues.length !== 1 ? "s" : ""}`,
+  };
 }
 
 // ─── Icons (inline SVG, no dependency) ──────────────────────────────────────

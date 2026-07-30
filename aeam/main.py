@@ -19,6 +19,7 @@ import logging
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
+import json
 from typing import Any, AsyncIterator
 
 from fastapi import FastAPI
@@ -73,6 +74,9 @@ from aeam.agents.policy.policy_agent import PolicyAgent
 from aeam.intelligence.cross_dataset_analyzer import CrossDatasetAnalyzer
 from aeam.intelligence.business_graph import BusinessGraphStore, TraversalBudget
 from aeam.intelligence.graph_correlation import GraphCorrelationEngine
+from aeam.intelligence.observability import ObservabilityEngine
+from aeam.agents.planning.planning_agent import PlanningAgent
+from aeam.agents.supervisor.supervisor_agent import SupervisorAgent
 from aeam.intelligence.adaptive_detection import AdaptiveDetectionEngine
 from aeam.intelligence.execution_planning import ExecutionPlanningEngine
 from aeam.governance.human_review import HumanReviewService
@@ -139,6 +143,7 @@ from aeam.api.audit import router as audit_router
 from aeam.api.learning import router as learning_router
 from aeam.api.graph import router as graph_router
 from aeam.api.replay import router as replay_router
+from aeam.api.mesh import router as mesh_router
 
 # ---------------------------------------------------------------------------
 # Logging bootstrap
@@ -988,6 +993,28 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         approval_required_quality_levels=_approval_quality_levels,
     )
 
+    # --- Planning Agent (Phase F6) ---
+    # A PROMOTION BY COMPOSITION, not a rewrite. PlanningAgent wraps the
+    # EXACT SAME engine constructed above and returns its result unmodified,
+    # so the Orchestrator's planning stage — which just calls `.plan(...)` on
+    # whatever it was given — needs no change at all, and the
+    # `execution_plan` finding it appends is identical field for field
+    # (COMPAT-1). What the wrapper adds is standing: a roster entry, its own
+    # heartbeat, its own agent_execution_time label, and its own span.
+    #
+    # Flag-off passes the bare engine, which is byte-identically the
+    # pre-F6 path — the documented F6 rollback.
+    planning_target: Any = execution_planning_engine
+    planning_agent: PlanningAgent | None = None
+    if settings.PLANNING_AGENT_ENABLED:
+        planning_agent = PlanningAgent(engine=execution_planning_engine)
+        planning_target = planning_agent
+    container.planning_agent = planning_agent
+    logger.info(
+        "Planning agent | enabled=%s | planner=%s",
+        settings.PLANNING_AGENT_ENABLED, type(planning_target).__name__,
+    )
+
     # --- Human-in-the-Loop Enforcement (Phase E9, AGENT-5) ---
     # The single service both the Orchestrator (which records what it
     # withheld) and the review API (which releases it) use, so the two can
@@ -1046,7 +1073,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         policy_registry=policy_registry,
         cross_dataset_analyzer=cross_dataset_analyzer,
         adaptive_detection_engine=adaptive_detection_engine,
-        execution_planning_engine=execution_planning_engine,
+        # Phase F6: the PlanningAgent when enabled, else the bare C7 engine.
+        # Both satisfy the same `.plan(...)` contract, which is what makes the
+        # promotion a drop-in rather than an orchestrator change.
+        execution_planning_engine=planning_target,
         explainability_engine=explainability_engine,
         ai_evaluation_engine=ai_evaluation_engine,
         human_review_service=human_review_service,
@@ -1064,13 +1094,72 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # constructed. The Orchestrator builds it itself from settings (the
     # placeholder it replaces was unconditional), so the roster reads back
     # what exists rather than asserting it.
+    # Phase F6: "planning" and "supervisor" join the roster on the same
+    # terms as every other entry — listed only when the object was actually
+    # constructed, so the roster keeps reading back what exists.
     container.agent_roster = sorted(
         ["orchestrator", "rag", "forecast", "report"]
         + (["monitor"] if monitor_agent is not None else [])
         + (["action"] if action_agent is not None else [])
         + (["kpi"] if getattr(orchestrator, "_kpi_agent", None) is not None else [])
+        + (["planning"] if planning_agent is not None else [])
+        + (["supervisor"] if settings.SUPERVISOR_AGENT_ENABLED else [])
     )
     logger.info("Agent roster | %s", container.agent_roster)
+
+    # --- Supervisor Agent (Phase F6, ARCH-1) ---
+    # Constructed LAST and deliberately given only two read-only providers:
+    # a roster reader and an observability reader. It receives no
+    # Orchestrator, no ActionAgent, no PlanningAgent, and no EventBus — so
+    # it has nothing to coordinate WITH. The single-coordinator invariant is
+    # preserved by what this object cannot reach, not by what it declines to
+    # do.
+    #
+    # The observability provider reuses the SAME ObservabilityEngine the
+    # /api/v1/observability endpoint uses, over the same bounded read (E6),
+    # so the Supervisor's participation figures and the Analytics page's are
+    # the same numbers (ENG-6). A failure here yields None, and the report
+    # says which components it therefore could not compute.
+    supervisor_agent: SupervisorAgent | None = None
+    if settings.SUPERVISOR_AGENT_ENABLED:
+        _observability_engine = ObservabilityEngine(
+            trend_window=settings.OBSERVABILITY_TREND_WINDOW
+        ) if getattr(settings, "OBSERVABILITY_TREND_WINDOW", None) is not None else ObservabilityEngine()
+        _mesh_window = int(getattr(settings, "OBSERVABILITY_RETENTION_LIMIT", None) or 500)
+
+        def _mesh_observability_summary() -> dict[str, Any] | None:
+            """Bounded, read-only observability summary for the Supervisor."""
+            try:
+                rows = container.db.fetch_all(
+                    "SELECT * FROM incidents ORDER BY timestamp DESC LIMIT :limit",
+                    {"limit": _mesh_window},
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("supervisor | incident read failed: %s", exc)
+                return None
+            incidents: list[dict[str, Any]] = []
+            for row in rows:
+                incident = dict(row)
+                findings = incident.get("findings")
+                if isinstance(findings, str):
+                    try:
+                        incident["findings"] = json.loads(findings) if findings else []
+                    except (json.JSONDecodeError, TypeError):
+                        incident["findings"] = []
+                incidents.append(incident)
+            try:
+                return _observability_engine.summarize(incidents)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("supervisor | observability summarize failed: %s", exc)
+                return None
+
+        supervisor_agent = SupervisorAgent(
+            settings=settings,
+            roster_provider=lambda: list(getattr(container, "agent_roster", []) or []),
+            observability_provider=_mesh_observability_summary,
+        )
+    container.supervisor_agent = supervisor_agent
+    logger.info("Supervisor agent | enabled=%s", settings.SUPERVISOR_AGENT_ENABLED)
 
     logger.info("Orchestrator registered with EventBus (ALL wildcard).")
     logger.info("Infrastructure container ready | %r", container)
@@ -1367,6 +1456,27 @@ def build_health_payload(container: "AppContainer") -> dict:
         else:
             status["checks"]["ingestion_worker"] = f"ok (last heartbeat {age:.0f}s ago)"
 
+    # Phase F6: the two agents formalized this phase report their heartbeat
+    # here so they are as observable as the workers above — but
+    # INFORMATIONALLY ONLY, and never flipping overall `status`. Both are
+    # request-scoped: planning beats once per finalized incident and the
+    # supervisor once per oversight read, so an old heartbeat means "not used
+    # recently", which on a quiet platform is correct behaviour rather than a
+    # fault. Treating it as staleness would report a healthy idle system as
+    # degraded — the exact fabrication OBS-4 forbids.
+    for agent_key, enabled, label in (
+        ("planning", container.settings.PLANNING_AGENT_ENABLED, "planning_agent"),
+        ("supervisor", container.settings.SUPERVISOR_AGENT_ENABLED, "supervisor_agent"),
+    ):
+        if not enabled:
+            status["checks"][label] = f"disabled ({label.upper()}_ENABLED=false)"
+            continue
+        agent_age = heartbeat_tracker.age_seconds(agent_key)
+        status["checks"][label] = (
+            "registered (no invocation yet)" if agent_age is None
+            else f"ok (last invoked {agent_age:.0f}s ago)"
+        )
+
     # Phase E7 (RAG-6): informational only — staleness here degrades
     # retrieval QUALITY, not platform availability, so it never flips
     # overall `status`.
@@ -1500,6 +1610,7 @@ def create_app() -> FastAPI:
     application.include_router(learning_router)
     application.include_router(graph_router)
     application.include_router(replay_router)
+    application.include_router(mesh_router)
 
     _register_routes(application)
     _mount_frontend_build(application)

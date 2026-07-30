@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from "react";
 import { PageHeader, Card, CardTitle, Badge, Field, Icon, fmtRelative, getRetrievedCount } from "../components/ui";
 import { PageContainer, MetricCard, Panel, EmptyState, LoadingState, ErrorState } from "../components/library";
 import AgentLogCard from "../components/AgentLogCard";
+import MeshHealthPanel from "../components/MeshHealthPanel";
 
 /* ──────────────────────────────────────────────────────────────────────────
  * pages/Agents.jsx  (Agent Observatory)
@@ -19,6 +20,11 @@ import AgentLogCard from "../components/AgentLogCard";
  *     currently watching
  *   - GET /api/v1/knowledge/documents    -> knowledge-base status for RAG
  *   - GET /api/v1/system/status          -> overall system health
+ *   - GET /api/v1/mesh/health            -> the Supervisor Agent's whole-mesh
+ *     observation (Phase F6): per-agent heartbeat/execution/participation
+ *     state, detected behaviour anomalies with the metrics behind each, and
+ *     the mesh-health score with its formula. Advisory and read-only — this
+ *     page renders observations and offers no action on them.
  *   - GET /api/v1/system/rule-engine     -> NEW, minimal, read-only endpoint
  *     added this phase (see aeam/api/system.py) — the only backend addition,
  *     justified because no existing endpoint exposed RuleEngine's curated
@@ -111,6 +117,7 @@ export default function Agents() {
   const [documents, setDocuments] = useState([]);
   const [activation, setActivation] = useState({ activated_dataset_ids: [] });
   const [ruleEngine, setRuleEngine] = useState(null);
+  const [mesh, setMesh] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -124,8 +131,9 @@ export default function Agents() {
       fetchJSON("/api/v1/knowledge/documents"),
       fetchJSON("/api/v1/data-center/activation"),
       fetchJSON("/api/v1/system/rule-engine"),
+      fetchJSON("/api/v1/mesh/health"),
     ]);
-    const [inc, stat, met, logs, docs, act, rules] = results;
+    const [inc, stat, met, logs, docs, act, rules, meshHealth] = results;
     if (inc.status === "fulfilled") setIncidents(Array.isArray(inc.value) ? inc.value : []);
     if (stat.status === "fulfilled") setStatus(stat.value);
     if (met.status === "fulfilled") setMetrics(met.value);
@@ -133,6 +141,9 @@ export default function Agents() {
     if (docs.status === "fulfilled") setDocuments(Array.isArray(docs.value) ? docs.value : []);
     if (act.status === "fulfilled") setActivation(act.value);
     if (rules.status === "fulfilled") setRuleEngine(rules.value);
+    // A failed mesh read leaves `mesh` null, which MeshHealthPanel renders as
+    // "not queried" — never as a healthy mesh.
+    if (meshHealth.status === "fulfilled") setMesh(meshHealth.value);
     if (inc.status === "rejected") setError(inc.reason?.message || "Failed to load incidents");
     setLoading(false);
   }, []);
@@ -285,6 +296,14 @@ export default function Agents() {
             <Field label="Pending Actions" value={<Unavailable label="not applicable — actions execute synchronously within incident finalization; no pending queue exists" />} />
             <Field label="Success Rate" value={successRate != null ? `${successRate}%` : "—"} mono />
           </div>
+        </Panel>
+      </div>
+
+      {/* Phase F6: whole-mesh oversight from the Supervisor Agent. */}
+      <div style={{ marginBottom: "1.4rem" }}>
+        <Panel title="Mesh Health — Supervisor Agent (advisory)" icon="shield"
+          right={<span style={{ fontSize: "0.62rem", color: "var(--muted)", fontFamily: "var(--font-mono)" }}>observes only — never coordinates or executes</span>}>
+          <MeshHealthPanel mesh={mesh} />
         </Panel>
       </div>
 

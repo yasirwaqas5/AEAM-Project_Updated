@@ -27,12 +27,16 @@ export const ENGINES = [
   { key: "cross",     label: "Cross-Dataset",       color: "#2dd4bf", purpose: "Correlates the incident metric against other activated business datasets." },
   { key: "adaptive",  label: "Adaptive Detection",  color: "#fbbf24", purpose: "Longer-horizon baselines and day-of-week seasonality checks." },
   { key: "retrieval", label: "Advanced Retrieval",  color: "#38bdf8", purpose: "Hybrid dense + lexical retrieval with reranking and business-relevance ranking." },
-  { key: "plan",      label: "Execution Planning",  color: "#f472b6", purpose: "Synthesizes all evidence into one explainable, priority-ordered plan." },
+  { key: "plan",      label: "Planning Agent",      color: "#f472b6", purpose: "Synthesizes all evidence into one explainable, priority-ordered plan. Promoted to a first-class agent in Phase F6 — same engine, same output." },
   { key: "explain",   label: "Explainability",      color: "#c084fc", purpose: "Explains WHY each recommendation exists — evidence chains and confidence." },
   { key: "eval",      label: "AI Evaluation",       color: "#34d399", purpose: "Scores each investigation's thoroughness across ten transparent components." },
   { key: "observe",   label: "Observability",       color: "#94a3b8", purpose: "Cross-incident hit rates, trends and the platform's overall AI-health score." },
   { key: "report",    label: "Report Agent",        color: "#8fb3e8", purpose: "Generates the human-readable investigation report and audit summary." },
   { key: "action",    label: "Action Engine",       color: "#fb923c", purpose: "Executes the approved response — Slack, Jira, email, webhooks." },
+  // Phase F6: whole-mesh oversight. Deliberately last in the ring, and
+  // deliberately NOT connected to the core as a coordinator — it observes
+  // the mesh and recommends; the Orchestrator remains the only coordinator.
+  { key: "supervisor", label: "Supervisor Agent",   color: "#e2e8f0", purpose: "Observes mesh health and agent behaviour from heartbeats, metrics and roster participation. Advisory only — it never coordinates, executes, or restarts anything." },
 ];
 
 const prefersReduced = () =>

@@ -178,6 +178,20 @@ _ENDPOINT_RBAC_MAP: list[tuple[str, str, str]] = [
     # so the auditor role reaches them by construction.
     ("/api/v1/logs",              "logs",      "view"),
     ("/api/v1/observability",     "logs",      "view"),
+
+    # --- Agent mesh oversight (Phase F6, SEC-3 / OBS-4).
+    #
+    # The Supervisor's report is operational telemetry — the same material
+    # /observability and the audit log already expose — so it is graded by
+    # the observability tier, reachable by the auditor role.
+    #
+    # ONE entry covers the prefix because the router has no actionable
+    # surface: every endpoint is a GET returning observations, and there is
+    # deliberately no endpoint to act on one (acting would give the
+    # Supervisor the coordination authority ARCH-1 reserves for the
+    # Orchestrator). The F6 suite asserts the absence of any non-GET route
+    # under this prefix, so that stays true.
+    ("/api/v1/mesh",              "logs",      "view"),
     ("/api/v1/system",            "logs",      "view"),
 
     # --- Audit query surface (Phase E11, SEC-6). Read-only queries over the

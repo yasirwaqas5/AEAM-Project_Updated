@@ -393,6 +393,46 @@ class Settings(BaseSettings):
         ),
     )
 
+    # --- Agent Mesh Formalization (Phase F6) ---
+    #
+    # Both agents are additive and flag-gated, and both default ON — the
+    # opposite of the F1–F4 intelligence flags, deliberately, because
+    # neither can change an outcome:
+    #
+    #   * PlanningAgent forwards to the SAME C7 engine and returns its
+    #     result unmodified, so its output is byte-identical by
+    #     construction (COMPAT-1). There is no behaviour for a default-off
+    #     flag to protect.
+    #   * SupervisorAgent only reads telemetry and returns a report. It
+    #     touches no investigation path at all.
+    #
+    # Flag-off is the documented F6 rollback: the roster entries disappear
+    # and the C7 engine becomes the direct planning path again.
+
+    PLANNING_AGENT_ENABLED: bool = Field(
+        default=True,
+        description=(
+            "Phase F6: when true, the C7 ExecutionPlanningEngine is wrapped "
+            "by PlanningAgent — a named roster member with its own heartbeat, "
+            "metric label, and span. Planning OUTPUT is unchanged either way "
+            "(the agent returns the engine's own result). False restores the "
+            "engine as the direct planning path."
+        ),
+    )
+
+    SUPERVISOR_AGENT_ENABLED: bool = Field(
+        default=True,
+        description=(
+            "Phase F6: when true, SupervisorAgent is constructed and "
+            "GET /api/v1/mesh/health reports mesh health and behaviour "
+            "anomalies from existing E7 heartbeats, E11 metrics, and roster "
+            "participation. Advisory only — it observes and recommends, and "
+            "never coordinates, executes, or restarts anything (ARCH-1). "
+            "False removes the roster entry and the endpoint reports that "
+            "oversight is disabled."
+        ),
+    )
+
     # --- Autonomous operations supervision (Phase E7, OBS-3/4) ---
 
     HEARTBEAT_STALE_SECONDS: int = Field(
