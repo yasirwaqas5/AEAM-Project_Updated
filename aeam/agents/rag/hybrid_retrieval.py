@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 import time
 from typing import Any
 
@@ -110,6 +111,20 @@ class BM25Index:
         # Phase E7 (RAG-6): wall-clock time of the last successful build,
         # for staleness disclosure. None until the first build() call.
         self._built_at: float | None = None
+        # Hardening — concurrency. This index is built at startup and then
+        # REBUILT IN PLACE by refresh_from_qdrant() from the IngestionWorker
+        # daemon thread, while search() reads it from request threads running
+        # investigations. Those are genuinely concurrent, and the parallel
+        # lists below must be mutually consistent: search() collects indices
+        # by enumerating _doc_freqs and then dereferences _docs[i], so a
+        # reader that observed the old _doc_freqs (556 entries) and the new,
+        # mid-rebuild _docs (12 entries) raised
+        # `IndexError: list index out of range` — surfacing as a spurious
+        # "Retrieval failed" RAG pass whenever a document was ingested during
+        # an investigation. The lock is held only long enough to swap (build)
+        # or snapshot (search) the references, never across BM25 scoring, so
+        # concurrent searches still run in parallel.
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Build
@@ -125,11 +140,15 @@ class BM25Index:
                        are indexed (so counts stay consistent) but simply never
                        match a query.
         """
-        self._docs = []
-        self._doc_tokens = []
-        self._doc_freqs = []
-        self._doc_len = []
-        self._df = {}
+        # Hardening: build into LOCALS, then publish every structure together
+        # under the lock. Previously these seven attributes were cleared and
+        # repopulated in place, so a concurrent search() could observe a
+        # half-built index (see the lock's note in __init__).
+        docs: list[dict[str, Any]] = []
+        doc_tokens: list[list[str]] = []
+        doc_freqs: list[dict[str, int]] = []
+        doc_len: list[int] = []
+        df: dict[str, int] = {}
 
         for doc in documents:
             text = str(doc.get("text", "") or "")
@@ -138,31 +157,40 @@ class BM25Index:
             for tok in tokens:
                 freqs[tok] = freqs.get(tok, 0) + 1
 
-            self._docs.append({
+            docs.append({
                 "chunk_id": doc.get("chunk_id"),
                 "text": text,
                 "metadata": doc.get("metadata", {}) or {},
             })
-            self._doc_tokens.append(tokens)
-            self._doc_freqs.append(freqs)
-            self._doc_len.append(len(tokens))
+            doc_tokens.append(tokens)
+            doc_freqs.append(freqs)
+            doc_len.append(len(tokens))
 
             for term in freqs:
-                self._df[term] = self._df.get(term, 0) + 1
+                df[term] = df.get(term, 0) + 1
 
-        n = len(self._docs)
-        self._avgdl = (sum(self._doc_len) / n) if n else 0.0
+        n = len(docs)
+        avgdl = (sum(doc_len) / n) if n else 0.0
 
         # Pre-compute idf for every term once.
-        self._idf = {}
-        for term, df in self._df.items():
-            self._idf[term] = math.log(1.0 + (n - df + 0.5) / (df + 0.5))
+        idf: dict[str, float] = {}
+        for term, term_df in df.items():
+            idf[term] = math.log(1.0 + (n - term_df + 0.5) / (term_df + 0.5))
 
-        self._built = True
-        self._built_at = time.time()
+        with self._lock:
+            self._docs = docs
+            self._doc_tokens = doc_tokens
+            self._doc_freqs = doc_freqs
+            self._doc_len = doc_len
+            self._df = df
+            self._idf = idf
+            self._avgdl = avgdl
+            self._built = True
+            self._built_at = time.time()
+
         logger.info(
             "BM25Index.build | docs=%d | vocab=%d | avgdl=%.1f",
-            n, len(self._df), self._avgdl,
+            n, len(df), avgdl,
         )
 
     @staticmethod
@@ -295,8 +323,21 @@ class BM25Index:
             Empty list if the index is empty, the query has no usable tokens,
             or nothing scored above zero.
         """
-        if not self._built or not self._docs or top_k < 1:
-            return []
+        # Hardening: take ONE consistent snapshot of the parallel structures
+        # under the lock, then score outside it. A concurrent in-place refresh
+        # (IngestionWorker thread) therefore either happens entirely before or
+        # entirely after this snapshot — never halfway through it — so the
+        # indices collected below always dereference the corpus they were
+        # computed against. Scoring itself stays lock-free, so concurrent
+        # searches are not serialised.
+        with self._lock:
+            if not self._built or not self._docs or top_k < 1:
+                return []
+            docs = self._docs
+            doc_freqs = self._doc_freqs
+            doc_len = self._doc_len
+            idf_map = self._idf
+            avgdl = self._avgdl
 
         q_tokens = tokenize(query)
         if not q_tokens:
@@ -305,8 +346,8 @@ class BM25Index:
         q_terms = set(q_tokens)
 
         scored: list[tuple[float, int]] = []
-        for i, freqs in enumerate(self._doc_freqs):
-            dl = self._doc_len[i]
+        for i, freqs in enumerate(doc_freqs):
+            dl = doc_len[i]
             if dl == 0:
                 continue
             score = 0.0
@@ -314,8 +355,8 @@ class BM25Index:
                 f = freqs.get(term)
                 if not f:
                     continue
-                idf = self._idf.get(term, 0.0)
-                denom = f + self._k1 * (1.0 - self._b + self._b * dl / (self._avgdl or 1.0))
+                idf = idf_map.get(term, 0.0)
+                denom = f + self._k1 * (1.0 - self._b + self._b * dl / (avgdl or 1.0))
                 score += idf * (f * (self._k1 + 1.0)) / denom
             if score > 0.0:
                 scored.append((score, i))
@@ -324,7 +365,7 @@ class BM25Index:
 
         results: list[dict[str, Any]] = []
         for score, i in scored[:top_k]:
-            doc = self._docs[i]
+            doc = docs[i]
             results.append({
                 "chunk_id": doc["chunk_id"],
                 "text": doc["text"],

@@ -294,7 +294,15 @@ def test_email_missing_credentials_returns_structured_error():
         email.send_email({"to": ["ops@example.com"], "subject": "s", "body": "b"})
 
     err = excinfo.value
-    assert err.reason == "Missing Google Cloud credentials"
+    # Hardening pass: the reason was the bare string "Missing Google Cloud
+    # credentials". That text is what the console renders in an incident's
+    # skipped_actions list, where it is both unactionable (which credentials?)
+    # and misleading (an email failure attributed to Google Cloud). It now
+    # names the missing keys, so the message stands on its own.
+    assert "Email credentials not configured" in err.reason
+    assert "gmail_private_key" in err.reason
+    assert "gmail_client_email" in err.reason
+    assert "gmail_sender_address" in err.reason
     # Reported in the documented order, all three missing.
     assert err.details["missing"] == [
         "gmail_private_key",

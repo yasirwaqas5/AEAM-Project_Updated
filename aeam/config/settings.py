@@ -778,6 +778,19 @@ class Settings(BaseSettings):
         description="API key for the LLM provider (loaded from .env).",
     )
 
+    LLM_MODEL: str = Field(
+        default="",
+        description=(
+            "Hardening: chat model id for the configured provider. Empty (the "
+            "default) keeps llm_service.py's engine-owned default "
+            "('llama-3.1-8b-instant') exactly as before (COMPAT-1, ENG-6 — the "
+            "literal continues to live once, in its owning module). Exists "
+            "because a hardcoded model id becomes a permanent, "
+            "every-call-fails 404 the day the vendor decommissions it, with no "
+            "configuration path out."
+        ),
+    )
+
     USE_MOCK_LLM: bool = Field(
         default=True,
         description=(
@@ -944,6 +957,25 @@ class Settings(BaseSettings):
     SHEET_RANGE: str = Field(
         default="Sheet1!A2:C10",
         description="Google Sheets range for KPI data.",
+    )
+
+    # --- Incident report delivery ---
+
+    INCIDENT_REPORT_RECIPIENTS: str = Field(
+        default="",
+        description=(
+            "Hardening: comma-separated recipients for the per-incident email "
+            "report (same comma-separated convention as ACTIVATED_DATASET_IDS). "
+            "Before this field the recipient was the hardcoded literal "
+            "'ops@company.com' — a registered THIRD-PARTY domain — so any "
+            "deployment that configured SMTP credentials silently sent every "
+            "finalized incident's full report (root cause, evidence, "
+            "confidence) off-organization on every incident, with no way to "
+            "stop it short of removing the credentials. "
+            "EMPTY (the default) means the email step is SKIPPED and recorded "
+            "with that reason. Fail-closed is the only correct default for an "
+            "egress path: an unset recipient must never fall back to a guess."
+        ),
     )
 
     # --- Slack configuration ---

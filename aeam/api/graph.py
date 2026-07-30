@@ -367,6 +367,25 @@ async def build_graph(request: Request, body: GraphBuildRequest | None = None) -
         raise HTTPException(status_code=500, detail=f"Graph build failed: {exc}") from exc
 
     payload = report.as_dict()
+    # Hardening: the builder wraps each evidence source in its own try/except
+    # and records a failure in `skipped_sources` rather than aborting — correct,
+    # because a partial graph beats no graph. But the response said
+    # `{"built": true}` either way, so a build that silently lost an entire
+    # evidence source (a locked read, an unreachable registry) was
+    # indistinguishable from a complete one. Reproduced against the running
+    # system: concurrent builds dropped the dataset source and produced a
+    # 2-node graph where a sequential build produced 4, and still reported
+    # success. `complete` states which of the two actually happened.
+    _skipped = payload.get("skipped_sources") or []
+    payload["complete"] = not _skipped
+    if _skipped:
+        payload["incomplete_reason"] = (
+            f"{len(_skipped)} evidence source(s) were skipped; the graph reflects "
+            "only the sources that were readable. See skipped_sources."
+        )
+        logger.warning(
+            "graph build | PARTIAL | skipped=%s", [s.get("source") for s in _skipped],
+        )
     _audit(request, principal, "graph.build", {
         "build_id": report.build_id,
         "nodes_written": report.nodes_written,

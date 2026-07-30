@@ -90,7 +90,17 @@ class EventBus:
         """
         Register a callable to be invoked when an event of ``event_type`` is published.
 
-        Use the special event_type ``"*"`` to receive every event regardless of type.
+        Use either ``"*"`` or ``"ALL"`` to receive every event regardless of
+        type. Both are real wildcards — :meth:`publish` dispatches
+        ``handlers[event_type]``, then ``handlers["*"]``, then
+        ``handlers["ALL"]``, in that order.
+
+        Hardening note: this docstring previously documented only ``"*"``,
+        while the composition root (``aeam/main.py``) registers the
+        Orchestrator under ``"ALL"``. Both worked, but the documented key was
+        not the one in use, so a developer following this docstring would
+        register a second catch-all that dispatches BEFORE the Orchestrator —
+        a subtle ordering surprise in the one place ordering matters.
 
         Args:
             event_type: The ``Event.event_type`` string this handler should

@@ -61,6 +61,9 @@ class LLMService:
         self._circuit_open = False
         self._last_failure_time = 0
         self._circuit_timeout = 60
+        # Hardening: one reused provider client per service instance instead
+        # of a fresh one on every retry attempt (see generate()).
+        self._client = None
 
         # Phase E8 (AI-1, SEC-4 pattern): fail loudly at construction time
         # if a real call would actually be attempted against an
@@ -127,37 +130,119 @@ class LLMService:
             )
 
         max_retries = 3
+        # Hardening: the real provider error used to be swallowed by
+        # `logger.warning(...)` and the final raise said only "Failed to
+        # generate LLM response after retries". That string is what got
+        # persisted into every failed incident's findings, so an operator
+        # reading the record could not tell an expired API key from a
+        # decommissioned model from a rate limit from a network timeout — the
+        # diagnosis existed only in a transient WARNING log line. The last
+        # error is now carried into the raised message and therefore into the
+        # persisted evidence.
+        last_error: Exception | None = None
         for attempt in range(max_retries):
             try:
                 logger.info(f"Generating LLM response (attempt {attempt + 1})")
                 if provider == "groq":
-                    import groq
-                    # Phase E8 (AI-3): per-call timeout, bounding every one
-                    # of the six shared call sites uniformly.
-                    client = groq.Groq(
-                        api_key=self.settings.LLM_API_KEY,
-                        timeout=self.settings.LLM_TIMEOUT_SECONDS,
-                    )
+                    # Hardening: the client is built ONCE per call rather than
+                    # once per retry attempt. Three attempts meant three
+                    # clients and three httpx connection pools per call, and
+                    # with five RAG passes per investigation that was up to
+                    # fifteen pools created (and never explicitly closed) for
+                    # a single incident.
+                    client = self._groq_client()
                     t = start_timer()
                     chat = client.chat.completions.create(
                         messages=[{"role": "user", "content": prompt}],
-                        model="llama-3.1-8b-instant",
+                        model=self._model_id(),
                         temperature=kwargs.get("temperature", 0.2),
                         max_tokens=kwargs.get("max_tokens", 1000),
                     )
                     end_timer(llm_call_duration_seconds.labels(provider=provider), t)
                     llm_calls_total.labels(provider=provider, status="success").inc()
                     self._record_usage_metrics(provider, chat)
+                    # Hardening: a success must clear the failure tally.
+                    # Previously _failure_count only ever grew, so a service
+                    # with two historical failures tripped its breaker on the
+                    # next one no matter how many thousands of calls had
+                    # succeeded in between.
+                    self._failure_count = 0
                     return chat.choices[0].message.content
                 else:
                     raise LLMServiceException(f"Unsupported provider: {provider}")
             except Exception as e:
-                logger.warning(f"LLM call failed: {e}")
-                await asyncio.sleep(2 ** attempt)
+                last_error = e
+                logger.warning(
+                    "LLM call failed (attempt %d/%d) | %s: %s",
+                    attempt + 1, max_retries, type(e).__name__, e,
+                )
+                # Hardening: do not burn retries on an error that cannot
+                # succeed on retry. An invalid key (401), a revoked key (403),
+                # or a decommissioned model (404) is permanent — retrying it
+                # three times added 1+2+4s of pure sleep per call, which across
+                # five RAG passes was ~35s of dead latency added to every
+                # investigation before it could report the failure.
+                if self._is_permanent_error(e):
+                    logger.error(
+                        "LLM call failed permanently (not retryable) | %s: %s",
+                        type(e).__name__, e,
+                    )
+                    break
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(2 ** attempt)
 
         await self._record_failure()
         llm_calls_total.labels(provider=provider, status="failure").inc()
-        raise LLMServiceException("Failed to generate LLM response after retries")
+        raise LLMServiceException(
+            f"Failed to generate LLM response after retries: "
+            f"{type(last_error).__name__}: {last_error}"
+            if last_error is not None
+            else "Failed to generate LLM response after retries"
+        )
+
+    # ------------------------------------------------------------------
+    # Provider plumbing
+    # ------------------------------------------------------------------
+
+    def _model_id(self) -> str:
+        """The chat model id for the configured provider.
+
+        Kept as one named accessor so the id is not buried mid-call. The
+        value is unchanged from before this hardening pass (COMPAT-1); it is
+        overridable via ``LLM_MODEL`` for an operator whose provider account
+        has a different model available, because a hardcoded id silently
+        becomes a permanent 404 the day a vendor decommissions it.
+        """
+        configured = str(getattr(self.settings, "LLM_MODEL", "") or "").strip()
+        return configured or "llama-3.1-8b-instant"
+
+    def _groq_client(self):
+        """One lazily-created, reused Groq client (see the retry-loop note)."""
+        import groq
+
+        if self._client is None:
+            self._client = groq.Groq(
+                api_key=self.settings.LLM_API_KEY,
+                # Phase E8 (AI-3): per-call timeout, bounding every one of the
+                # shared call sites uniformly.
+                timeout=self.settings.LLM_TIMEOUT_SECONDS,
+            )
+        return self._client
+
+    @staticmethod
+    def _is_permanent_error(exc: Exception) -> bool:
+        """True for provider errors that retrying cannot fix.
+
+        Detected by HTTP status where the SDK exposes one, so this stays
+        correct without importing provider-specific exception classes.
+        """
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+        if isinstance(status, int) and status in {400, 401, 403, 404, 422}:
+            return True
+        return isinstance(exc, LLMServiceException)
 
     def _record_usage_metrics(self, provider: str, chat) -> None:
         """

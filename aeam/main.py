@@ -18,6 +18,7 @@ from aeam.services.llm_service import LLMService
 import logging
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 import json
 from typing import Any, AsyncIterator
@@ -46,6 +47,12 @@ from aeam.registry.repositories import (
     GraphNodeRepository,
     IncidentApprovalRepository,
     ReviewVerdictRepository,
+    # Phase F7 hardening: required by the METRICS-connector composition
+    # below. Its absence made that block raise NameError into a broad
+    # `except Exception`, so every enabled metrics connector was silently
+    # dropped from CompositeKPISource while connector health still
+    # reported it enabled.
+    SourceRepository,
 )
 from aeam.ingestion.worker import IngestionWorker
 from aeam.ingestion.processor import DocumentIngestJobProcessor
@@ -310,11 +317,22 @@ def _ingest_startup_documents(ingestion_pipeline: IngestionPipeline) -> None:
         text = path.read_text(encoding="utf-8").strip()
         if not text:
             continue
+        # Hardening: this was the frozen literal "2026-07-04". BusinessRelevanceScorer
+        # reads `date` to award its recency bonus, so a hardcoded date meant the
+        # startup runbooks' ranking silently decayed against uploaded documents as
+        # wall-clock time passed — invisibly, because nothing disclosed the value's
+        # provenance. The file's own mtime is a real, self-maintaining fact.
+        try:
+            doc_date = datetime.fromtimestamp(
+                path.stat().st_mtime, tz=timezone.utc
+            ).date().isoformat()
+        except OSError:
+            doc_date = datetime.now(tz=timezone.utc).date().isoformat()
         documents.append({
             "text": text,
             "metadata": {
                 "source": path.name,
-                "date": "2026-07-04",
+                "date": doc_date,
                 "doc_type": "startup_runbook",
                 "doc_id": path.stem,
             },
@@ -368,7 +386,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # --- Startup ---
     logger.info("AEAM starting up …")
 
-    settings = Settings()  # pyright: ignore[reportCallIssue]
+    # Hardening: reuse the SAME Settings instance create_app() already built
+    # and stashed on app.state, instead of constructing a second one. Two
+    # live configuration objects meant SecurityMiddleware (which holds the
+    # create_app instance, and with it the `development` auth bypass) and
+    # every agent/engine (which held this one) could disagree about which
+    # environment the process is in if anything mutated the environment
+    # between the two constructions. One object, one answer. Falls back to a
+    # fresh Settings only if app.state has none, so a caller that builds the
+    # lifespan directly (tests) keeps working unchanged.
+    settings = getattr(app.state, "settings", None)
+    if not isinstance(settings, Settings):
+        settings = Settings()  # pyright: ignore[reportCallIssue]
+        app.state.settings = settings
     logger.info("Settings loaded | environment=%r", settings.ENVIRONMENT)
 
     # Phase E11 (OBS-6): configure OTLP tracing before any investigation can
@@ -809,8 +839,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             _metric_connectors = connector_registry.build_metric_sources(
                 SourceRepository(container.db).list_all()
             )
+        except (NameError, AttributeError, ImportError, TypeError):
+            # Hardening: these four are never an upstream/tenant failure —
+            # they are bugs in this composition root. Letting the broad
+            # handler below absorb them is what allowed the missing
+            # SourceRepository import to silently disable every metrics
+            # connector for an entire release. Re-raised so a wiring bug is
+            # a loud startup failure, which is the only way it gets fixed.
+            raise
         except Exception as exc:  # noqa: BLE001
-            # Connector composition must never block startup.
+            # A genuine upstream failure (unreachable warehouse, bad
+            # credential, malformed source row) must never block startup:
+            # the connector reports zero rows and its health surface says
+            # why, exactly as a connector that fails mid-sync does.
             logger.error("Connector metric composition failed (continuing): %s", exc)
             _metric_connectors = []
     for _connector in _metric_connectors:
@@ -1268,6 +1309,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("IngestionWorker stop signalled.")
     container.db.dispose()
     container.redis.close()
+    # Hardening: the RateLimiter's RedisClient is constructed in create_app()
+    # (it must exist before the container does, because middleware is
+    # registered there) and was never closed — one connection pool leaked per
+    # process lifetime. It is now closed alongside the container's.
+    middleware_redis = getattr(app.state, "middleware_redis", None)
+    if middleware_redis is not None:
+        try:
+            middleware_redis.close()
+            logger.info("Security-middleware RedisClient closed.")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Security-middleware RedisClient close failed: %s", exc)
     logger.info("AEAM shutdown complete.")
 
 
@@ -1473,12 +1525,27 @@ def build_health_payload(container: "AppContainer") -> dict:
             "bm25_index": "unknown",
         }
     }
-    # Check database
-    try:
-        status["checks"]["database"] = "ok"
-    except Exception as e:
+    # Check database.
+    #
+    # Hardening: this check previously assigned "ok" inside a try whose body
+    # was a dict assignment — it could not raise, so the handler was
+    # unreachable and the value unconditional. A fully unreachable database
+    # still reported "healthy", which defeated the orchestrator restart /
+    # de-route decisions this endpoint exists to drive, and the console
+    # StatusBar rendered the same false green. It now issues the cheapest
+    # possible real round-trip through the EXISTING pooled client (no new
+    # connection, no new client) so the answer is measured.
+    db = getattr(container, "db", None)
+    if db is None:
         status["status"] = "degraded"
-        status["checks"]["database"] = f"error: {str(e)}"
+        status["checks"]["database"] = "error: no database client is configured"
+    else:
+        try:
+            db.fetch_one("SELECT 1 AS ok")
+            status["checks"]["database"] = "ok"
+        except Exception as e:  # noqa: BLE001
+            status["status"] = "degraded"
+            status["checks"]["database"] = f"error: {str(e)}"
 
     # Check Redis only if URL is provided
     if container.settings.REDIS_URL:
@@ -1506,13 +1573,27 @@ def build_health_payload(container: "AppContainer") -> dict:
     # discovered, not detected" audit gap. "disabled" (flag off) is
     # reported honestly and never counted against overall health.
     stale_after = container.settings.HEARTBEAT_STALE_SECONDS
+    # Hardening: MonitorAgent beats ONCE PER CYCLE, so its heartbeat is
+    # legitimately as old as one full interval. With the shipped defaults
+    # (HEARTBEAT_STALE_SECONDS=120, MONITOR_INTERVAL_SECONDS=300) the raw
+    # threshold declared a perfectly healthy agent stale for ~60% of every
+    # cycle — and docker-compose.yml defaults ENABLE_MONITOR_AGENT=true, so
+    # `docker compose up` produced a permanently 503 platform (a restart
+    # loop wherever /health is a liveness probe). The interval is therefore
+    # a FLOOR on this agent's threshold: the configured value still wins
+    # whenever it is already generous enough, so an operator who tuned it
+    # up keeps their value (COMPAT-1). The IngestionWorker below is
+    # deliberately left on the raw setting — it polls every 2s, so the
+    # configured threshold is already generous for it.
+    monitor_interval = float(getattr(container.settings, "MONITOR_INTERVAL_SECONDS", 0) or 0)
+    monitor_stale_after = max(float(stale_after), monitor_interval * 2.0 + 30.0)
     if getattr(container, "monitor_agent", None) is None:
         status["checks"]["monitor_agent"] = "disabled (ENABLE_MONITOR_AGENT=false)"
     else:
         age = heartbeat_tracker.age_seconds("monitor")
         if age is None:
             status["checks"]["monitor_agent"] = "starting (no heartbeat yet)"
-        elif age > stale_after:
+        elif age > monitor_stale_after:
             status["status"] = "degraded"
             status["checks"]["monitor_agent"] = f"stale (last heartbeat {age:.0f}s ago)"
         else:
@@ -1616,6 +1697,10 @@ def create_app() -> FastAPI:
     # because container is not yet attached at this point.
     settings = Settings()  # pyright: ignore[reportCallIssue]
     redis_client = RedisClient(redis_url=str(settings.REDIS_URL))
+    # Exposed so the lifespan's shutdown hook can close this pool. It cannot
+    # be the container's client (the container does not exist yet at
+    # middleware-registration time), but it must not leak either.
+    application.state.middleware_redis = redis_client
 
     # Phase E3 (SEC-1/SEC-4): resolve the RS256 public key from
     # SecretManager (env-first, settings-fallback). In non-development

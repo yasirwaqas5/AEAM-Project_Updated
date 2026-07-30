@@ -216,9 +216,27 @@ class _StubRedis:
         return True
 
 
+class _StubDB:
+    """A database that answers the /health liveness probe.
+
+    Hardening pass: build_health_payload() now issues a real `SELECT 1`
+    through the pooled client instead of unconditionally assigning
+    ``checks["database"] = "ok"`` (the old code's try body was a dict
+    assignment, so its handler was unreachable and an unreachable database
+    still reported "healthy"). These tests are about MonitorAgent /
+    IngestionWorker / BM25 supervision, so they need a database that simply
+    answers — otherwise every assertion below would be measuring the new
+    database check instead of the thing under test.
+    """
+
+    def fetch_one(self, *_args, **_kwargs):
+        return {"ok": 1}
+
+
 class _StubContainer:
     def __init__(self, **overrides):
         self.settings = _settings(HEARTBEAT_STALE_SECONDS=2, BM25_STALE_SECONDS=5)
+        self.db = _StubDB()
         self.redis = _StubRedis()
         self.queue = _StubQueue()
         self.monitor_agent = None
@@ -256,7 +274,19 @@ def test_health_payload_flips_degraded_when_monitor_heartbeat_stale():
         tracker._last_seen["monitor"] = time.time() - 100  # 100s ago
 
     container = _StubContainer(monitor_agent=object())
-    container.settings = _settings(HEARTBEAT_STALE_SECONDS=2)  # 100s > 2s => stale
+    # Hardening pass: the monitor's stale threshold is now interval-aware —
+    # max(HEARTBEAT_STALE_SECONDS, 2 * MONITOR_INTERVAL_SECONDS + 30) — because
+    # MonitorAgent beats once per cycle, so its heartbeat is legitimately as
+    # old as one full interval. With the shipped defaults (120 vs 300) the raw
+    # threshold called a healthy agent stale for ~60% of every cycle, and
+    # docker-compose.yml defaults ENABLE_MONITOR_AGENT=true, so `docker compose
+    # up` produced a permanently-503 platform.
+    #
+    # The interval must therefore be stated for a staleness assertion to mean
+    # anything: with a 1s interval the effective threshold is 32s, so a
+    # heartbeat 100s old is genuinely stale — a dead thread, which is exactly
+    # what this test is about.
+    container.settings = _settings(HEARTBEAT_STALE_SECONDS=2, MONITOR_INTERVAL_SECONDS=1)
     payload = build_health_payload(container)
     assert payload["checks"]["monitor_agent"].startswith("stale")
     assert payload["status"] == "degraded"

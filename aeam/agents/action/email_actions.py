@@ -191,12 +191,22 @@ class EmailActions:
             if not (isinstance(resolved[key], str) and resolved[key].strip())
         ]
         if missing:
+            # Hardening: the reason string was "Missing Google Cloud
+            # credentials", which is what the console renders in an incident's
+            # skipped_actions list. An operator reading "email skipped: Missing
+            # Google Cloud credentials" has no way to know WHICH credentials,
+            # and the mention of Google Cloud is actively misleading for what
+            # presents as an SMTP/email failure. The reason now names the
+            # missing keys, so the message is actionable on its own.
             logger.error(
-                "EmailActions.send_email | missing Google Cloud credentials | missing=%s",
+                "EmailActions.send_email | missing email credentials | missing=%s",
                 missing,
             )
             raise ActionConfigurationError(
-                reason="Missing Google Cloud credentials",
+                reason=(
+                    "Email credentials not configured: "
+                    f"{', '.join(sorted(missing))} (resolved via SecretManager)"
+                ),
                 details={"missing": missing},
             )
 

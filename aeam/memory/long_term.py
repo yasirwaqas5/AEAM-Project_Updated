@@ -14,6 +14,19 @@ Two storage backends are supported:
 
 Both clients are dependency-injected, keeping this class decoupled from any
 specific driver, ORM, or connection pool implementation.
+
+**Runtime reality of ``vector_client`` (hardening note).** The composition
+root (``aeam/main.py``) injects a deliberate NO-OP vector client here — a
+small class whose ``upsert`` / ``query`` / ``delete`` all ``pass``. So the
+vector capability this module describes is INERT in the running system, and
+this class's relational path is the only one that persists anything.
+
+That is not a defect: incident vectors are genuinely persisted, by
+:class:`~aeam.memory.enterprise_memory.EnterpriseMemoryEngine`, into its own
+dedicated Qdrant collection (``aeam_incident_memories``) using the same
+embedding model and Qdrant client as document RAG. This note exists because
+the protocol below otherwise reads as a live subsystem, and a reader looking
+for "where are incident embeddings written" would look here and find nothing.
 """
 
 from typing import Any, Protocol, runtime_checkable

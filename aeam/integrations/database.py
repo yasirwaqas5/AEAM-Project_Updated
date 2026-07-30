@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import QueuePool
@@ -93,16 +93,62 @@ class DatabaseClient:
         if not database_url or not database_url.strip():
             raise ValueError("database_url must be a non-empty string.")
 
-        self._engine: Engine = create_engine(
-            database_url,
-            poolclass=QueuePool,
-            pool_size=pool_size,
-            max_overflow=max_overflow,
-            pool_timeout=pool_timeout,
-            pool_recycle=pool_recycle,
+        # Hardening — SQLite concurrency. SQLite is a documented, supported
+        # backend (see this class's docstring and CLAUDE.md), and AEAM is
+        # inherently multi-threaded even in local development: the
+        # IngestionWorker daemon thread, the optional MonitorAgent daemon
+        # thread, and every Starlette request worker all write through this
+        # one client. SQLite's default busy timeout is ZERO, so the first
+        # write-lock contention between AEAM's own threads raised
+        # "database is locked" immediately instead of waiting.
+        #
+        # That was not theoretical: it is the mechanism behind the repository's
+        # one failing test (F4's concurrent-graph-build convergence check),
+        # where a locked read was swallowed into BusinessGraphBuilder's
+        # `skipped_sources` and the build silently produced a partial graph
+        # while still reporting success.
+        #
+        # Both settings below apply ONLY to SQLite. PostgreSQL — the
+        # production backend — is created exactly as before (COMPAT-1).
+        _is_sqlite = database_url.strip().lower().startswith("sqlite")
+        _engine_kwargs: dict[str, Any] = {
+            "poolclass": QueuePool,
+            "pool_size": pool_size,
+            "max_overflow": max_overflow,
+            "pool_timeout": pool_timeout,
+            "pool_recycle": pool_recycle,
             # Echo is intentionally disabled; debugging should use DB-level logs.
-            echo=False,
-        )
+            "echo": False,
+        }
+        if _is_sqlite:
+            _engine_kwargs["connect_args"] = {
+                # Wait for a contended lock instead of failing instantly.
+                # Reuses the already-configured pool timeout so there is one
+                # "how long may a caller wait for the database" number, not two.
+                "timeout": float(pool_timeout),
+                # AEAM shares one client across threads by design; the pool,
+                # not the driver, is what serialises access.
+                "check_same_thread": False,
+            }
+
+        self._engine: Engine = create_engine(database_url, **_engine_kwargs)
+
+        if _is_sqlite:
+            # WAL lets readers proceed during a write, which is what makes an
+            # investigation's reads survive a concurrent ingestion write.
+            # busy_timeout is set per-connection as well as via connect_args
+            # because pysqlite honours the pragma on every pooled connection.
+            @event.listens_for(self._engine, "connect")
+            def _sqlite_pragmas(dbapi_connection, _connection_record):  # noqa: ANN001
+                try:
+                    cursor = dbapi_connection.cursor()
+                    cursor.execute("PRAGMA journal_mode=WAL")
+                    cursor.execute(f"PRAGMA busy_timeout={int(pool_timeout * 1000)}")
+                    cursor.close()
+                except Exception as exc:  # noqa: BLE001
+                    # A pragma failure must never prevent the connection from
+                    # being used — it only means contention is less forgiving.
+                    logger.warning("SQLite pragma setup skipped: %s", exc)
 
         # Ensure required tables exist (development convenience)
         self._create_tables_if_not_exist()

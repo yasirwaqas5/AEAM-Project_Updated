@@ -98,7 +98,7 @@ def get_status(request: Request) -> JSONResponse:
         # Use current UTC time as a live timestamp. When the event queue
         # has pending items it indicates recent activity; when empty the
         # timestamp still reflects system liveness.
-        last_event_time: str = _derive_last_event_time(container)
+        last_event_time: str | None = _derive_last_event_time(container)
 
         # Roster of agents the lifespan actually constructed (Phase E1).
         # Empty-list fallback keeps minimal test apps (no roster attached)
@@ -304,33 +304,47 @@ def _count_unresolved_incidents(container: Any) -> int:
         return 0
 
 
-def _derive_last_event_time(container: Any) -> str:
+def _derive_last_event_time(container: Any) -> str | None:
     """
-    Derive the last event timestamp from the container's event queue.
+    The timestamp of the most recent event AEAM actually processed.
 
-    Checks whether the priority queue holds any pending events. If items
-    are queued, their presence implies recent activity and the current UTC
-    time is returned as the event time proxy. If the queue is empty, the
-    current UTC time is still returned — representing the last known
-    liveness check rather than a stale or null value.
+    Hardening. This used to be derived from ``container.queue.size()`` and
+    then returned ``datetime.now()`` on BOTH branches, so the field reported
+    "just now" on every single call — verified at runtime, where two
+    consecutive requests 1.7s apart returned two timestamps 1.7s apart. It
+    was a liveness indicator structurally incapable of indicating anything,
+    and indistinguishable from a working one.
 
-    This approach avoids storing a separate ``last_event_at`` field in the
-    container while still returning a meaningful, non-null timestamp.
+    The queue it read has had no producer since Phase E1 (MonitorAgent's
+    push was removed) and no consumer, so it is permanently empty; that
+    retention is deliberate (COMPAT-4 keeps the ``queue`` field in this
+    payload and in ``/health``), but deriving a TIMESTAMP from a
+    structurally-zero gauge is not something compatibility justifies.
 
-    Args:
-        container: The ``AppContainer`` from ``request.app.state.container``.
+    The real answer is the newest persisted incident, which is exactly "the
+    last event AEAM processed". The read is index-backed by
+    ``idx_incidents_timestamp`` (Phase E5), so it costs one indexed lookup.
 
     Returns:
-        UTC ISO 8601 timestamp string.
+        UTC ISO 8601 timestamp of the newest incident, or ``None`` when no
+        event has ever been processed. ``None`` is the honest answer for a
+        fresh deployment — a fabricated "now" claimed activity that never
+        happened.
     """
+    db = getattr(container, "db", None)
+    if db is None:
+        return None
     try:
-        queue_size: int = container.queue.size()
-        if queue_size > 0:
-            logger.debug(
-                "_derive_last_event_time | queue has %d item(s) — recent activity",
-                queue_size,
-            )
-    except Exception:  # noqa: BLE001
-        pass
+        row = db.fetch_one(
+            "SELECT timestamp FROM incidents ORDER BY timestamp DESC LIMIT 1"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("_derive_last_event_time | incident read failed: %s", exc)
+        return None
 
-    return datetime.now(tz=timezone.utc).isoformat()
+    if not row:
+        return None
+    value = row.get("timestamp")
+    if value is None:
+        return None
+    return value.isoformat() if isinstance(value, datetime) else str(value)

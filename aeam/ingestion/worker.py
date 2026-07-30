@@ -84,12 +84,16 @@ class IngestionWorker:
 
     Args:
         job_repo:      Repository used to poll for and update jobs.
-        processor:     Callable invoked for each claimed job. Defaults to
-                       :class:`PlaceholderJobProcessor`.
+        processor:     Callable invoked for each claimed job. REQUIRED — there
+                       is deliberately no default (see the hardening note in
+                       ``__init__``); pass
+                       :class:`~aeam.ingestion.routing.RoutingJobProcessor`
+                       for real ingestion.
         poll_interval: Seconds to sleep between polls when the queue is empty.
 
     Raises:
-        ValueError: If ``job_repo`` is ``None`` or ``poll_interval`` <= 0.
+        ValueError: If ``job_repo`` is ``None``, ``processor`` is ``None``, or
+                    ``poll_interval`` <= 0.
     """
 
     def __init__(
@@ -102,8 +106,24 @@ class IngestionWorker:
             raise ValueError("job_repo must not be None.")
         if poll_interval <= 0:
             raise ValueError(f"poll_interval must be > 0. Got: {poll_interval}.")
+        # Hardening: `processor or PlaceholderJobProcessor()` used to be the
+        # default. Any caller that forgot the processor got a worker which
+        # marked every job 100% complete and DONE having extracted nothing,
+        # embedded nothing, and indexed nothing — documents would show as
+        # successfully ingested and be permanently invisible to retrieval.
+        # Silent success is the most expensive failure shape available, and it
+        # must not be what an omitted argument produces. The placeholder is
+        # retained for the B1.2 infrastructure tests that assert its
+        # behaviour, but it now has to be asked for by name.
+        if processor is None:
+            raise ValueError(
+                "processor must be provided. Omitting it previously fell back to "
+                "PlaceholderJobProcessor, which completes jobs without indexing "
+                "anything. Pass RoutingJobProcessor(...) for real ingestion, or "
+                "PlaceholderJobProcessor() explicitly if that is genuinely intended."
+            )
         self._job_repo = job_repo
-        self._processor = processor or PlaceholderJobProcessor()
+        self._processor = processor
         self._poll_interval = poll_interval
         self._stop_event = threading.Event()
         self._processed_count = 0

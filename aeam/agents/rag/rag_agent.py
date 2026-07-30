@@ -479,6 +479,7 @@ class RAGAgent:
             return self._error_result(
                 f"LLM call failed: {exc}",
                 query=query, attempt=attempt, strategy=strategy, threshold=threshold,
+                retrieved_count=len(chunks),
             )
 
         # Step 4b (Phase E8, AI-1): validate_output before this text is
@@ -495,6 +496,7 @@ class RAGAgent:
                 "LLM output failed safety validation (sensitive data pattern detected).",
                 raw_response=raw_response,
                 query=query, attempt=attempt, strategy=strategy, threshold=threshold,
+                retrieved_count=len(chunks),
             )
 
         # Step 5: parse JSON response.
@@ -505,6 +507,7 @@ class RAGAgent:
                 "LLM response could not be parsed as JSON.",
                 raw_response=raw_response,
                 query=query, attempt=attempt, strategy=strategy, threshold=threshold,
+                retrieved_count=len(chunks),
             )
 
         # Step 6: validate.
@@ -521,6 +524,7 @@ class RAGAgent:
                 f"Validation failed: {reason}",
                 raw_response=raw_response,
                 query=query, attempt=attempt, strategy=strategy, threshold=threshold,
+                retrieved_count=len(chunks),
             )
 
         # Step 7: assemble return structure.
@@ -785,6 +789,7 @@ class RAGAgent:
         attempt: int | None = None,
         strategy: str | None = None,
         threshold: float | None = None,
+        retrieved_count: int = 0,
     ) -> dict[str, Any]:
         """
         Build a safe error result that matches the full ``investigate()`` schema.
@@ -796,6 +801,17 @@ class RAGAgent:
             attempt:      Which query attempt (1-3) this was.
             strategy:     Query strategy name ("original"/"rewritten"/"broadened").
             threshold:    Similarity threshold in effect for this pass.
+            retrieved_count: Chunks retrieval ACTUALLY returned before the
+                          failure. Hardening: this used to be hardcoded 0 on
+                          every error path, so a pass that retrieved five
+                          chunks and then hit an LLM failure was persisted as
+                          "retrieved 0" — indistinguishable from a retrieval
+                          that genuinely found nothing, which is a different
+                          fault with a different fix. ``audit_summary``'s
+                          ``evidence_count`` reads this field, so the incident
+                          record claimed no evidence existed when it did.
+                          Defaults to 0 for the paths that fail BEFORE
+                          retrieval, where 0 is the true figure.
 
         Returns:
             Full return dict with safe defaults.
@@ -804,7 +820,7 @@ class RAGAgent:
             "possible_causes":       [],
             "overall_confidence":    0.0,
             "requires_human_review": True,
-            "retrieved_count":       0,
+            "retrieved_count":       retrieved_count,
             "validation_passed":     False,
             "raw_llm_response":      raw_response,
             "error":                 reason,

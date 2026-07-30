@@ -91,6 +91,40 @@ _THREAD_WORKERS: frozenset[str] = frozenset({"monitor", "ingestion"})
 #: one — a quiet platform is not a broken platform.
 _REQUEST_SCOPED: frozenset[str] = frozenset({"planning", "supervisor", "report", "rag", "kpi"})
 
+#: Hardening — roster name → the ``agent_execution_time`` label(s) the
+#: platform ACTUALLY records for that member.
+#:
+#: The roster (Phase E1) names agents; the E11 histogram is labelled by
+#: STAGE. For most members the two coincide, but three did not, and the
+#: Supervisor's exact-label lookup therefore reported them as never having
+#: executed *immediately after they executed* — verified at runtime: a live
+#: investigation recorded ``agent="action:jira"``, ``"action:slack"``,
+#: ``"action:email"`` and ``"kpi_analysis"``, while the Supervisor answered
+#: ``observed=false`` for roster members ``action`` and ``kpi`` and scored
+#: ``agent_activity`` at 4/8 instead of 6/8.
+#:
+#: That is a false negative presented as observed fact, which is precisely
+#: what this agent's "evidence, never invention" contract forbids. Resolving
+#: the alias is not invention: it reads the SAME existing series, and the
+#: label it resolved to is disclosed in the response so the reading stays
+#: traceable to its source.
+_EXECUTION_LABEL_ALIASES: dict[str, tuple[str, ...]] = {
+    # KPIAgent's investigation pass is timed under its stage name.
+    "kpi": ("kpi_analysis",),
+    # The Orchestrator times its own stages, not itself. `decision` is the
+    # one stage no other component records and which runs once per
+    # investigation depth, so it is the Orchestrator's own execution count.
+    "orchestrator": ("decision",),
+}
+
+#: Roster name → label PREFIX, for members recorded as one series per
+#: sub-type. ActionAgent is labelled ``action:<registry_type>``
+#: (``action:jira``, ``action:slack``, ``action:email``), so its execution
+#: count is the sum across those series.
+_EXECUTION_LABEL_PREFIXES: dict[str, str] = {
+    "action": "action:",
+}
+
 #: The observability-summary keys that describe one roster agent's
 #: participation across investigations, so a "this agent contributed to
 #: nothing" observation cites a measured rate rather than an impression.
@@ -137,6 +171,69 @@ def _counter_value(collector: Any, label_key: str, label_value: str) -> float | 
     except Exception as exc:  # noqa: BLE001
         logger.warning("supervisor | metric read failed | %s=%s | %s", label_key, label_value, exc)
         return None
+
+
+def _counter_prefix_total(collector: Any, label_key: str, prefix: str) -> float | None:
+    """Sum every ``_count``/``_total`` series whose label starts with ``prefix``.
+
+    Hardening: ActionAgent is timed as one series per registry type
+    (``action:jira``, ``action:slack``, ``action:email``), so its roster-level
+    execution count is the sum across them. Returns ``None`` when no matching
+    series exists, preserving the "not instrumented" vs "measured zero"
+    distinction the exact-match reader above is careful about.
+    """
+    try:
+        total = 0.0
+        seen = False
+        for metric in collector.collect():
+            for sample in metric.samples:
+                label = sample.labels.get(label_key)
+                if not isinstance(label, str) or not label.startswith(prefix):
+                    continue
+                if sample.name.endswith(("_count", "_total")):
+                    total += float(sample.value)
+                    seen = True
+        return total if seen else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("supervisor | prefix metric read failed | %s* | %s", prefix, exc)
+        return None
+
+
+def _resolve_executions(name: str) -> tuple[float | None, str]:
+    """This roster member's execution count and the label it was read from.
+
+    Resolution order, so the common case stays a plain exact-label read:
+
+    1. the roster name itself (``rag``, ``report``, ``planning``,
+       ``supervisor``, ``forecast`` all record under their own name);
+    2. a declared prefix (``action`` → ``action:*``, summed);
+    3. a declared alias (``kpi`` → ``kpi_analysis``, ``orchestrator`` →
+       ``decision``).
+
+    The returned label is what the caller discloses, so a reader can always
+    go and check the series the number came from.
+    """
+    exact = _counter_value(agent_execution_time, "agent", name)
+    if exact is not None:
+        return exact, name
+
+    prefix = _EXECUTION_LABEL_PREFIXES.get(name)
+    if prefix:
+        total = _counter_prefix_total(agent_execution_time, "agent", prefix)
+        if total is not None:
+            return total, f"{prefix}*"
+
+    for alias in _EXECUTION_LABEL_ALIASES.get(name, ()):
+        value = _counter_value(agent_execution_time, "agent", alias)
+        if value is not None:
+            return value, alias
+
+    # Nothing recorded anywhere. Report the label a reader should look for,
+    # which for an aliased member is the alias rather than the roster name.
+    candidates = (
+        [f"{prefix}*"] if prefix else list(_EXECUTION_LABEL_ALIASES.get(name, ())) or [name]
+    )
+    return None, candidates[0]
 
 
 def _collector_total(collector: Any) -> float | None:
@@ -322,7 +419,7 @@ class SupervisorAgent:
         else:
             heartbeat_state = "stale" if thread_worker else "idle"
 
-        executions = _counter_value(agent_execution_time, "agent", name)
+        executions, execution_label = _resolve_executions(name)
 
         return {
             "agent": name,
@@ -347,9 +444,17 @@ class SupervisorAgent:
             "executions": {
                 "observed": executions is not None,
                 "count": executions,
-                "source": "agent_execution_time_seconds_count (Phase E11)",
+                # The resolved label is disclosed so the figure stays traceable
+                # to the exact series it was read from (see
+                # _EXECUTION_LABEL_ALIASES / _EXECUTION_LABEL_PREFIXES).
+                "source": (
+                    f"agent_execution_time_seconds_count{{agent={execution_label}}} (Phase E11)"
+                ),
                 "reason": None if executions is not None
-                else f"No agent_execution_time series is recorded under agent={name!r}.",
+                else (
+                    f"No agent_execution_time series is recorded under "
+                    f"agent={execution_label}."
+                ),
             },
             "participation": self._participation(name, observability),
         }

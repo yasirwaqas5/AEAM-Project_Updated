@@ -211,7 +211,17 @@ async def upload_file(
     # connector-fetched document travel the SAME path and are therefore
     # indistinguishable afterwards. Behaviour here is unchanged: the same
     # steps, in the same order, with the same dedup rules.
-    submitter = IngestionSubmitter(db=container.db, blob_store=container.blob_store)
+    # Hardening: use the SHARED submitter the lifespan built and describes as
+    # "the ONE ingestion entry point, shared with the upload API". This
+    # endpoint was constructing its own per-request instance, so the shared
+    # object was not in fact shared — identical behaviour today, but any state,
+    # cache, or metric later added to IngestionSubmitter would have silently
+    # applied to connector syncs and not to uploads, which is exactly the
+    # divergence the shared-instance design exists to prevent. Falls back to a
+    # fresh instance when the container has none (a minimal test app).
+    submitter = getattr(container, "ingestion_submitter", None)
+    if submitter is None:
+        submitter = IngestionSubmitter(db=container.db, blob_store=container.blob_store)
     source_id = get_or_create_upload_source(SourceRepository(container.db))
     result = submitter.submit(
         data,

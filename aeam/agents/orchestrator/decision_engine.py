@@ -136,17 +136,38 @@ class DecisionEngine:
 
         Decision is derived solely from ``event.severity``:
 
-        +------------+-------------+-----------+------------+
-        | Severity   | Decision    | Agents    | Confidence |
-        +============+=============+===========+============+
-        | CRITICAL   | INVESTIGATE | [``KPI``] | 0.95       |
-        +------------+-------------+-----------+------------+
-        | HIGH       | INVESTIGATE | [``KPI``] | 0.90       |
-        +------------+-------------+-----------+------------+
-        | MEDIUM     | INVESTIGATE | [``KPI``] | 0.70       |
-        +------------+-------------+-----------+------------+
-        | LOW        | INVESTIGATE | [``KPI``] | 0.70       |
-        +------------+-------------+-----------+------------+
+        +------------+-------------+------------------+------------+
+        | Severity   | Decision    | Agents           | Confidence |
+        +============+=============+==================+============+
+        | CRITICAL   | INVESTIGATE | [``KPI``,``RAG``]| 0.95       |
+        +------------+-------------+------------------+------------+
+        | HIGH       | INVESTIGATE | [``KPI``,``RAG``]| 0.90       |
+        +------------+-------------+------------------+------------+
+        | MEDIUM     | INVESTIGATE | [``KPI``]        | 0.70       |
+        +------------+-------------+------------------+------------+
+        | LOW        | INVESTIGATE | [``KPI``]        | 0.70       |
+        +------------+-------------+------------------+------------+
+
+        **This table was stale and is corrected here.** It previously showed
+        ``[KPI]`` for CRITICAL/HIGH, directly contradicting the dict beneath
+        it, which is how the following two consequences went unnoticed:
+
+        1. ``RAG`` is reachable ONLY at CRITICAL or HIGH. Because
+           ``MonitorAgent._derive_severity`` assigns HIGH only at >= 2
+           detection signals, a SINGLE-SIGNAL autonomous detection is MEDIUM
+           and therefore performs no document retrieval at all: no chunks, no
+           citations, ``validation_status="SKIPPED"``, and a root cause that
+           can only come from ``KPIAgent`` (a statistical characterisation,
+           never a causal claim).
+        2. Because CRITICAL/HIGH return early at ``confidence >= 0.9``, this
+           engine's own LLM augmentation path is reachable ONLY for
+           MEDIUM/LOW at depth > 2 — precisely the severities where RAG is
+           skipped. The two intelligence-escalation paths are mutually
+           exclusive, which is emergent rather than designed.
+
+        Widening RAG below HIGH is a deliberate cost decision (it multiplies
+        retrieval and LLM spend on the highest-volume severity band), so the
+        routing is left as-is and the consequence is documented instead.
 
         Args:
             event: The :class:`~aeam.core.event_models.Event` to decide on.

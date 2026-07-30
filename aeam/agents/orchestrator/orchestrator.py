@@ -836,7 +836,16 @@ class Orchestrator:
                 depth, ctx.incident_id,
             )
             try:
-                llm = LLMService(settings=self._settings)
+                # Hardening: this used to construct its OWN LLMService per pass.
+                # Settings.LLM_TIMEOUT_SECONDS documents that all call sites
+                # "share one LLMService instance, so one setting governs all
+                # six" — they did not, and a per-pass instance also meant this
+                # path could keep hammering a provider the shared client had
+                # already circuit-broken. Reuse the DecisionEngine's injected
+                # client when it is reachable; fall back to a fresh one only if
+                # no shared client exists (a caller that assembled the graph
+                # without one).
+                llm = getattr(self._decision, "_llm", None) or LLMService(settings=self._settings)
 
                 # Build a structured prompt that insists on pure JSON
                 prompt = (
@@ -877,13 +886,60 @@ class Orchestrator:
                         "raw_response": raw,
                     })
                 else:
-                    # Update STM with the LLM output
-                    ctx.stm.set("root_cause", insight.get("root_cause", "Unknown"))
-                    ctx.stm.set("root_cause_source", "llm_reasoning")
-                    ctx.stm.set("confidence", insight.get("confidence", 0.0))
-                    ctx.stm.set("llm_response", raw)
+                    # Hardening (EXPL-1/AI-2 — fabricated traceability).
+                    #
+                    # This block used to write root_cause UNCONDITIONALLY, with
+                    # `insight.get("root_cause", "Unknown")`. Three defects
+                    # followed from that:
+                    #
+                    #   1. It discarded RAG's chunk-cited, guardrail-checked,
+                    #      grounding-VALIDATED cause and replaced it with
+                    #      unvalidated free text. This path passes only
+                    #      parse_llm_json — not validate_output, not
+                    #      RAGResponseValidator — so the LEAST-validated writer
+                    #      won purely by running last.
+                    #   2. root_cause_source flipped to "llm_reasoning" while the
+                    #      persisted chunk_ids still cited the superseded RAG
+                    #      finding, so the audit trail's citations pointed at
+                    #      evidence for a conclusion no longer on the record.
+                    #   3. A response that parsed but omitted the key wrote the
+                    #      literal string "Unknown" over a real grounded cause.
+                    #
+                    # KPIAgent, a few lines away, already encodes the intended
+                    # contract ("write only when nothing better is there").
+                    # This now mirrors it: a real explanation from RAG wins, and
+                    # the LLM's own view is still recorded as its own advisory
+                    # finding so nothing is lost.
+                    llm_root_cause = str(insight.get("root_cause") or "").strip()
+                    existing_root_cause = ctx.stm.get("root_cause")
+                    existing_source = ctx.stm.get("root_cause_source")
 
-                    logger.info("investigate | LLM reasoning stored successfully")
+                    ctx.stm.set("llm_response", raw)
+                    ctx.stm.append("findings", {
+                        "type": "llm_reasoning",
+                        "depth": depth,
+                        "root_cause": llm_root_cause or None,
+                        "confidence": insight.get("confidence"),
+                        "recommended_action": insight.get("recommended_action"),
+                        "superseded_by": existing_source if existing_root_cause else None,
+                    })
+
+                    if llm_root_cause and not existing_root_cause:
+                        ctx.stm.set("root_cause", llm_root_cause)
+                        ctx.stm.set("root_cause_source", "llm_reasoning")
+                        try:
+                            llm_confidence = float(insight.get("confidence") or 0.0)
+                        except (TypeError, ValueError):
+                            llm_confidence = 0.0
+                        existing_confidence = float(ctx.stm.get("confidence") or 0.0)
+                        ctx.stm.set("confidence", round(max(existing_confidence, llm_confidence), 2))
+                        logger.info("investigate | LLM reasoning stored as the root cause")
+                    else:
+                        logger.info(
+                            "investigate | LLM reasoning recorded as advisory only "
+                            "(existing %s root cause retained) | incident_id=%s",
+                            existing_source or "grounded", ctx.incident_id,
+                        )
             except Exception as exc:
                 logger.warning("investigate | LLM reasoning failed: %s", exc)
                 # Keep the KPI Agent's grounded characterisation (already set in _run_kpi_investigation)
@@ -1451,11 +1507,32 @@ class Orchestrator:
         else:
             report = {"detailed_report": "ReportAgent not available."}
 
-        _run_step("email", {
-            "to": ["ops@company.com"],
-            "subject": f"AEAM Incident - {event_data.get('event_type', 'unknown')}",
-            "body": report.get("detailed_report", ""),
-        })
+        # Hardening: the recipient was the hardcoded literal "ops@company.com" —
+        # a registered third-party domain — so a deployment with working SMTP
+        # credentials emailed every finalized incident's full report
+        # off-organization automatically. Recipients are now operator-configured
+        # and the step FAILS CLOSED: unset means the email is not sent at all,
+        # and the skip is recorded with its reason like every other withheld
+        # action. An egress path must never fall back to a default address.
+        report_recipients = [
+            addr.strip()
+            for addr in str(getattr(self._settings, "INCIDENT_REPORT_RECIPIENTS", "") or "").split(",")
+            if addr.strip()
+        ]
+        if report_recipients:
+            _run_step("email", {
+                "to": report_recipients,
+                "subject": f"AEAM Incident - {event_data.get('event_type', 'unknown')}",
+                "body": report.get("detailed_report", ""),
+            })
+        else:
+            skipped_actions.append({
+                "action": "email",
+                "reason": (
+                    "No incident report recipients are configured "
+                    "(INCIDENT_REPORT_RECIPIENTS is empty); email not sent."
+                ),
+            })
 
         # --- Human-approval findings entry (Phase E9). Appended only when
         # the gate actually held something back, so an incident with no

@@ -45,8 +45,24 @@ async def run():
         )
 
         if event:
-            print(f"Multi‑signal anomaly confirmed! Event ID: {event.event_id}")
-            container.event_bus.publish(event)
+            # NOTE: process_kpi() has ALREADY published this event to the
+            # EventBus (see MonitorAgent.process_kpi step 9) and the
+            # Orchestrator has already run a full investigation for it by the
+            # time it returns.
+            #
+            # This script used to call container.event_bus.publish(event) again
+            # here. That second publish bypassed EventDeduplicator entirely
+            # (dedup runs INSIDE process_kpi, before its own publish), so one
+            # simulated anomaly produced two full investigations, two incident
+            # rows, and two sets of REAL external side effects — duplicate
+            # Slack posts, duplicate Jira tickets, duplicate emails
+            # (ActionAgent's idempotency is keyed on incident_id, which
+            # differs between the two investigations, so it did not suppress
+            # them) — plus double LLM spend. The duplicates also skewed every
+            # aggregate computed from the incidents table, including F2
+            # calibration fits and F4 graph edges.
+            print(f"Multi-signal anomaly confirmed! Event ID: {event.event_id}")
+            print("Investigation already completed synchronously via EventBus.")
         else:
             print("No anomaly confirmed (insufficient signals).")
 

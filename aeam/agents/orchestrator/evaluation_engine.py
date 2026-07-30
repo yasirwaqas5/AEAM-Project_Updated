@@ -53,12 +53,53 @@ class EvaluationResult(TypedDict):
 # Each criterion is a (label, score_contribution) pair.
 # Reason strings are hardcoded in the evaluation logic for clarity and
 # to avoid brittle indexing.
+#
+# HARDENING NOTE — the achievable maximum is 0.9, not 1.0.
+#
+# ``action_taken`` is STRUCTURALLY UNREACHABLE in the current lifecycle and
+# has been since Phase 3. ``handle_event`` initialises it to False and
+# nothing writes it again during the investigation loop: actions execute in
+# ``_finalize_incident``, i.e. AFTER evaluation has already concluded, and
+# the outcome is written to the persistence payload
+# (``action_taken=bool(executed_actions)``) rather than back into STM. No
+# correct implementation of the present ordering could set it before
+# scoring, so this is a design residue from a lifecycle where remediation
+# was expected mid-loop — not an omitted write.
+#
+# The consequence is load-bearing and was confirmed against the running
+# system, so it is recorded here rather than left to be rediscovered:
+# reaching the 0.8 STOP threshold requires root_cause (0.4) + >=3 evidence
+# (0.3) + confidence STRICTLY ABOVE 0.8 (0.2). A live investigation that
+# retrieved 5 grounded chunks, passed RAG validation, and reported a
+# chunk-cited root cause at confidence 0.75 therefore scored 0.7, ran to
+# MAX_INVESTIGATION_DEPTH, and was recorded as ESCALATED. Across the
+# platform's whole recorded history this produced
+# ``investigation_success_rate = 0.0`` with 0 resolved of 8 — the platform
+# reporting total failure on work it had in fact performed correctly.
+#
+# This is deliberately NOT "fixed" here. Every available remedy changes
+# WHEN AEAM stops investigating and auto-resolves without a human, which is
+# a product and safety decision (it directly trades human oversight for
+# throughput), not a hardening call: re-weighting the three reachable
+# criteria to total 1.0, or lowering _STOP_THRESHOLD to 0.7, would each
+# make investigations auto-resolve that currently reach a reviewer. Either
+# also invalidates any fitted Phase F2 calibration, because those were fitted
+# against the confidence distribution the current scoring produces.
+# The entry is retained (it costs one always-False check) so the intended
+# four-criterion model stays visible to whoever makes that decision.
 _CRITERIA: list[tuple[str, float]] = [
     ("root_cause",   0.4),
     ("evidence",     0.3),
     ("confidence",   0.2),
+    # Unreachable — see the note above. Retained deliberately, not by oversight.
     ("action_taken", 0.1),
 ]
+
+#: The highest score the current lifecycle can actually produce, given that
+#: ``action_taken`` above can never be True at evaluation time. Stated as a
+#: named constant so a reader comparing a score against 1.0 sees the real
+#: ceiling.
+MAX_ACHIEVABLE_SCORE: float = 0.9
 
 
 class EvaluationEngine:
@@ -179,6 +220,11 @@ class EvaluationEngine:
             )
 
         # --- Criterion 4: action taken ---
+        # Structurally unreachable in the current lifecycle: actions run in
+        # _finalize_incident, after this method has already returned. See the
+        # hardening note on _CRITERIA above — the achievable maximum is
+        # MAX_ACHIEVABLE_SCORE (0.9), and the remedy is a product decision
+        # about auto-resolution, not a code fix.
         if memory.get("action_taken") is True:
             score += 0.1
             reasons.append("Remediation action recorded (+0.1)")
