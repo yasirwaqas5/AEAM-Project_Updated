@@ -1725,7 +1725,7 @@ def create_app() -> FastAPI:
             "Modular monolith for autonomous event detection, "
             "prioritisation, deduplication, and investigation."
         ),
-        version="0.1.0",
+        version="1.0.0",
         lifespan=_lifespan,
         # Disable the default 422 body included in validation errors in prod.
         docs_url="/docs",

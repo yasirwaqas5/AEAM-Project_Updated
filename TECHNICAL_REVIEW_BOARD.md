@@ -55,7 +55,7 @@
 
 **User impact.** An operator enables `CONNECTORS_ENABLED=true` plus `CONNECTOR_SNOWFLAKE_ENABLED=true`, sees the connector reported as `enabled: true` in `GET /api/v1/connectors/health`, watches its document-side sync succeed, and never receives a single KPI row from it. `container.metric_connectors` is permanently `[]`. The only evidence is one `ERROR` line at startup. SAP, Salesforce, Snowflake, and BigQuery — the entire metrics half of the F7 feature set shipped in the most recent commit — are non-functional, and the platform reports the opposite.
 
-**Root cause.** [main.py:810](aeam/main.py:810) calls `SourceRepository(container.db).list_all()`. The name is never imported, assigned, or defined in the module (the `from aeam.registry.repositories import (...)` block at lines 38–49 omits it; confirmed by AST analysis of the module's bindings). It raises `NameError` at call time, which the surrounding `except Exception` on line 812 swallows into a log line and `_metric_connectors = []`. `aeam/api/connectors.py` imports the symbol *locally inside its handlers*, which is why the API surface works and masks the defect.
+**Root cause.** [main.py:810](aeam/main.py#L810) calls `SourceRepository(container.db).list_all()`. The name is never imported, assigned, or defined in the module (the `from aeam.registry.repositories import (...)` block at lines 38–49 omits it; confirmed by AST analysis of the module's bindings). It raises `NameError` at call time, which the surrounding `except Exception` on line 812 swallows into a log line and `_metric_connectors = []`. `aeam/api/connectors.py` imports the symbol *locally inside its handlers*, which is why the API surface works and masks the defect.
 
 The deeper cause is the broad `except Exception` wrapping a **construction-time** block. It was written to absorb upstream connector failures — a legitimate goal — but it also absorbs programming errors in the composition root itself, converting a would-be startup crash into a silent capability loss.
 
@@ -75,7 +75,7 @@ The deeper cause is the broad `except Exception` wrapping a **construction-time*
 
 **User impact.** With Postgres unreachable, `/health` returns `200 {"status": "healthy", "checks": {"database": "ok", ...}}`. Every automated failure-detection mechanism that consumes it is defeated: a load balancer keeps routing to a dead instance, a container orchestrator neither restarts nor rolls back, and the console StatusBar renders a green database indicator sourced directly from this field. Meanwhile every request that touches persistence fails. The platform's primary self-report is confidently wrong in exactly the scenario it exists to catch.
 
-**Root cause.** [main.py:1477](aeam/main.py:1477):
+**Root cause.** [main.py:1477](aeam/main.py#L1477):
 
 ```python
 try:
@@ -103,7 +103,7 @@ The `try` body is a dictionary assignment, which cannot raise. The exception han
 
 **User impact.** `_finalize_incident` unconditionally attempts an email step to a hardcoded recipient list. When SMTP credentials are configured, every finalized incident sends `ReportAgent`'s full detailed report — root cause, evidence, confidence, executed actions, and any free-text the investigation surfaced — to an address at a domain the operator does not control and cannot revoke. Under the deployment's own declared `DATA_CLASSIFICATION=internal` posture, that is an outbound disclosure of internal operational data to an uncontrolled third party, occurring automatically on every incident with no configuration surface to stop it short of removing SMTP credentials entirely.
 
-**Root cause.** [orchestrator.py:1455](aeam/agents/orchestrator/orchestrator.py:1455) passes `{"to": ["ops@company.com"], ...}`. This is placeholder-shaped content that survived into a path with real external side effects. It is currently masked because the repository's `.env` configures no SMTP credentials, so `EmailActions` raises `NonRetryableActionError` and the step is recorded as skipped — the defect is latent behind a missing credential, not behind a flag anyone reviewed.
+**Root cause.** [orchestrator.py:1455](aeam/agents/orchestrator/orchestrator.py#L1455) passes `{"to": ["ops@company.com"], ...}`. This is placeholder-shaped content that survived into a path with real external side effects. It is currently masked because the repository's `.env` configures no SMTP credentials, so `EmailActions` raises `NonRetryableActionError` and the step is recorded as skipped — the defect is latent behind a missing credential, not behind a flag anyone reviewed.
 
 **Should it be fixed?** **Yes.** No email should leave the platform to an address that is not operator-configured.
 
@@ -143,7 +143,7 @@ This is not hypothetical. `docker-compose.yml` sets `ENABLE_MONITOR_AGENT: "${EN
 
 The asymmetry is the core of it. The RAG path passes `validate_output` (sensitive-pattern guardrail), `parse_llm_json`, **and** `RAGResponseValidator.validate` (grounding against retrieved chunks). The depth-≥3 path passes only `parse_llm_json`. **The least-validated writer wins.** `KPIAgent`, sitting a few lines away, demonstrates the intended contract explicitly: `if result.get("root_cause") and not ctx.stm.get("root_cause")`. The LLM path omits that guard.
 
-**Root cause.** [orchestrator.py:881](aeam/agents/orchestrator/orchestrator.py:881) calls `ctx.stm.set("root_cause", ...)` with no precedence check. The stage was added as a last-resort escape hatch for investigations that had found nothing, and the "nothing was found" precondition was never encoded — so it fires whether or not something was found.
+**Root cause.** [orchestrator.py:881](aeam/agents/orchestrator/orchestrator.py#L881) calls `ctx.stm.set("root_cause", ...)` with no precedence check. The stage was added as a last-resort escape hatch for investigations that had found nothing, and the "nothing was found" precondition was never encoded — so it fires whether or not something was found.
 
 **Should it be fixed?** **Yes.** This is the fabricated-traceability defect class the codebase's own Article X language identifies as the worst possible failure in this platform, reachable through a two-line omission.
 
@@ -221,7 +221,7 @@ The consequence that outlasts the demo: duplicated incidents pollute every downs
 
 **User impact.** None today — the composition root always injects a `RoutingJobProcessor`. The exposure is the failure *mode*: any caller that constructs `IngestionWorker` without a processor gets a worker that marks every job **100% complete and `DONE`** with stage text `"placeholder — no extraction/embedding implemented yet (Phase B1.2)"`, having extracted nothing, embedded nothing, and indexed nothing. Documents would show as successfully ingested and be permanently invisible to retrieval. Silent success is the most expensive failure shape available, and it is the default argument.
 
-**Root cause.** [worker.py:106](aeam/ingestion/worker.py:106): `self._processor = processor or PlaceholderJobProcessor()`. A Phase B1.2 infrastructure-only scaffold retained as a convenience default after the real processors arrived.
+**Root cause.** [worker.py:106](aeam/ingestion/worker.py#L106): `self._processor = processor or PlaceholderJobProcessor()`. A Phase B1.2 infrastructure-only scaffold retained as a convenience default after the real processors arrived.
 
 **Should it be fixed?** **Yes.** Make `processor` a required constructor argument and delete the placeholder, or move it under an explicitly-named test double.
 
@@ -261,7 +261,7 @@ Separately, `create_app()`'s `RedisClient` (owned by `RateLimiter`) is never clo
 
 The asymmetry sharpens it: **dataset activation is re-read every monitor cycle and takes effect immediately**, while rule adoption requires a restart. Two governance surfaces in the same console behave oppositely, and neither says so.
 
-**Root cause.** The restart-applied behaviour itself is **Intentional Design** — `PolicyAgent.active_overrides()` is read once at [main.py:852](aeam/main.py:852), deliberately reusing Phase D4's documented restart-applied configuration posture rather than introducing a second live-reload mechanism. That trade-off is defensible. What is missing is *disclosure*: the decision was recorded in a code comment and never surfaced to the operator taking the action.
+**Root cause.** The restart-applied behaviour itself is **Intentional Design** — `PolicyAgent.active_overrides()` is read once at [main.py:852](aeam/main.py#L852), deliberately reusing Phase D4's documented restart-applied configuration posture rather than introducing a second live-reload mechanism. That trade-off is defensible. What is missing is *disclosure*: the decision was recorded in a code comment and never surfaced to the operator taking the action.
 
 **Should it be fixed?** **Optional** — and the board recommends doing it, because the cost is a response field and the alternative is an operator believing a control is active when it is not.
 
@@ -299,13 +299,13 @@ This is outcome-relevant, not cosmetic. An incident with a root cause (+0.4) and
 
 **§13.16B** · Category: **Functional Bug** · Severity: **Low**
 
-**Impact.** [main.py:317](aeam/main.py:317) tags every startup-ingested document with `"date": "2026-07-04"`. `BusinessRelevanceScorer` reads `date` to award a recency bonus (`RETRIEVAL_RECENCY_BONUS` within `RETRIEVAL_RECENCY_WINDOW_DAYS`, default 30). As wall-clock time passes that literal ages, so the startup runbooks' ranking silently decays relative to uploaded documents — and the decay is invisible because nothing reports the value's provenance. **Fix:** Yes — use the file's mtime or the ingestion timestamp. **Wait:** Yes. **Risk:** Low; it changes retrieval ranking for the startup corpus, so re-run the retrieval evaluation harness (`aeam/tests/retrieval_eval.py`). **Dependencies:** none.
+**Impact.** [main.py:317](aeam/main.py#L317) tags every startup-ingested document with `"date": "2026-07-04"`. `BusinessRelevanceScorer` reads `date` to award a recency bonus (`RETRIEVAL_RECENCY_BONUS` within `RETRIEVAL_RECENCY_WINDOW_DAYS`, default 30). As wall-clock time passes that literal ages, so the startup runbooks' ranking silently decays relative to uploaded documents — and the decay is invisible because nothing reports the value's provenance. **Fix:** Yes — use the file's mtime or the ingestion timestamp. **Wait:** Yes. **Risk:** Low; it changes retrieval ranking for the startup corpus, so re-run the retrieval evaluation harness (`aeam/tests/retrieval_eval.py`). **Dependencies:** none.
 
 ### 14. `LongTermMemory`'s vector client is a no-op stub
 
 **§13.4** · Category: **Documentation Issue** · Severity: **Low**
 
-**Impact.** [main.py:405](aeam/main.py:405) injects `_NoOpVectorClient` (all methods `pass`), so `LongTermMemory`'s documented capability — "vector storage to support embedding-based retrieval of historical incidents and decisions" — is inert. Functionally harmless: `EnterpriseMemoryEngine` provides real incident vectors through its own Qdrant collection. The cost is that a reader of `LongTermMemory` or its `VectorClient` protocol believes a subsystem exists that does not. **Fix:** Yes — correct the docstring to state that vector persistence lives in `EnterpriseMemoryEngine`, and consider making the parameter `Optional[...] = None` so the stub class is unnecessary. **Wait:** Yes. **Risk:** Low. **Dependencies:** none.
+**Impact.** [main.py:405](aeam/main.py#L405) injects `_NoOpVectorClient` (all methods `pass`), so `LongTermMemory`'s documented capability — "vector storage to support embedding-based retrieval of historical incidents and decisions" — is inert. Functionally harmless: `EnterpriseMemoryEngine` provides real incident vectors through its own Qdrant collection. The cost is that a reader of `LongTermMemory` or its `VectorClient` protocol believes a subsystem exists that does not. **Fix:** Yes — correct the docstring to state that vector persistence lives in `EnterpriseMemoryEngine`, and consider making the parameter `Optional[...] = None` so the stub class is unnecessary. **Wait:** Yes. **Risk:** Low. **Dependencies:** none.
 
 ### 15. `decisions` table created, never written
 
@@ -317,13 +317,13 @@ This is outcome-relevant, not cosmetic. An incident with a root cause (+0.4) and
 
 **§13.12** · Category: **Documentation Issue** · Severity: **Low**
 
-**Impact.** `publish` dispatches `handlers[event_type] + handlers["*"] + handlers["ALL"]`; `register_handler`'s docstring documents only `"*"`; [main.py:1161](aeam/main.py:1161) uses `"ALL"`. Both work. A developer following the docstring registers under `"*"` and gets correct-but-differently-ordered dispatch relative to the Orchestrator — a subtle ordering surprise in the one place ordering matters. **Fix:** Yes — document both keys and their dispatch order, or converge on one. **Wait:** Yes. **Risk:** Low to document; Medium to converge (touches the sole handler registration and the tests that use `"ALL"`). **Dependencies:** none.
+**Impact.** `publish` dispatches `handlers[event_type] + handlers["*"] + handlers["ALL"]`; `register_handler`'s docstring documents only `"*"`; [main.py:1161](aeam/main.py#L1161) uses `"ALL"`. Both work. A developer following the docstring registers under `"*"` and gets correct-but-differently-ordered dispatch relative to the Orchestrator — a subtle ordering surprise in the one place ordering matters. **Fix:** Yes — document both keys and their dispatch order, or converge on one. **Wait:** Yes. **Risk:** Low to document; Medium to converge (touches the sole handler registration and the tests that use `"ALL"`). **Dependencies:** none.
 
 ### 17. Upload endpoint constructs its own `IngestionSubmitter`
 
 **§13.13** · Category: **Technical Debt** · Severity: **Low**
 
-**Impact.** The lifespan builds `container.ingestion_submitter` and describes it as "the ONE ingestion entry point, shared with the upload API" ([main.py:783](aeam/main.py:783)); the upload endpoint instead constructs a fresh instance per request. Same class, same dependencies, identical behaviour today. The exposure is future: any state, cache, or metric added to `IngestionSubmitter` would apply to connector syncs and silently not to uploads — the exact divergence the shared-instance design exists to prevent. **Fix:** Yes — use `container.ingestion_submitter`. **Wait:** Yes. **Risk:** Low. **Dependencies:** none.
+**Impact.** The lifespan builds `container.ingestion_submitter` and describes it as "the ONE ingestion entry point, shared with the upload API" ([main.py:783](aeam/main.py#L783)); the upload endpoint instead constructs a fresh instance per request. Same class, same dependencies, identical behaviour today. The exposure is future: any state, cache, or metric added to `IngestionSubmitter` would apply to connector syncs and silently not to uploads — the exact divergence the shared-instance design exists to prevent. **Fix:** Yes — use `container.ingestion_submitter`. **Wait:** Yes. **Risk:** Low. **Dependencies:** none.
 
 ### 18. `webhook` and `sheets` action handlers appear in no runbook
 
@@ -335,7 +335,7 @@ This is outcome-relevant, not cosmetic. An incident with a root cause (+0.4) and
 
 **§13.8A** · Category: **Technical Debt** · Severity: **Low**
 
-**Impact.** [orchestrator.py:839](aeam/agents/orchestrator/orchestrator.py:839) instantiates `LLMService(settings=self._settings)` per investigation pass rather than using the injected shared instance. `Settings.LLM_TIMEOUT_SECONDS`'s own documentation asserts that all six call sites "share one LLMService instance, so one setting governs all six" — they do not; this is a seventh. Behaviour is near-equivalent (same `Settings`, module-level metrics collectors, provider check re-runs), but per-instance state such as `LLMService`'s circuit breaker is not shared, so this call path can hammer a failing provider that the shared client has already circuit-broken. **Fix:** Yes — use the injected service. **Wait:** Yes. **Risk:** Low. **Dependencies:** land alongside issue 5 (§13.8B); both edit the same block.
+**Impact.** [orchestrator.py:839](aeam/agents/orchestrator/orchestrator.py#L839) instantiates `LLMService(settings=self._settings)` per investigation pass rather than using the injected shared instance. `Settings.LLM_TIMEOUT_SECONDS`'s own documentation asserts that all six call sites "share one LLMService instance, so one setting governs all six" — they do not; this is a seventh. Behaviour is near-equivalent (same `Settings`, module-level metrics collectors, provider check re-runs), but per-instance state such as `LLMService`'s circuit breaker is not shared, so this call path can hammer a failing provider that the shared client has already circuit-broken. **Fix:** Yes — use the injected service. **Wait:** Yes. **Risk:** Low. **Dependencies:** land alongside issue 5 (§13.8B); both edit the same block.
 
 ---
 
@@ -345,7 +345,7 @@ This is outcome-relevant, not cosmetic. An incident with a root cause (+0.4) and
 
 **§13.3A** · Category: **Intentional Design** · Severity: **Low**
 
-**Verdict: No fix.** The decision is explicit and documented at [main.py:260-265](aeam/main.py:260): a correct, tested primitive whose producer was removed in Phase E1 because it was unbounded and never drained, retained because `/health` and `/api/v1/system/status` report its size and the response field must not disappear (COMPAT-4), with a real consumer expected in the concurrency work. That is a coherent compatibility argument, honestly recorded.
+**Verdict: No fix.** The decision is explicit and documented at [main.py:260-265](aeam/main.py#L260): a correct, tested primitive whose producer was removed in Phase E1 because it was unbounded and never drained, retained because `/health` and `/api/v1/system/status` report its size and the response field must not disappear (COMPAT-4), with a real consumer expected in the concurrency work. That is a coherent compatibility argument, honestly recorded.
 
 **One rider.** The queue stays; `last_event_time` should stop depending on it (issue 8). Retaining a zero-valued field for compatibility is defensible. Deriving a *timestamp* from that zero and reporting it as a measurement is not — the compatibility argument covers the field's existence, not a fabricated value.
 
@@ -353,7 +353,7 @@ This is outcome-relevant, not cosmetic. An incident with a root cause (+0.4) and
 
 **§13.17** · Category: **Intentional Design** · Severity: **Low as designed** / **Critical if misdeployed**
 
-**Verdict: No fix to the behaviour.** It is deliberate, documented in `CLAUDE.md`, warned about in the settings docstrings, and matched by a fail-closed contract everywhere else (non-development startup aborts without real JWT key material; OIDC aborts in every environment if half-configured). `SecurityMiddleware` returning before any check at [security_middleware.py:352](aeam/middleware/security_middleware.py:352) is the intended local-development affordance.
+**Verdict: No fix to the behaviour.** It is deliberate, documented in `CLAUDE.md`, warned about in the settings docstrings, and matched by a fail-closed contract everywhere else (non-development startup aborts without real JWT key material; OIDC aborts in every environment if half-configured). `SecurityMiddleware` returning before any check at [security_middleware.py:352](aeam/middleware/security_middleware.py#L352) is the intended local-development affordance.
 
 **Two riders the board does want on the record.**
 

@@ -220,6 +220,43 @@ function RequireAuth({ children }) {
   return children;
 }
 
+/**
+ * The inverse of RequireAuth: keep an ALREADY-AUTHENTICATED caller off the
+ * sign-in page.
+ *
+ * `/login` was the only route in the table with no guard on it at all, so it
+ * rendered the sign-in form unconditionally — including for a caller who
+ * already held a valid session. In a development posture that is a dead end
+ * you cannot escape by waiting: AuthProvider's boot sequence auto-acquires a
+ * dev token from `/api/v1/auth/dev-token` (verified working: 200, sub=dev-user,
+ * roles=[admin]), so `isAuthenticated` becomes true seconds after load, yet
+ * the page kept asking for a bearer token nobody has to paste. The usual way
+ * in is a transient one: the backend restarts (uvicorn --reload does this
+ * constantly during development), that one boot's dev-token fetch fails,
+ * RequireAuth redirects here, and the URL then STAYS at /login forever because
+ * nothing sends a now-authenticated caller back.
+ *
+ * Production behaviour is unchanged by construction: outside development the
+ * dev-token endpoint 404s, `isAuthenticated` stays false until a real token is
+ * pasted or SSO completes, and this guard falls through to <Login/> exactly as
+ * before. It also honours the `from` location RequireAuth records, so a
+ * deep-link that bounced through here resumes where it was headed instead of
+ * dumping the user on the dashboard.
+ */
+function RedirectIfAuthenticated({ children }) {
+  const { isAuthenticated, booting } = useAuth();
+  const location = useLocation();
+  // Wait for the boot probe rather than flashing the form: `booting` is true
+  // while the dev-token/stored-token check is still in flight.
+  if (booting) return <RouteFallback />;
+  if (isAuthenticated) {
+    const target = location.state?.from?.pathname || "/";
+    // Never bounce back to /login itself (a redirect loop).
+    return <Navigate to={target === "/login" ? "/" : target} replace />;
+  }
+  return children;
+}
+
 function AppRoutes() {
   return (
     <Suspense fallback={<RouteFallback />}>
@@ -267,7 +304,9 @@ export default function App() {
                   <Suspense fallback={<RouteFallback />}><Welcome /></Suspense>
                 } />
                 <Route path="/login" element={
-                  <Suspense fallback={<RouteFallback />}><Login /></Suspense>
+                  <RedirectIfAuthenticated>
+                    <Suspense fallback={<RouteFallback />}><Login /></Suspense>
+                  </RedirectIfAuthenticated>
                 } />
                 {/* Phase E13: the OIDC redirect target. Unauthenticated by
                     necessity — it is where the token arrives — so it sits

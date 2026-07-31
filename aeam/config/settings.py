@@ -959,6 +959,26 @@ class Settings(BaseSettings):
         description="Google Sheets range for KPI data.",
     )
 
+    # --- Deployment-only variables (declared, never read by the app) ---
+
+    POSTGRES_PASSWORD: str = Field(
+        default="",
+        description=(
+            "Release audit (v1.0.0): declared so a verbatim `cp .env.example .env` "
+            "boots. This variable belongs to docker-compose.yml, which requires it "
+            "(`${POSTGRES_PASSWORD:?}`) to build DATABASE_URL and to initialise the "
+            "postgres container. AEAM itself never reads it — the app takes its "
+            "connection string from DATABASE_URL. "
+            "It must be DECLARED here rather than omitted because "
+            "model_config sets extra='forbid': an undeclared key in .env aborts "
+            "startup with a Pydantic ValidationError, which is exactly what the "
+            "documented quick start produced before this field existed. "
+            "Keeping extra='forbid' is deliberate — a typo'd variable name must "
+            "fail loudly rather than be silently ignored — so the correct fix is "
+            "to declare the real variable, not to relax the check."
+        ),
+    )
+
     # --- Incident report delivery ---
 
     INCIDENT_REPORT_RECIPIENTS: str = Field(

@@ -1,4 +1,7 @@
-version: "3.9"
+# Release audit (v1.0.0): the top-level `version:` key was removed. It has been
+# obsolete since Compose v2 and made every `docker compose` invocation print a
+# deprecation warning before doing anything — a poor first impression for a
+# reader following the Quick Start. No behavioural change.
 
 # ============================================================
 # AEAM — local development compose (Phase E4, ARCH-7 / SEC-5)

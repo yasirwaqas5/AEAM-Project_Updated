@@ -24,20 +24,20 @@ Module-level side effects that happen before any lifespan code:
 
 | Order | What | Where |
 |---|---|---|
-| 1 | Logger `aeam` configured | [main.py:157](aeam/main.py:157) via `aeam.monitoring.logging_config.get_logger` |
-| 2 | Prometheus collectors registered (module-level `Counter`/`Gauge`/`Histogram` singletons) | [metrics.py:34-400](aeam/monitoring/metrics.py:34) |
-| 3 | `heartbeat_tracker` singleton created | [metrics.py:571](aeam/monitoring/metrics.py:571) |
-| 4 | `_STARTUP_KNOWLEDGE_DIR = aeam/knowledge/` resolved | [main.py:159](aeam/main.py:159) |
-| 5 | `_FRONTEND_DIST = <repo>/frontend/dist` resolved | [main.py:1701](aeam/main.py:1701) |
+| 1 | Logger `aeam` configured | [main.py:157](aeam/main.py#L157) via `aeam.monitoring.logging_config.get_logger` |
+| 2 | Prometheus collectors registered (module-level `Counter`/`Gauge`/`Histogram` singletons) | [metrics.py:34-400](aeam/monitoring/metrics.py#L34) |
+| 3 | `heartbeat_tracker` singleton created | [metrics.py:571](aeam/monitoring/metrics.py#L571) |
+| 4 | `_STARTUP_KNOWLEDGE_DIR = aeam/knowledge/` resolved | [main.py:159](aeam/main.py#L159) |
+| 5 | `_FRONTEND_DIST = <repo>/frontend/dist` resolved | [main.py:1701](aeam/main.py#L1701) |
 
-### 1.2 `create_app()` — [main.py:1582](aeam/main.py:1582)
+### 1.2 `create_app()` — [main.py:1582](aeam/main.py#L1582)
 
 Runs **synchronously at import**, before the lifespan.
 
 1. `FastAPI(...)` constructed with `lifespan=_lifespan`, `docs_url="/docs"`, `redoc_url="/redoc"`.
 2. **A second `Settings()` is instantiated here** (independent of the lifespan's own). Pydantic `BaseSettings` reads `.env` + environment; `extra="forbid"` means an unknown key in `.env` aborts startup. `ENVIRONMENT` is required and validated against `{development, staging, production, test}`.
 3. **A second `RedisClient` is constructed here** — `create_app` cannot use the container's, because the container does not exist yet. This client is owned by the `RateLimiter` and is never disposed by the shutdown hook (which only closes the container's client).
-4. `_build_jwt_auth(settings)` — [main.py:1295](aeam/main.py:1295):
+4. `_build_jwt_auth(settings)` — [main.py:1295](aeam/main.py#L1295):
    - If `OIDC_ENABLED` → `_build_oidc_jwt_auth`: requires `OIDC_ISSUER` + `OIDC_CLIENT_ID`, performs **OIDC discovery synchronously at startup**, and raises `RuntimeError` (aborting startup, in every environment including development) if issuer/client-id are missing, discovery fails, or no `jwks_uri` can be resolved.
    - Else PEM literal `JWT_PUBLIC_KEY` → else file at `JWT_PUBLIC_KEY_PATH` → else: **abort** unless `ENVIRONMENT == "development"`, in which case the literal placeholder `"dummy-public-key"` is used with a `WARNING`.
 5. `RBAC()`, `RateLimiter(redis_client)`, `AuditLogger(log_file=settings.AUDIT_LOG_FILE)` constructed. The `AuditLogger` is stashed on `app.state.audit_logger` so the lifespan can later attach a DB sink to **the same instance**. `settings` is stashed on `app.state.settings` for the auth router.
@@ -47,7 +47,7 @@ Runs **synchronously at import**, before the lifespan.
 8. `_register_routes(app)` adds `GET /`, `GET /metrics`, `GET /health`.
 9. `_mount_frontend_build(app)`: if `frontend/dist` exists, mounts `/assets` as `StaticFiles` and registers a **catch-all `GET /{full_path:path}` SPA fallback** excluding the prefixes `api/`, `health`, `metrics`, `docs`, `redoc`, `openapi.json`, `internal/`, `favicon.ico`. If `frontend/dist` is absent, this is a silent no-op and `GET /` keeps returning liveness JSON.
 
-### 1.3 `_lifespan()` — [main.py:343](aeam/main.py:343)
+### 1.3 `_lifespan()` — [main.py:343](aeam/main.py#L343)
 
 Runs once when uvicorn starts serving. Strictly ordered; **this order is the dependency graph**.
 
@@ -169,7 +169,7 @@ Runs once when uvicorn starts serving. Strictly ordered; **this order is the dep
 | ASGI request loop | Yes | uvicorn |
 | **IngestionWorker thread** | **Always** | Daemon thread, polls `ingestion_jobs` every `INGEST_WORKER_POLL_SECONDS` (2.0s). Heartbeat key `"ingestion"`. |
 | **MonitorAgent thread** | **Only if `ENABLE_MONITOR_AGENT=true`** | Default is `False`, and the repository's `.env` does not set it → **not running locally**. Daemon thread, `MONITOR_INTERVAL_SECONDS` (300s) between cycles. Heartbeat key `"monitor"`. |
-| Scheduler | **No** | No scheduler exists. Removed in Phase E1; the code documents this explicitly at [main.py:1248](aeam/main.py:1248). |
+| Scheduler | **No** | No scheduler exists. Removed in Phase E1; the code documents this explicitly at [main.py:1248](aeam/main.py#L1248). |
 | Connector sync | **No loop** | Sync is request-triggered only (`POST /api/v1/connectors/sync[/{id}]`). |
 | Graph build | **No loop** | Explicit `POST /api/v1/graph/build` only. No startup build. |
 | Recalibration | **No loop** | Explicit `POST /api/v1/learning/recalibrate` only. |
@@ -183,7 +183,7 @@ Runs once when uvicorn starts serving. Strictly ordered; **this order is the dep
 
 ### 1.6 Health providers
 
-`GET /health` → `build_health_payload(container)` — [main.py:1445](aeam/main.py:1445). Returns `200` when `status == "healthy"`, else `503`.
+`GET /health` → `build_health_payload(container)` — [main.py:1445](aeam/main.py#L1445). Returns `200` when `status == "healthy"`, else `503`.
 
 | Check | Source | Can it degrade overall status? |
 |---|---|---|
@@ -197,7 +197,7 @@ Runs once when uvicorn starts serving. Strictly ordered; **this order is the dep
 
 Note the default-configuration trap: `HEARTBEAT_STALE_SECONDS=120` but `MONITOR_INTERVAL_SECONDS=300`. If MonitorAgent is enabled with defaults, its heartbeat is only refreshed every 300s, so `/health` reports it stale and the platform `degraded` for most of every cycle. The setting's own docstring warns about this; no code enforces the relationship.
 
-Qdrant and LLM reachability are **not** in the payload; the console shows them as explicit `"unknown"` placeholders ([HealthProvider.jsx:100](frontend/src/layout/HealthProvider.jsx:100)).
+Qdrant and LLM reachability are **not** in the payload; the console shows them as explicit `"unknown"` placeholders ([HealthProvider.jsx:100](frontend/src/layout/HealthProvider.jsx#L100)).
 
 ---
 
@@ -418,7 +418,7 @@ EventBus.publish(event)                                  [event_bus.py:121]
   if failures: raise HandlerError(failures)
 ```
 
-### 3.2 `Orchestrator.handle_event` — [orchestrator.py:317](aeam/agents/orchestrator/orchestrator.py:317)
+### 3.2 `Orchestrator.handle_event` — [orchestrator.py:317](aeam/agents/orchestrator/orchestrator.py#L317)
 
 ```
 incident_id = uuid4()                       ← the INVESTIGATION id (not the DB primary key)
@@ -562,7 +562,7 @@ if decision == "STOP" or unrecognised: _finalize_incident(ctx); return
 _evaluate(ctx)
 ```
 
-### 3.4 `_evaluate(ctx)` — [orchestrator.py:893](aeam/agents/orchestrator/orchestrator.py:893)
+### 3.4 `_evaluate(ctx)` — [orchestrator.py:893](aeam/agents/orchestrator/orchestrator.py#L893)
 
 ```
 EvaluationEngine.evaluate(memory=stm)             [evaluation_engine.py:102]
@@ -585,7 +585,7 @@ other     → _finalize_incident(ctx)
 
 The practical ceiling on score without an executed action is `0.4 + 0.3 + 0.2 = 0.9`, so STOP is reachable; but it requires ≥3 evidence entries **and** confidence > 0.8. A KPI-only pass contributes exactly one evidence entry per depth, so a typical no-RAG investigation runs to depth 5 and ESCALATEs.
 
-### 3.5 `_finalize_incident(ctx)` — [orchestrator.py:952](aeam/agents/orchestrator/orchestrator.py:952)
+### 3.5 `_finalize_incident(ctx)` — [orchestrator.py:952](aeam/agents/orchestrator/orchestrator.py#L952)
 
 ```
 if FSM state == COMPLETE: return                  ← idempotency guard
@@ -928,7 +928,7 @@ Enterprise Memory uses the *same two pipeline classes* pointed at a second colle
 
 | Phase | Where | What happens |
 |---|---|---|
-| **Construction** | [main.py:466-485](aeam/main.py:466) | `IngestionPipeline` + `RetrievalPipeline` on `collection="aeam_incident_memories"`, sharing the startup `EmbeddingService` and `QdrantClient`. `similarity_threshold=MEMORY_SIMILARITY_THRESHOLD` (default `None` = no extra filter). |
+| **Construction** | [main.py:466-485](aeam/main.py#L466) | `IngestionPipeline` + `RetrievalPipeline` on `collection="aeam_incident_memories"`, sharing the startup `EmbeddingService` and `QdrantClient`. `similarity_threshold=MEMORY_SIMILARITY_THRESHOLD` (default `None` = no extra filter). |
 | **Write** | `Orchestrator._finalize_incident` → `remember_incident` | One entry per finalized incident, **regardless of outcome** (a FAILED/ESCALATED investigation is still useful memory). Payload: `incident_id, event_type, metric, severity, timestamp, root_cause, confidence, investigation_status, recommended_actions, executed_actions, chunk_ids`. Failure is logged, never raised. |
 | **Quarantine** | Same site | `root_cause_source == "placeholder"` ⇒ **skipped loudly**. Phase F1 deleted the only producer of that marker, so this only fires on re-investigation/replay of pre-F1 records. |
 | **Search** | `Orchestrator._investigate`, memory stage | `recall_similar_incidents(query=RAGAgent._formulate_query(event), exclude_incident_id=<this one>)`. Same query formulation as document RAG and policy matching, so all three search on identical vocabulary. |
@@ -1259,26 +1259,26 @@ Hot-path indexes: `idx_incidents_timestamp`, `idx_metrics_metric_timestamp`, `id
 
 | Flag | Default | This repo's `.env` | Where used | Effect when on |
 |---|---|---|---|---|
-| `ENABLE_MONITOR_AGENT` | `false` | **unset ⇒ off** | [main.py:886](aeam/main.py:886) | Constructs `MonitorAgent` and starts its daemon thread. Sole gate, no environment backdoor. Off ⇒ no autonomous detection at all. |
+| `ENABLE_MONITOR_AGENT` | `false` | **unset ⇒ off** | [main.py:886](aeam/main.py#L886) | Constructs `MonitorAgent` and starts its daemon thread. Sole gate, no environment backdoor. Off ⇒ no autonomous detection at all. |
 | `LLM_ENABLED` | `false` | `true` | `DecisionEngine.should_use_llm`, `_investigate` depth≥3, `LLMService.generate` | Permits real LLM calls |
 | `USE_MOCK_LLM` | `true` | `false` | `LLMService` | On ⇒ fixed mock string, metered `status="mock"` |
 | `KPI_AGENT_ENABLED` | **`true`** | unset ⇒ on | `Orchestrator.__init__` | Real KPI pass. Off records `not_consulted`; it does **not** restore the deleted placeholder |
-| `RAG_HYBRID_ENABLED` | `true` | unset ⇒ on | [main.py:493](aeam/main.py:493) | BM25 index + RRF fusion; also enables in-place lexical refresh after ingestion |
-| `RAG_MULTI_QUERY_ENABLED` | `true` | unset ⇒ on | [main.py:535](aeam/main.py:535) | LLM query expansion + RRF |
-| `RAG_RERANK_ENABLED` | `true` | unset ⇒ on | [main.py:563](aeam/main.py:563) | Cross-encoder rerank of `RAG_RERANK_TOP_N` candidates |
-| `RAG_DIVERSITY_ENABLED` | `true` | unset ⇒ on | [main.py:589](aeam/main.py:589) | Near-duplicate removal + per-document cap |
-| `RAG_ADVANCED_RETRIEVAL_ENABLED` | `true` | unset ⇒ on | [main.py:621](aeam/main.py:621) | Entity extraction, metadata filtering with relaxation, relevance ranking |
+| `RAG_HYBRID_ENABLED` | `true` | unset ⇒ on | [main.py:493](aeam/main.py#L493) | BM25 index + RRF fusion; also enables in-place lexical refresh after ingestion |
+| `RAG_MULTI_QUERY_ENABLED` | `true` | unset ⇒ on | [main.py:535](aeam/main.py#L535) | LLM query expansion + RRF |
+| `RAG_RERANK_ENABLED` | `true` | unset ⇒ on | [main.py:563](aeam/main.py#L563) | Cross-encoder rerank of `RAG_RERANK_TOP_N` candidates |
+| `RAG_DIVERSITY_ENABLED` | `true` | unset ⇒ on | [main.py:589](aeam/main.py#L589) | Near-duplicate removal + per-document cap |
+| `RAG_ADVANCED_RETRIEVAL_ENABLED` | `true` | unset ⇒ on | [main.py:621](aeam/main.py#L621) | Entity extraction, metadata filtering with relaxation, relevance ranking |
 | `POLICY_EXTRACTION_ENABLED` | `true` | unset ⇒ on | `DocumentIngestJobProcessor` | Extra LLM pass per ingested document → `policies` rows |
 | `KNOWLEDGE_CURATION_ENABLED` | `true` | unset ⇒ on | Knowledge curation endpoints | Off ⇒ `503` on curation writes; reads unaffected |
 | `HUMAN_APPROVAL_ENFORCED` | **`true`** | unset ⇒ on | `HumanReviewService.enforced` | Gated steps withheld. **Not in `config_registry`** — cannot be switched off via the admin API |
-| `PLANNING_AGENT_ENABLED` | **`true`** | unset ⇒ on | [main.py:1083](aeam/main.py:1083) | Wraps the C7 engine; output byte-identical either way |
-| `SUPERVISOR_AGENT_ENABLED` | **`true`** | unset ⇒ on | [main.py:1198](aeam/main.py:1198) | Constructs the Supervisor; `/mesh/*` reports real data instead of `supervisor_enabled: false` |
+| `PLANNING_AGENT_ENABLED` | **`true`** | unset ⇒ on | [main.py:1083](aeam/main.py#L1083) | Wraps the C7 engine; output byte-identical either way |
+| `SUPERVISOR_AGENT_ENABLED` | **`true`** | unset ⇒ on | [main.py:1198](aeam/main.py#L1198) | Constructs the Supervisor; `/mesh/*` reports real data instead of `supervisor_enabled: false` |
 | `DETECTION_CHANGEPOINT_ENABLED` | `false` | off | `MonitorAgent.__init__` | Adds `ChangepointDetector` + `statistical:changepoint(...)` signal + `metadata["changepoint"]` |
 | `DETECTION_SEASONAL_HYBRID_ENABLED` | `false` | off | `MonitorAgent.__init__` | Adds `SeasonalHybridDetector` + `statistical:seasonal_residual(...)` |
 | `FORECAST_BACKTEST_ENABLED` | `false` | off | `ForecastAgent.load_or_train` | Holdout backtest + `forecast_backtests` row; with `FORECAST_MAX_HOLDOUT_MAPE > 0` a bad model is **refused** |
 | `FORECAST_MODEL_SELECTION_ENABLED` | `false` | off | `ForecastAgent` | Backtests candidates, lowest MAPE serves (requires backtesting on) |
 | `LEARNING_CALIBRATION_ENABLED` | `false` | off | `Orchestrator.__init__`, finalize | Constructs `LearningAgent`; calibrated confidence with raw retained in `audit_summary.calibration` |
-| `BUSINESS_GRAPH_ENABLED` | `false` | off | [main.py:1012](aeam/main.py:1012) | `GraphCorrelationEngine` constructed → `graph` finding appended; `CrossDatasetAnalyzer` consults the graph. Off ⇒ graph tables inert, read API still honest |
+| `BUSINESS_GRAPH_ENABLED` | `false` | off | [main.py:1012](aeam/main.py#L1012) | `GraphCorrelationEngine` constructed → `graph` finding appended; `CrossDatasetAnalyzer` consults the graph. Off ⇒ graph tables inert, read API still honest |
 | `CONNECTORS_ENABLED` | `false` | off | `ConnectorRegistry.is_enabled` | Master switch for all eight connectors |
 | `CONNECTOR_MOCK_MODE` | `false` | off | `ConnectorRegistry._mock_client_for` | Deterministic in-repo clients; disclosed in health |
 | `CONNECTOR_<KIND>_ENABLED` ×8 | `false` | off | `ConnectorRegistry` | Per-connector enable (requires the master switch) |
@@ -1293,7 +1293,7 @@ Hot-path indexes: `idx_incidents_timestamp`, `idx_metrics_metric_timestamp`, `id
 
 The 21 Phase-D4 fields are `X | None = None`. `None` means *unconfigured*, and the engine's own module constant is used — the literal is never duplicated in `Settings`. `config_registry.py` imports each real default from its owning module and exposes it via `GET /api/v1/admin/config/` (Settings page). **`CONFIG_FIELDS` contains exactly 21 keys** — the memory/policy/cross-dataset/adaptive/retrieval/planning/AI-eval/observability tunables. Every boolean feature flag in the table above is deliberately **not** admin-editable.
 
-`ENVIRONMENT` is the highest-leverage single setting: `development` makes `SecurityMiddleware` return `call_next(request)` before any check ([security_middleware.py:352](aeam/middleware/security_middleware.py:352)) — **all** JWT, RBAC, and rate-limit enforcement is bypassed, and the JWT placeholder key is accepted.
+`ENVIRONMENT` is the highest-leverage single setting: `development` makes `SecurityMiddleware` return `call_next(request)` before any check ([security_middleware.py:352](aeam/middleware/security_middleware.py#L352)) — **all** JWT, RBAC, and rate-limit enforcement is bypassed, and the JWT placeholder key is accepted.
 
 ---
 
@@ -1303,7 +1303,7 @@ Each item below was verified against the code, not inferred.
 
 ### 13.1 Metric connectors can never join the KPI source — `NameError` in the composition root
 
-[main.py:806-820](aeam/main.py:806):
+[main.py:806-820](aeam/main.py#L806):
 
 ```python
 if connector_registry.enabled_kinds():
@@ -1324,7 +1324,7 @@ if connector_registry.enabled_kinds():
 
 ### 13.2 `run_simulation.py` publishes each event twice
 
-`MonitorAgent.process_kpi` already ends with `self._bus.publish(event)` ([monitor_agent.py:443](aeam/agents/monitor/monitor_agent.py:443)). `run_simulation.py` then does:
+`MonitorAgent.process_kpi` already ends with `self._bus.publish(event)` ([monitor_agent.py:443](aeam/agents/monitor/monitor_agent.py#L443)). `run_simulation.py` then does:
 
 ```python
 event = monitor.process_kpi(...)
@@ -1338,17 +1338,17 @@ The script also injects a `DummyForecastAgent` that always returns `is_deviation
 
 ### 13.3 `EventPriorityQueue` is a live object with no producer and no consumer
 
-Constructed at [main.py:267](aeam/main.py:267). `MonitorAgent`'s push was removed in Phase E1; nothing else writes to it and nothing drains it. It survives only because `.size()` is reported by `/health` (`queue: "ok (size=0)"`) and by `GET /api/v1/system/status`, and because `MonitorAgent.__repr__` reads `queue_depth`. The code documents this deliberately ([main.py:260-265](aeam/main.py:260)). It is a permanently-zero gauge that reads as a real queue depth.
+Constructed at [main.py:267](aeam/main.py#L267). `MonitorAgent`'s push was removed in Phase E1; nothing else writes to it and nothing drains it. It survives only because `.size()` is reported by `/health` (`queue: "ok (size=0)"`) and by `GET /api/v1/system/status`, and because `MonitorAgent.__repr__` reads `queue_depth`. The code documents this deliberately ([main.py:260-265](aeam/main.py#L260)). It is a permanently-zero gauge that reads as a real queue depth.
 
 Related: `GET /api/v1/system/status`'s `last_event_time` is derived from that always-empty queue and falls back to "now", so the field never carries a real last-event timestamp.
 
 ### 13.4 `LongTermMemory`'s vector client is a no-op stub
 
-[main.py:405-415](aeam/main.py:405) defines `_NoOpVectorClient` (`upsert`/`query`/`delete` all pass) and injects it. `LongTermMemory`'s entire documented vector-storage capability — "vector storage to support embedding-based retrieval of historical incidents and decisions" — is therefore inert. This is not a defect in practice, because `EnterpriseMemoryEngine` provides real incident vectors via its own Qdrant collection, but the `LongTermMemory` docstring and `VectorClient` protocol describe a capability the running system does not have.
+[main.py:405-415](aeam/main.py#L405) defines `_NoOpVectorClient` (`upsert`/`query`/`delete` all pass) and injects it. `LongTermMemory`'s entire documented vector-storage capability — "vector storage to support embedding-based retrieval of historical incidents and decisions" — is therefore inert. This is not a defect in practice, because `EnterpriseMemoryEngine` provides real incident vectors via its own Qdrant collection, but the `LongTermMemory` docstring and `VectorClient` protocol describe a capability the running system does not have.
 
 ### 13.5 `/health`'s `database` check does not check the database
 
-[main.py:1477-1481](aeam/main.py:1477):
+[main.py:1477-1481](aeam/main.py#L1477):
 
 ```python
 try:
@@ -1364,11 +1364,11 @@ The console's StatusBar renders this value directly as backend/DB status.
 
 ### 13.6 `Settings()` is instantiated three times per startup
 
-Once in `create_app()` ([main.py:1617](aeam/main.py:1617)), once inside `_build_jwt_auth` → `SecretManager(settings=settings)` reuses that one, and once again at the top of `_lifespan` ([main.py:371](aeam/main.py:371)). The lifespan's instance is the one every agent and engine receives; the `create_app` instance is what `SecurityMiddleware` (and thus the `development` bypass) and `app.state.settings` hold. Two independent `RedisClient` instances follow from the same split, and only the container's is closed at shutdown. In practice both `Settings` read the same `.env`, so values agree — but the platform has two configuration objects and two Redis connection pools where the architecture describes one of each.
+Once in `create_app()` ([main.py:1617](aeam/main.py#L1617)), once inside `_build_jwt_auth` → `SecretManager(settings=settings)` reuses that one, and once again at the top of `_lifespan` ([main.py:371](aeam/main.py#L371)). The lifespan's instance is the one every agent and engine receives; the `create_app` instance is what `SecurityMiddleware` (and thus the `development` bypass) and `app.state.settings` hold. Two independent `RedisClient` instances follow from the same split, and only the container's is closed at shutdown. In practice both `Settings` read the same `.env`, so values agree — but the platform has two configuration objects and two Redis connection pools where the architecture describes one of each.
 
 ### 13.7 RAG is unreachable for `MEDIUM` and `LOW` severity, and the docstring says otherwise
 
-`DecisionEngine.apply_priority_rules` ([decision_engine.py:171](aeam/agents/orchestrator/decision_engine.py:171)) maps only `CRITICAL → agents=["KPI","RAG"], 0.95` and `HIGH → ["KPI","RAG"], 0.90`. Everything else falls to `agents=["KPI"], 0.70`. `_investigate` gates the RAG stage on `"RAG" in agents`, so **a `MEDIUM` or `LOW` incident never performs document retrieval** — no chunks, no grounded cause, `validation_status: "SKIPPED"`, and a root cause that can only come from `KPIAgent` (a characterisation, never a causal claim) or from forced LLM reasoning at depth ≥ 3.
+`DecisionEngine.apply_priority_rules` ([decision_engine.py:171](aeam/agents/orchestrator/decision_engine.py#L171)) maps only `CRITICAL → agents=["KPI","RAG"], 0.95` and `HIGH → ["KPI","RAG"], 0.90`. Everything else falls to `agents=["KPI"], 0.70`. `_investigate` gates the RAG stage on `"RAG" in agents`, so **a `MEDIUM` or `LOW` incident never performs document retrieval** — no chunks, no grounded cause, `validation_status: "SKIPPED"`, and a root cause that can only come from `KPIAgent` (a characterisation, never a causal claim) or from forced LLM reasoning at depth ≥ 3.
 
 Two consequences worth naming:
 
@@ -1379,13 +1379,13 @@ Because `CRITICAL`/`HIGH` return at `confidence >= 0.9`, `DecisionEngine`'s own 
 
 ### 13.8 The forced depth-≥3 LLM call constructs its own `LLMService`
 
-[orchestrator.py:839](aeam/agents/orchestrator/orchestrator.py:839): `llm = LLMService(settings=self._settings)` inside `_investigate`. `Settings.LLM_TIMEOUT_SECONDS`'s own documentation states that all six call sites "share one LLMService instance, so one setting governs all six". They do not — this is a seventh, per-investigation-pass instance. Behaviour is largely equivalent (the new instance re-reads the same `Settings`, and the Prometheus collectors are module-level so metering still works), and the provider-support check re-runs. The divergence is architectural, not functional: a per-instance concern such as a circuit-breaker state (`LLMService._check_circuit`) is not shared with the injected client.
+[orchestrator.py:839](aeam/agents/orchestrator/orchestrator.py#L839): `llm = LLMService(settings=self._settings)` inside `_investigate`. `Settings.LLM_TIMEOUT_SECONDS`'s own documentation states that all six call sites "share one LLMService instance, so one setting governs all six". They do not — this is a seventh, per-investigation-pass instance. Behaviour is largely equivalent (the new instance re-reads the same `Settings`, and the Prometheus collectors are module-level so metering still works), and the provider-support check re-runs. The divergence is architectural, not functional: a per-instance concern such as a circuit-breaker state (`LLMService._check_circuit`) is not shared with the injected client.
 
 Note also that this call path writes `root_cause` **unconditionally** from the parsed insight, overwriting a grounded, chunk-cited RAG cause when both are present — `stm.set("root_cause", insight.get("root_cause", "Unknown"))` with no "only if unset" guard, unlike `KPIAgent`'s deliberately deferential write.
 
 ### 13.9 The `action_taken` evaluation criterion can never fire
 
-`EvaluationEngine` awards `+0.1` for `memory.get("action_taken") is True` ([evaluation_engine.py:182](aeam/agents/orchestrator/evaluation_engine.py:182)). `handle_event` initialises `action_taken = False`, and **no code writes it again during the investigation loop** — actions run only in `_finalize_incident`, after evaluation is over, and the result is written to the *persistence payload* (`"action_taken": bool(executed_actions)`) rather than back into STM. The criterion is structurally dead: the maximum achievable evaluation score is 0.9, not 1.0. It does not break STOP (threshold 0.8) but it does mean the documented 4-criterion scoring model is really a 3-criterion one.
+`EvaluationEngine` awards `+0.1` for `memory.get("action_taken") is True` ([evaluation_engine.py:182](aeam/agents/orchestrator/evaluation_engine.py#L182)). `handle_event` initialises `action_taken = False`, and **no code writes it again during the investigation loop** — actions run only in `_finalize_incident`, after evaluation is over, and the result is written to the *persistence payload* (`"action_taken": bool(executed_actions)`) rather than back into STM. The criterion is structurally dead: the maximum achievable evaluation score is 0.9, not 1.0. It does not break STOP (threshold 0.8) but it does mean the documented 4-criterion scoring model is really a 3-criterion one.
 
 ### 13.10 `decisions` table is created and never used
 
@@ -1393,15 +1393,15 @@ Note also that this call path writes `root_cause` **unconditionally** from the p
 
 ### 13.11 `PlaceholderJobProcessor` remains the `IngestionWorker` default
 
-[worker.py:106](aeam/ingestion/worker.py:106): `self._processor = processor or PlaceholderJobProcessor()`. The real composition root always passes a `RoutingJobProcessor`, so the placeholder is unreachable in production — but it is the default for any caller that constructs `IngestionWorker` without a processor, and it marks jobs 100% complete with the stage text `"placeholder — no extraction/embedding implemented yet (Phase B1.2)"`. A job so processed would report success having indexed nothing.
+[worker.py:106](aeam/ingestion/worker.py#L106): `self._processor = processor or PlaceholderJobProcessor()`. The real composition root always passes a `RoutingJobProcessor`, so the placeholder is unreachable in production — but it is the default for any caller that constructs `IngestionWorker` without a processor, and it marks jobs 100% complete with the stage text `"placeholder — no extraction/embedding implemented yet (Phase B1.2)"`. A job so processed would report success having indexed nothing.
 
 ### 13.12 `EventBus` supports two wildcard keys; the docstring documents one
 
-`register_handler`'s docstring says to use `"*"` for a catch-all. `publish` dispatches `handlers[event_type] + handlers["*"] + handlers["ALL"]`, and the composition root registers under `"ALL"` ([main.py:1161](aeam/main.py:1161)). Both work; the documented one is not the one used. A reader following the docstring would register a second catch-all under `"*"` and get correct-but-differently-ordered dispatch.
+`register_handler`'s docstring says to use `"*"` for a catch-all. `publish` dispatches `handlers[event_type] + handlers["*"] + handlers["ALL"]`, and the composition root registers under `"ALL"` ([main.py:1161](aeam/main.py#L1161)). Both work; the documented one is not the one used. A reader following the docstring would register a second catch-all under `"*"` and get correct-but-differently-ordered dispatch.
 
 ### 13.13 `POST /api/v1/ingest/upload` builds its own submitter instead of the container's
 
-The lifespan constructs `container.ingestion_submitter` and hands it to the sync engine as "the ONE ingestion entry point, shared with the upload API" ([main.py:783](aeam/main.py:783)). The upload endpoint instead constructs a fresh `IngestionSubmitter(db=container.db, blob_store=container.blob_store)` per request ([ingest.py](aeam/api/ingest.py)). Same class, same dependencies, identical behaviour — but the shared instance is not in fact shared, so a future stateful change to `IngestionSubmitter` would silently apply to connector syncs and not to uploads.
+The lifespan constructs `container.ingestion_submitter` and hands it to the sync engine as "the ONE ingestion entry point, shared with the upload API" ([main.py:783](aeam/main.py#L783)). The upload endpoint instead constructs a fresh `IngestionSubmitter(db=container.db, blob_store=container.blob_store)` per request ([ingest.py](aeam/api/ingest.py)). Same class, same dependencies, identical behaviour — but the shared instance is not in fact shared, so a future stateful change to `IngestionSubmitter` would silently apply to connector syncs and not to uploads.
 
 ### 13.14 Default `HEARTBEAT_STALE_SECONDS` is shorter than the default monitor interval
 
@@ -1409,12 +1409,12 @@ The lifespan constructs `container.ingestion_submitter` and hands it to the sync
 
 ### 13.15 Adopted compiled rules and extracted-policy overrides require a restart
 
-`PolicyAgent.active_overrides()` is called exactly once, in the lifespan, and merged into the base `RuleEngine`'s config ([main.py:852-864](aeam/main.py:852)). Approving a compiled rule through `POST /api/v1/knowledge/rules/...` writes `compiled_rules` but does **not** change detection until the process restarts. This is a deliberate, documented trade-off (it reuses D4's restart-applied configuration posture) — recorded here because the console's rule-approval flow gives no indication that the approval is not yet in force. By contrast, *dataset activation* is re-read every cycle and does take effect immediately; the two governance surfaces behave differently.
+`PolicyAgent.active_overrides()` is called exactly once, in the lifespan, and merged into the base `RuleEngine`'s config ([main.py:852-864](aeam/main.py#L852)). Approving a compiled rule through `POST /api/v1/knowledge/rules/...` writes `compiled_rules` but does **not** change detection until the process restarts. This is a deliberate, documented trade-off (it reuses D4's restart-applied configuration posture) — recorded here because the console's rule-approval flow gives no indication that the approval is not yet in force. By contrast, *dataset activation* is re-read every cycle and does take effect immediately; the two governance surfaces behave differently.
 
 ### 13.16 Hardcoded values on the outbound path
 
-- Email recipient: `["ops@company.com"]` ([orchestrator.py:1455](aeam/agents/orchestrator/orchestrator.py:1455)) — not configurable.
-- Startup-ingested knowledge documents carry `"date": "2026-07-04"` ([main.py:317](aeam/main.py:317)) — a fixed literal that feeds `BusinessRelevanceScorer`'s recency bonus.
+- Email recipient: `["ops@company.com"]` ([orchestrator.py:1455](aeam/agents/orchestrator/orchestrator.py#L1455)) — not configurable.
+- Startup-ingested knowledge documents carry `"date": "2026-07-04"` ([main.py:317](aeam/main.py#L317)) — a fixed literal that feeds `BusinessRelevanceScorer`'s recency bonus.
 - `webhook` and `sheets` action handlers are registered but appear in no runbook, so they are unreachable from the investigation path.
 
 ### 13.17 `ENVIRONMENT=development` disables all security, and that is the local configuration
