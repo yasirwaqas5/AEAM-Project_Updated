@@ -4,10 +4,11 @@ import {
   PageHeader, Card, CardTitle, Field, Badge, ConfidenceBar,
   Skeleton, Icon, Button, stateColor, deriveStatus, getRetrievedCount, getRecommendedAction,
   fmtTime, fmtRelative, buildMeshLive, getRootCauseSource, rootCauseSourceBadge,
-  getCalibration, CalibrationNote,
+  getCalibration, CalibrationNote, humanizeMetric,
 } from "../components/ui";
 import { PageContainer } from "../components/library";
 import { CountUp, Sparkline, ProgressRing } from "../components/charts";
+import { useHealth } from "../layout/HealthProvider";
 
 const AgentMesh = lazy(() => import("../components/three/AgentMesh"));
 
@@ -105,6 +106,11 @@ export default function Dashboard() {
 
   useEffect(() => { load(); const id = setInterval(load, 30_000); return () => clearInterval(id); }, [load]);
 
+  // The shared /health context (polled every 15s by HealthProvider). Read here
+  // so the Live Architecture panel's Monitor node uses the SAME supervision
+  // signal as the StatusBar rather than inferring activity from incidents.
+  const healthCtx = useHealth();
+
   const systemOk = status?.status === "healthy";
   const sysColor = systemOk ? "var(--ok)" : "var(--err)";
   const latest = incidents[0] || null;
@@ -125,7 +131,14 @@ export default function Dashboard() {
   );
   // Real per-agent activity for the mesh — derived from persisted incidents
   // + observability; never fabricated.
-  const meshLive = useMemo(() => buildMeshLive(incidents, observability), [incidents, observability]);
+  // `checksRaw.monitor_agent` is the same /health string the StatusBar reads,
+  // so the Monitor node and the StatusBar can never disagree about whether the
+  // autonomous watcher is running (they used to: this panel called it "active"
+  // off the back of manually-triggered incidents).
+  const meshLive = useMemo(
+    () => buildMeshLive(incidents, observability, null, healthCtx?.checksRaw?.monitor_agent),
+    [incidents, observability, healthCtx?.checksRaw?.monitor_agent],
+  );
   const investigating = (status?.active_incidents ?? 0) > 0;
 
   return (
@@ -293,12 +306,34 @@ export default function Dashboard() {
           {!loading && !metricsErr && displayedMetrics.length === 0 && <div style={{ color: "var(--muted)", fontSize: "var(--fs-sm)" }}>No metrics available — ensure /metrics is exposed.</div>}
           {!loading && !metricsErr && displayedMetrics.length > 0 && (
             <div>
-              {displayedMetrics.map(([k, v]) => (
-                <div key={k} style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "0.5rem 0", borderBottom: "1px solid var(--border)", fontSize: "var(--fs-sm)" }}>
-                  <span style={{ color: "var(--muted)", fontFamily: "var(--font-mono)", fontSize: "var(--fs-xs)", maxWidth: "70%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{k}</span>
-                  <span style={{ fontFamily: "var(--font-mono)", color: "var(--text)", fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>{typeof v === "number" ? v.toFixed(4) : v}</span>
-                </div>
-              ))}
+              {/* Column headers: the values used to sit in an unlabelled
+                  column, so "0.0264" carried no indication of what it was. */}
+              <div style={{
+                display: "flex", justifyContent: "space-between", padding: "0 0 0.35rem",
+                borderBottom: "1px solid var(--border)", fontSize: "var(--fs-2xs)",
+                color: "var(--faint)", textTransform: "uppercase", letterSpacing: ".06em",
+              }}>
+                <span>Metric</span><span>Value</span>
+              </div>
+              {displayedMetrics.map(([k, v]) => {
+                const m = humanizeMetric(k, v);
+                return (
+                  <div key={k} title={m.raw}
+                    style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12, padding: "0.5rem 0", borderBottom: "1px solid var(--border)", fontSize: "var(--fs-sm)" }}>
+                    <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      <span style={{ color: "var(--text-2)" }}>{m.label}</span>
+                      {m.context && (
+                        <span style={{ color: "var(--faint)", fontFamily: "var(--font-mono)", fontSize: "var(--fs-2xs)", marginLeft: 6 }}>
+                          {m.context}
+                        </span>
+                      )}
+                    </span>
+                    <span style={{ fontFamily: "var(--font-mono)", color: "var(--text)", fontWeight: 600, fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap" }}>
+                      {m.display}
+                    </span>
+                  </div>
+                );
+              })}
             </div>
           )}
         </Card>

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   PageHeader, Card, CardTitle, Badge, Icon, Skeleton,
-  SEVERITY, severityOf, deriveStatus, fmtTime, fmtRelative,
+  SEVERITY, severityOf, deriveStatus, fmtTime, fmtRelative, parseTs, humanizeMetric,
 } from "../components/ui";
 import { PageContainer, MetricCard, Panel, EmptyState, LoadingState, ErrorState, DataTable } from "../components/library";
 import { BarTrend, SegmentBar } from "../components/charts";
@@ -80,7 +80,15 @@ async function fetchObservability() {
 
 function TrendBarChart({ buckets }) {
   if (!buckets.length) return <EmptyState icon="target" title="No incident history yet" tone="muted" />;
-  return <BarTrend buckets={buckets} color="var(--accent)" height={150} valueLabel="incidents" />;
+  return (
+    <BarTrend
+      buckets={buckets}
+      color="var(--accent)"
+      height={150}
+      valueLabel="incidents"
+      caption={bucketMonthCaption(buckets)}
+    />
+  );
 }
 
 function DistributionBar({ segments, total }) {
@@ -95,16 +103,48 @@ function bucketByDay(incidents, days = 14) {
   const now = new Date();
   for (let i = days - 1; i >= 0; i--) {
     const d = new Date(now); d.setDate(d.getDate() - i); d.setHours(0, 0, 0, 0);
-    buckets.push({ date: d, label: `${d.getMonth() + 1}/${d.getDate()}`, count: 0 });
+    buckets.push({
+      date: d,
+      key: d.toISOString().slice(0, 10),
+      // Axis label is the day number alone. It used to be "M/D" ("7/30"),
+      // which at 14 buckets did not fit the column width and was ellipsised
+      // to an unreadable stub — the month now lives once in the caption.
+      label: String(d.getDate()),
+      // Full date for the hover readout, where there IS room to be explicit.
+      tooltip: d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }),
+      count: 0,
+    });
   }
   for (const inc of incidents) {
-    const t = new Date(inc.timestamp);
-    if (isNaN(t)) continue;
-    t.setHours(0, 0, 0, 0);
-    const bucket = buckets.find((b) => b.date.getTime() === t.getTime());
+    // parseTs, not new Date: incidents.timestamp carries its UTC offset, but
+    // routing every timestamp through one parser keeps this bucketing correct
+    // if the column shape ever changes (see parseTs's note on zone-less
+    // SQL timestamps).
+    const t = parseTs(inc.timestamp);
+    if (!t) continue;
+    const local = new Date(t); local.setHours(0, 0, 0, 0);
+    const bucket = buckets.find((b) => b.date.getTime() === local.getTime());
     if (bucket) bucket.count += 1;
   }
   return buckets;
+}
+
+/** "Jul 2026" or "Jul 2026 – Aug 2026" — the month(s) a date-bucketed window spans.
+ *
+ * Returns null for bucket sets that carry no dates. BarTrend is shared with
+ * `trendToBuckets`, which emits positional {label, count} buckets (1..9) for
+ * the observability trend sparklines — those have no `date`, and assuming one
+ * here crashed the whole Analytics page through the error boundary.
+ */
+function bucketMonthCaption(buckets) {
+  if (!buckets?.length) return null;
+  const first = buckets[0]?.date;
+  const last = buckets[buckets.length - 1]?.date;
+  if (!(first instanceof Date) || !(last instanceof Date)) return null;
+  const fmt = (d) => d.toLocaleDateString(undefined, { month: "short", year: "numeric" });
+  const a = fmt(first);
+  const b = fmt(last);
+  return a === b ? a : `${a} – ${b}`;
 }
 
 function statusDistribution(incidents) {
@@ -469,12 +509,25 @@ export default function Analytics() {
             <EmptyState icon="activity" title="No matching series yet" tone="muted" />
           ) : (
             <div>
-              {promHighlights.map(([k, v]) => (
-                <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "0.45rem 0", borderBottom: "1px solid var(--border)" }}>
-                  <span style={{ fontSize: "0.72rem", color: "var(--muted)", fontFamily: "var(--font-mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "70%" }}>{k}</span>
-                  <span style={{ fontSize: "0.78rem", fontFamily: "var(--font-mono)", color: "var(--text)", fontWeight: 600 }}>{v.toFixed(2)}</span>
-                </div>
-              ))}
+              <div style={{
+                display: "flex", justifyContent: "space-between", padding: "0 0 0.3rem",
+                borderBottom: "1px solid var(--border)", fontSize: "var(--fs-2xs)",
+                color: "var(--faint)", textTransform: "uppercase", letterSpacing: ".06em",
+              }}>
+                <span>Metric</span><span>Value</span>
+              </div>
+              {promHighlights.map(([k, v]) => {
+                const m = humanizeMetric(k, v);
+                return (
+                  <div key={k} title={m.raw} style={{ display: "flex", justifyContent: "space-between", gap: 12, padding: "0.45rem 0", borderBottom: "1px solid var(--border)" }}>
+                    <span style={{ fontSize: "0.72rem", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      <span style={{ color: "var(--text-2)" }}>{m.label}</span>
+                      {m.context && <span style={{ color: "var(--faint)", fontFamily: "var(--font-mono)", marginLeft: 6 }}>{m.context}</span>}
+                    </span>
+                    <span style={{ fontSize: "0.78rem", fontFamily: "var(--font-mono)", color: "var(--text)", fontWeight: 600, whiteSpace: "nowrap" }}>{m.display}</span>
+                  </div>
+                );
+              })}
             </div>
           )}
         </Panel>

@@ -110,7 +110,27 @@ function RetrievalSummary({ incident }) {
 function EvidenceCard({ item }) {
   const chunkId = item.chunk_id ?? "unknown";
   const shortId = chunkId.length > 16 ? `${chunkId.slice(0, 14)}…` : chunkId;
-  const simPct = item.similarity != null ? Math.round((item.similarity <= 1 ? item.similarity * 100 : item.similarity)) : null;
+
+  // Similarity, honestly.
+  //
+  // The hybrid pipeline sets `similarity = 0.0` for any chunk it cannot
+  // attribute a dense cosine to (a BM25-only hit, or one whose cosine was
+  // dropped during multi-query RRF re-fusion) — deliberate, and documented in
+  // hybrid_retrieval._finalize. But the card rendered that as a red
+  // "similarity 0%" badge, which reads as "this evidence matched nothing"
+  // when the chunk was in fact selected, ranked, cited by the LLM at 80%
+  // confidence, and scored 1.00 on business relevance.
+  //
+  // A missing measurement is not a zero measurement. Prefer the real dense
+  // score when one survived; otherwise say the score is unavailable and let
+  // the ranking signals that DID decide the ordering (rerank / business
+  // relevance / confidence) speak for the chunk.
+  const rawSim = item.dense_similarity ?? item.similarity;
+  const hasSim = rawSim != null && Number(rawSim) > 0;
+  const simPct = hasSim ? Math.round(rawSim <= 1 ? rawSim * 100 : rawSim) : null;
+  const relPct = item.business_relevance_score != null
+    ? Math.round(item.business_relevance_score <= 1 ? item.business_relevance_score * 100 : item.business_relevance_score)
+    : null;
 
   return (
     <div style={{
@@ -129,7 +149,20 @@ function EvidenceCard({ item }) {
           }}>{shortId}</span>
         </div>
         <div style={{ display: "flex", gap: "0.4rem", flexWrap: "wrap" }}>
-          {simPct != null && <Badge label={`similarity ${simPct}%`} color={scoreColor(simPct)} />}
+          {simPct != null
+            ? <Badge label={`similarity ${simPct}%`} color={scoreColor(simPct)} />
+            : <span
+                title={
+                  "No dense cosine survived for this chunk — it was retrieved lexically (BM25) " +
+                  "or its cosine was dropped during multi-query fusion. It was still ranked and " +
+                  "selected; the scores that decided its place are shown alongside."
+                }
+                style={{
+                  fontSize: "var(--fs-2xs)", color: "var(--faint)", fontFamily: "var(--font-mono)",
+                  border: "1px dashed var(--border)", borderRadius: 5, padding: "1px 6px",
+                }}
+              >similarity n/a</span>}
+          {relPct != null && <Badge label={`relevance ${relPct}%`} color={scoreColor(relPct)} />}
           {item.confidence != null && <Badge label={`confidence ${fmtPct(item.confidence)}`} color={scoreColor(item.confidence <= 1 ? item.confidence * 100 : item.confidence)} />}
         </div>
       </div>

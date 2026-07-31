@@ -38,6 +38,13 @@ function normalize(raw) {
   if (v === "healthy") return "ok";
   if (v === "degraded") return "degraded";
   if (v.startsWith("error")) return "error";
+  // Hardening pass — the qdrant/llm forms added to /health.
+  // "mock" is a real, deliberate posture, not a fault: it renders as a
+  // distinct pending state so an operator can see at a glance that the
+  // platform is answering from a stub rather than a provider.
+  if (v.startsWith("mock")) return "pending";
+  if (v.startsWith("unreachable") || v.startsWith("misconfigured")) return "error";
+  if (v.startsWith("not configured")) return "disabled";
   return "unknown";
 }
 
@@ -97,8 +104,13 @@ export function HealthProvider({ children }) {
       monitor:    reachable ? normalize(checks.monitor_agent) : "unknown",
       ingestion:  reachable ? normalize(checks.ingestion_worker) : "unknown",
       bm25:       reachable ? normalize(checks.bm25_index) : "unknown",
-      qdrant:   "unknown", // not reported by /health — honest placeholder
-      llm:      "unknown", // not reported by /health — honest placeholder
+      // Both are now really reported by /health (hardening pass). They were
+      // hardcoded "unknown" placeholders because the backend did not expose
+      // them — which meant an unreachable Qdrant (retrieval silently returns
+      // nothing) and an expired LLM key (every investigation fails) both
+      // rendered as a permanent grey "n/a" next to healthy-looking lights.
+      qdrant:   reachable ? normalize(checks.qdrant) : "unknown",
+      llm:      reachable ? normalize(checks.llm) : "unknown",
     },
     // Raw text (e.g. "stale (last heartbeat 130s ago)") for tooltips.
     checksRaw: checks,

@@ -81,10 +81,50 @@ def _require_mutable_activation(container: Any):
 
 @router.get("/activation", summary="List currently activated dataset ids")
 def get_activation(request: Request) -> JSONResponse:
+    """
+    The activated dataset ids, reconciled against the dataset registry.
+
+    Hardening: activation lives in Redis (``aeam:activated_datasets``) and the
+    registry lives in Postgres, and nothing kept them in step. Deleting a
+    dataset left its id activated forever — observed live as a console
+    reporting "Activated for Monitoring: 2" directly beside "Registered
+    Datasets: 0", with MonitorAgent still asking a `DatasetKPISource` for two
+    datasets that no longer exist (it returns no rows, so the symptom is a
+    silently dead KPI feed rather than an error).
+
+    ``activated_dataset_ids`` is unchanged for existing callers. The two
+    additive fields state which of those ids are real and which are orphans,
+    so the console can show the true monitored count instead of the raw set
+    size.
+    """
     container = request.app.state.container
     activation = getattr(container, "dataset_activation", None)
     ids = activation.list_activated_dataset_ids() if activation is not None else []
-    return JSONResponse(status_code=200, content={"activated_dataset_ids": ids})
+
+    live: list[str] = []
+    orphaned: list[str] = []
+    db = getattr(container, "db", None)
+    if db is None:
+        live = list(ids)
+    else:
+        repo = DatasetRepository(db)
+        for dataset_id in ids:
+            try:
+                exists = repo.get(dataset_id) is not None
+            except Exception:  # noqa: BLE001
+                exists = True  # a read failure must not label a real dataset an orphan
+            (live if exists else orphaned).append(dataset_id)
+
+    return JSONResponse(status_code=200, content={
+        "activated_dataset_ids": ids,
+        "live_dataset_ids": live,
+        "orphaned_dataset_ids": orphaned,
+        "orphaned_note": (
+            "These ids are activated but no longer exist in the dataset registry "
+            "(the dataset was deleted while activated). They contribute no KPI "
+            "rows. POST /datasets/{id}/deactivate clears one."
+        ) if orphaned else None,
+    })
 
 
 @router.post("/datasets/{dataset_id}/activate", summary="Activate a dataset for monitoring")
@@ -104,9 +144,18 @@ def activate_dataset(request: Request, dataset_id: str) -> JSONResponse:
 
 @router.post("/datasets/{dataset_id}/deactivate", summary="Deactivate a dataset from monitoring")
 def deactivate_dataset(request: Request, dataset_id: str) -> JSONResponse:
-    """Mark ``dataset_id`` as deactivated. See :func:`activate_dataset` for timing."""
+    """Mark ``dataset_id`` as deactivated. See :func:`activate_dataset` for timing.
+
+    Hardening: this used to call ``_get_dataset_or_404`` first, which made an
+    ORPHANED activation permanently unclearable — the one case where
+    deactivation matters most. Deleting an activated dataset removed the
+    registry row but left the Redis entry, and every attempt to clean it up
+    then 404'd because the dataset it named no longer existed. Deactivating is
+    a pure removal from a set; it does not need its subject to exist.
+    ``activate`` still validates, because activating an id that does not exist
+    would create exactly the orphan this fixes.
+    """
     container = request.app.state.container
-    _get_dataset_or_404(container, dataset_id)
     activation = _require_mutable_activation(container)
     activation.deactivate(dataset_id)
     logger.info("deactivate_dataset | dataset_id=%s", dataset_id)

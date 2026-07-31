@@ -212,7 +212,59 @@ def test_activation_list_empty_by_default(client):
     tc, _ = client
     r = tc.get("/api/v1/data-center/activation")
     assert r.status_code == 200
-    assert r.json() == {"activated_dataset_ids": []}
+    body = r.json()
+    # The original contract, unchanged.
+    assert body["activated_dataset_ids"] == []
+    # Hardening pass added reconciliation fields (activation lives in Redis,
+    # the registry in Postgres, and nothing kept them in step — a deleted
+    # dataset stayed activated forever). Asserted by key rather than by whole-
+    # dict equality, matching the repo's additive-field convention: a reader
+    # that ignores unknown keys must keep working.
+    assert body["live_dataset_ids"] == []
+    assert body["orphaned_dataset_ids"] == []
+
+
+def test_activation_list_flags_orphaned_datasets(client, db):
+    """A dataset deleted while activated must be reported as an orphan.
+
+    Observed live: the console showed "Activated for Monitoring: 2" beside
+    "Registered Datasets: 0", and MonitorAgent kept asking DatasetKPISource
+    for two datasets that no longer existed (yielding no rows, so the symptom
+    was a silently dead KPI feed rather than an error).
+    """
+    tc, _ = client
+    dataset_id = _seed_dataset(db)
+    assert tc.post(f"/api/v1/data-center/datasets/{dataset_id}/activate").status_code == 200
+
+    body = tc.get("/api/v1/data-center/activation").json()
+    assert body["live_dataset_ids"] == [dataset_id]
+    assert body["orphaned_dataset_ids"] == []
+
+    db.execute("DELETE FROM datasets WHERE dataset_id = :i", {"i": dataset_id})
+
+    body = tc.get("/api/v1/data-center/activation").json()
+    assert body["activated_dataset_ids"] == [dataset_id]
+    assert body["live_dataset_ids"] == []
+    assert body["orphaned_dataset_ids"] == [dataset_id]
+    assert body["orphaned_note"]
+
+
+def test_orphaned_activation_can_be_deactivated(client, db):
+    """Deactivating must not require the dataset to still exist.
+
+    This 404'd before the hardening pass (deactivate called
+    _get_dataset_or_404 first), which made an orphaned activation permanently
+    unclearable — the one case where deactivation matters most.
+    """
+    tc, _ = client
+    dataset_id = _seed_dataset(db)
+    tc.post(f"/api/v1/data-center/datasets/{dataset_id}/activate")
+    db.execute("DELETE FROM datasets WHERE dataset_id = :i", {"i": dataset_id})
+
+    r = tc.post(f"/api/v1/data-center/datasets/{dataset_id}/deactivate")
+    assert r.status_code == 200
+    assert r.json() == {"dataset_id": dataset_id, "activated": False}
+    assert tc.get("/api/v1/data-center/activation").json()["activated_dataset_ids"] == []
 
 
 def test_activate_and_deactivate_dataset(client, db):

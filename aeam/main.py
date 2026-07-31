@@ -1523,6 +1523,18 @@ def build_health_payload(container: "AppContainer") -> dict:
             "monitor_agent": "unknown",
             "ingestion_worker": "unknown",
             "bm25_index": "unknown",
+            # Hardening: Qdrant and the LLM were the two dependencies the
+            # platform actually depends on for RAG and never reported, so the
+            # console's StatusBar rendered a permanent "n/a" for both while
+            # every other dependency showed a real light. An unreachable
+            # Qdrant meant retrieval silently returned nothing; an expired LLM
+            # key meant every investigation failed — and /health said
+            # "healthy" through both. They are reported here, but
+            # INFORMATIONALLY: both degrade investigation QUALITY, not
+            # platform availability, so neither flips overall status (the same
+            # contract bm25_index already follows).
+            "qdrant": "unknown",
+            "llm": "unknown",
         }
     }
     # Check database.
@@ -1651,6 +1663,36 @@ def build_health_payload(container: "AppContainer") -> dict:
             status["checks"]["bm25_index"] = (
                 f"ok (built {bm25_age:.0f}s ago, {bm25_index.size} docs)"
             )
+
+    # Qdrant (RAG corpus + Enterprise Memory). Informational: an unreachable
+    # vector store degrades retrieval to nothing, but the platform still
+    # serves, ingests, and investigates — so this is disclosed, never a 503.
+    qdrant_client = getattr(container, "qdrant_client", None)
+    if qdrant_client is None:
+        status["checks"]["qdrant"] = "not configured"
+    else:
+        try:
+            collections = qdrant_client.get_collections().collections
+            names = sorted(getattr(c, "name", "?") for c in collections)
+            status["checks"]["qdrant"] = f"ok ({len(names)} collection(s): {', '.join(names)})"
+        except Exception as exc:  # noqa: BLE001
+            status["checks"]["qdrant"] = f"unreachable: {exc}"
+
+    # LLM posture. Deliberately does NOT make a provider call — a health probe
+    # that spends tokens on every poll is its own defect. It reports the
+    # configured posture, which is what an operator actually needs to see
+    # (mock vs real, and whether a key exists at all).
+    settings = container.settings
+    if not getattr(settings, "LLM_ENABLED", False):
+        status["checks"]["llm"] = "disabled (LLM_ENABLED=false)"
+    elif getattr(settings, "USE_MOCK_LLM", True):
+        status["checks"]["llm"] = "mock (USE_MOCK_LLM=true — no real provider call)"
+    elif not str(getattr(settings, "LLM_API_KEY", "") or "").strip():
+        status["checks"]["llm"] = "misconfigured: LLM_ENABLED=true but LLM_API_KEY is empty"
+    else:
+        provider = getattr(settings, "LLM_PROVIDER", "?")
+        model = str(getattr(settings, "LLM_MODEL", "") or "").strip() or "llama-3.1-8b-instant"
+        status["checks"]["llm"] = f"ok (provider={provider}, model={model}, key configured)"
 
     return status
 

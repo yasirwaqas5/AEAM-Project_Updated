@@ -44,18 +44,35 @@ const prefersReduced = () =>
   window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
 function layout(radius) {
-  // A nearly-flat circle; the scene's base tilt (see MeshScene) presents it
-  // as a clean ellipse so nodes and labels distribute around the ring
-  // instead of stacking vertically.
+  // TWO INTERLEAVED TIERS, not one flat ring.
+  //
+  // Every node used to sit on a single nearly-flat circle at one radius. With
+  // 14 engines that puts ~26° between neighbours, and once the ring is
+  // projected to screen space the nodes near the left and right extremes
+  // converge — so their HTML labels (which are full agent names, not dots)
+  // overlapped into an unreadable pile, while the panel's vertical space sat
+  // empty above and below the ellipse.
+  //
+  // Alternating nodes between an inner and an outer ring, each lifted to its
+  // own height band and offset by half an angular step, doubles the effective
+  // separation between any two adjacent labels and spends the vertical room
+  // the flat ring was wasting. Purely presentational: same nodes, same order,
+  // same edges to the core.
+  const n = ENGINES.length;
+  const step = (Math.PI * 2) / n;
   return ENGINES.map((e, i) => {
-    const a = (i / ENGINES.length) * Math.PI * 2;
+    const outer = i % 2 === 0;
+    // Half-step offset on the inner tier so the two rings interleave rather
+    // than sitting radially in line with each other.
+    const a = i * step + (outer ? 0 : step * 0.5);
+    const r = radius * (outer ? 1.12 : 0.74);
+    // Two height bands, with a gentle wave inside each so a tier never reads
+    // as a hard flat disc.
+    const band = outer ? radius * 0.26 : radius * -0.24;
+    const wave = Math.sin(a * 2.0) * radius * 0.06;
     return {
       ...e,
-      pos: new THREE.Vector3(
-        Math.cos(a) * radius,
-        Math.sin(a * 2.0) * radius * 0.09,
-        Math.sin(a) * radius,
-      ),
+      pos: new THREE.Vector3(Math.cos(a) * r, band + wave, Math.sin(a) * r),
     };
   });
 }
@@ -297,7 +314,10 @@ export default function AgentMesh({ health = null, variant = "dashboard", height
       <div style={{ height, position: "relative" }} aria-label="AEAM agent mesh — live architecture map" role="img">
         <Canvas
           dpr={[1, 1.75]}
-          camera={{ position: [0, 0.55, welcome ? 5.7 : 5.2], fov: 44 }}
+          // Pulled back slightly and lifted: the two-tier layout (see layout())
+          // is taller and wider than the old flat ring, so the outer tier's
+          // labels needed the extra frame to stay inside the panel.
+          camera={{ position: [0, 0.9, welcome ? 6.5 : 6.0], fov: 44 }}
           gl={{ antialias: true, alpha: true, powerPreference: "high-performance" }}
           frameloop={animate ? "always" : "demand"}
           style={{ background: "transparent" }}

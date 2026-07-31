@@ -39,24 +39,100 @@ export function stateColor(key) {
 
 // ─── Formatters ─────────────────────────────────────────────────────────────
 
+/**
+ * Parse a backend timestamp, treating a zone-less value as UTC.
+ *
+ * Every timestamp AEAM writes is UTC (`datetime.now(tz=timezone.utc)`), but
+ * they reach the browser in two different shapes:
+ *
+ *   - `incidents.timestamp` is a TEXT column, so it keeps its offset:
+ *     "2026-07-30T17:09:01.644833+00:00"  → parsed correctly.
+ *   - `review_verdicts.created_at`, `incident_approvals.created_at` and
+ *     `action_logs.executed_at` are real TIMESTAMP columns, and Postgres
+ *     returns them WITHOUT a zone marker: "2026-07-31 10:46:42.818655".
+ *
+ * `new Date()` parses that second form as LOCAL time per ECMA-262, so every
+ * one of those timestamps was shifted by the viewer's UTC offset. Observed:
+ * a verdict recorded seconds earlier rendered as "6h ago" in a UTC+5:30
+ * browser — the platform appearing to misreport its own audit trail.
+ *
+ * Normalising here fixes every caller at once (fmtTime, fmtRelative and the
+ * chart bucketing all route through it) rather than patching each surface.
+ */
+export function parseTs(ts) {
+  if (ts == null || ts === "") return null;
+  if (ts instanceof Date) return ts;
+  const raw = String(ts).trim();
+  // Already carries a zone designator (Z, +HH:MM, -HH:MM) → parse as-is.
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(raw);
+  // "YYYY-MM-DD HH:MM:SS[.ffffff]" — a zone-less SQL timestamp. Convert the
+  // space separator to 'T' and pin it to UTC, which is what it actually is.
+  const normalised = hasZone ? raw : `${raw.replace(" ", "T")}Z`;
+  const d = new Date(normalised);
+  return isNaN(d.getTime()) ? null : d;
+}
+
 export function fmtTime(ts) {
   if (!ts) return "—";
-  try {
-    return new Date(ts).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
-  } catch {
-    return String(ts);
-  }
+  const d = parseTs(ts);
+  if (!d) return String(ts);
+  return d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 }
 
 export function fmtRelative(ts) {
   if (!ts) return "—";
-  const then = new Date(ts).getTime();
-  if (isNaN(then)) return String(ts);
-  const secs = Math.max(0, Math.round((Date.now() - then) / 1000));
+  const d = parseTs(ts);
+  if (!d) return String(ts);
+  const secs = Math.max(0, Math.round((Date.now() - d.getTime()) / 1000));
   if (secs < 60) return `${secs}s ago`;
   if (secs < 3600) return `${Math.round(secs / 60)}m ago`;
   if (secs < 86400) return `${Math.round(secs / 3600)}h ago`;
   return `${Math.round(secs / 86400)}d ago`;
+}
+
+/**
+ * Turn a raw Prometheus series into something a human can read.
+ *
+ * `/metrics` exposes machine names — "agent_execution_time_seconds_sum{agent=
+ * "supervisor"}" — and the console rendered them verbatim next to a bare
+ * "0.0264", with no unit and no column header. Correct, and close to
+ * unreadable: nothing said whether 0.0264 was seconds, a count, or a ratio.
+ *
+ * This is a DISPLAY transform only. The raw series name is returned as
+ * `raw` so it can stay in the tooltip — the machine truth is never hidden,
+ * just no longer the only thing shown.
+ */
+export function humanizeMetric(key, value) {
+  const raw = String(key ?? "");
+  const labelMatch = raw.match(/\{(.+)\}$/);
+  const base = raw.replace(/\{.*\}$/, "");
+  // agent="supervisor" → "supervisor"; keeps multiple labels comma-joined.
+  const context = labelMatch
+    ? labelMatch[1].split(",").map((p) => p.split("=")[1]?.replace(/"/g, "").trim()).filter(Boolean).join(" · ")
+    : null;
+
+  const isSeconds = /_seconds(_sum|_count)?$/.test(base);
+  const isCount = /_(count|total)$/.test(base);
+  const isSum = /_sum$/.test(base);
+
+  let name = base
+    .replace(/_seconds(_sum|_count)?$/, "")
+    .replace(/_(count|total)$/, "")
+    .replace(/_/g, " ")
+    .trim();
+  name = name.charAt(0).toUpperCase() + name.slice(1);
+  if (isSum) name += " (total)";
+  else if (isCount) name += " (count)";
+
+  const num = typeof value === "number" ? value : Number(value);
+  let display;
+  if (isNaN(num)) display = String(value);
+  else if (isSeconds) {
+    display = num >= 1 ? `${num.toFixed(2)} s` : `${Math.round(num * 1000)} ms`;
+  } else if (Number.isInteger(num)) display = num.toLocaleString();
+  else display = num.toFixed(2);
+
+  return { raw, label: name, context, display };
 }
 
 export function fmtPct(v) {
@@ -651,7 +727,7 @@ export function getMetadataFilterApplied(incident) {
  * come from real observability rates; anything unrecorded stays undefined so
  * the mesh renders "no recorded activity" instead of inventing one.
  */
-export function buildMeshLive(incidents = [], observability = null, mesh = null) {
+export function buildMeshLive(incidents = [], observability = null, mesh = null, monitorCheck = null) {
   const types = {
     memory: "memory", policy: "policy", cross: "cross_dataset", adaptive: "adaptive",
     retrieval: "rag", plan: "execution_plan", explain: "explainability",
@@ -666,8 +742,28 @@ export function buildMeshLive(incidents = [], observability = null, mesh = null)
       if (lastSeen[key] == null && present.has(t)) lastSeen[key] = inc.timestamp;
     }
     if (lastSeen.action == null && (getAuditSummary(inc)?.executed_actions || []).length) lastSeen.action = inc.timestamp;
-    if (lastSeen.monitor == null) lastSeen.monitor = inc.timestamp;
   }
+  // Hardening pass — the Monitor node used to be derived as
+  // `lastSeen.monitor = inc.timestamp` for ANY incident, and its state as
+  // `!!latest` (i.e. "active" whenever a single incident exists anywhere).
+  // Both were wrong in the same direction: every incident on this deployment
+  // arrived through POST /api/v1/trigger, and MonitorAgent has never run
+  // (ENABLE_MONITOR_AGENT=false). The panel therefore reported
+  // "Monitor Agent — active, last activity 9h ago" while the StatusBar two
+  // inches below correctly reported "disabled". Manual triggers are not
+  // evidence that the autonomous watcher is running.
+  //
+  // The monitor node now reads the SAME /health check the StatusBar does, so
+  // the two cannot disagree. `monitorCheck` is the raw string
+  // (e.g. "disabled (ENABLE_MONITOR_AGENT=false)" | "ok (last heartbeat 4s ago)").
+  const monitorRaw = String(monitorCheck ?? "").toLowerCase();
+  const monitorState = !monitorRaw
+    ? "unknown"
+    : monitorRaw.startsWith("disabled") ? "disabled"
+    : monitorRaw.startsWith("stale") ? "degraded"
+    : monitorRaw.startsWith("ok") ? "active"
+    : monitorRaw.startsWith("starting") ? "standby"
+    : "unknown";
   const rate = (m, label = "hit rate") =>
     observability?.[m]?.available ? `${Math.round(observability[m].rate * 100)}% ${label}` : undefined;
   const trendAvg = (m, label) =>
@@ -682,10 +778,9 @@ export function buildMeshLive(incidents = [], observability = null, mesh = null)
       ? `${Math.round(observability.overall_ai_health.score * 100)}% AI health` : undefined,
   };
   const out = {};
-  for (const key of ["monitor", "memory", "policy", "cross", "adaptive", "retrieval", "plan", "explain", "eval", "observe", "report", "action"]) {
+  for (const key of ["memory", "policy", "cross", "adaptive", "retrieval", "plan", "explain", "eval", "observe", "report", "action"]) {
     const activeNow =
-      key === "monitor" ? !!latest
-      : key === "action" ? !!(latest && (getAuditSummary(latest)?.executed_actions || []).length)
+      key === "action" ? !!(latest && (getAuditSummary(latest)?.executed_actions || []).length)
       : key === "observe" ? !!observability
       : latestTypes.has(types[key]);
     out[key] = {
@@ -696,6 +791,18 @@ export function buildMeshLive(incidents = [], observability = null, mesh = null)
         : lastSeen[key] ? fmtRelative(lastSeen[key]) : undefined,
     };
   }
+
+  // The Monitor node, from the real supervision signal (see the note above).
+  out.monitor = {
+    state: monitorState,
+    health: monitorState === "disabled" ? "not running" : undefined,
+    lastActivity:
+      monitorState === "disabled"
+        ? "never — ENABLE_MONITOR_AGENT=false"
+        : monitorState === "unknown"
+        ? "health not reported"
+        : monitorCheck,
+  };
   // Policy Intelligence runs at DOCUMENT INGESTION time, not per incident —
   // stated honestly rather than pretending an incident-level signal exists.
   out.policy_intel = { state: "standby", lastActivity: "runs at document ingestion" };

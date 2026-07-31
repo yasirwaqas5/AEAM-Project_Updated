@@ -122,33 +122,76 @@ export function ProgressRing({ value, size = 96, stroke = 7, color, label, subla
 }
 
 /* ─── BarTrend — daily/bucketed bar chart with rise-in + hover tooltip ───── */
-export function BarTrend({ buckets = [], color = "var(--accent)", height = 120, valueLabel = "events" }) {
+export function BarTrend({ buckets = [], color = "var(--accent)", height = 120, valueLabel = "events", caption = null }) {
+  // Hover state drives a styled in-chart readout. The previous implementation
+  // relied on the native `title` attribute, which takes ~1s to appear, cannot
+  // be styled, and was carrying the axis label ("7/30") rather than a full
+  // date — so a bar told you almost nothing on hover.
+  const [hover, setHover] = useState(null);
   const max = Math.max(...buckets.map((b) => b.count), 1);
   if (!buckets.length) return <span style={{ color: "var(--faint)", fontSize: "var(--fs-xs)" }}>No data in range.</span>;
+
+  const active = hover != null ? buckets[hover] : null;
+
   return (
-    <div style={{ display: "flex", alignItems: "flex-end", gap: 4, height, padding: "4px 0" }}>
-      {buckets.map((b, i) => (
-        <div key={b.label ?? i} title={`${b.label}: ${b.count} ${valueLabel}`}
-          style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 5, minWidth: 0, height: "100%", justifyContent: "flex-end" }}>
-          <div style={{
-            width: "100%", maxWidth: 26, borderRadius: "4px 4px 2px 2px",
-            height: `${Math.max(3, (b.count / max) * 82)}%`,
-            background: b.count === 0 ? "var(--surface-3)"
-              : `linear-gradient(180deg, ${color}, color-mix(in srgb, ${color} 45%, transparent))`,
-            boxShadow: b.count > 0 ? `0 0 8px color-mix(in srgb, ${color} 25%, transparent)` : "none",
-            animation: prefersReduced() ? "none" : "aeamRise .55s var(--ease-out) backwards",
-            animationDelay: `${i * 28}ms`,
-            transition: "filter var(--t-fast)",
-          }}
-            onMouseEnter={(e) => (e.currentTarget.style.filter = "brightness(1.25)")}
-            onMouseLeave={(e) => (e.currentTarget.style.filter = "")} />
-          {b.label != null && (
-            <span style={{ fontSize: "var(--fs-2xs)", color: "var(--faint)", fontFamily: "var(--font-mono)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "100%" }}>
-              {b.label}
-            </span>
-          )}
-        </div>
-      ))}
+    <div>
+      {/* Caption + live readout share one row: the caption (e.g. the month
+          range) sits top-left as a permanent axis legend, and the hovered
+          bucket's detail replaces the right side on hover. */}
+      <div style={{
+        display: "flex", justifyContent: "space-between", alignItems: "baseline",
+        gap: 12, marginBottom: 6, minHeight: 18,
+      }}>
+        {caption && (
+          <span style={{ fontSize: "var(--fs-2xs)", color: "var(--muted)", fontFamily: "var(--font-mono)", letterSpacing: ".04em" }}>
+            {caption}
+          </span>
+        )}
+        <span style={{
+          fontSize: "var(--fs-2xs)", fontFamily: "var(--font-mono)", marginLeft: "auto",
+          color: active ? "var(--text-2)" : "var(--faint)",
+          transition: "color var(--t-fast)", whiteSpace: "nowrap",
+        }}>
+          {active
+            ? `${active.tooltip ?? active.label} · ${active.count} ${valueLabel}`
+            : "hover a bar for detail"}
+        </span>
+      </div>
+
+      <div style={{ display: "flex", alignItems: "flex-end", gap: 4, height, padding: "4px 0" }}>
+        {buckets.map((b, i) => (
+          <div
+            key={b.key ?? b.label ?? i}
+            onMouseEnter={() => setHover(i)}
+            onMouseLeave={() => setHover((h) => (h === i ? null : h))}
+            style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 5, minWidth: 0, height: "100%", justifyContent: "flex-end", cursor: "default" }}
+          >
+            <div style={{
+              width: "100%", maxWidth: 26, borderRadius: "4px 4px 2px 2px",
+              height: `${Math.max(3, (b.count / max) * 82)}%`,
+              background: b.count === 0 ? "var(--surface-3)"
+                : `linear-gradient(180deg, ${color}, color-mix(in srgb, ${color} 45%, transparent))`,
+              boxShadow: b.count > 0 ? `0 0 8px color-mix(in srgb, ${color} 25%, transparent)` : "none",
+              animation: prefersReduced() ? "none" : "aeamRise .55s var(--ease-out) backwards",
+              animationDelay: `${i * 28}ms`,
+              transition: "filter var(--t-fast), outline-color var(--t-fast)",
+              filter: hover === i ? "brightness(1.3)" : "none",
+              outline: hover === i ? `1px solid color-mix(in srgb, ${color} 60%, transparent)` : "1px solid transparent",
+              outlineOffset: 2,
+            }} />
+            {b.label != null && (
+              <span style={{
+                fontSize: "var(--fs-2xs)",
+                color: hover === i ? "var(--text-2)" : "var(--faint)",
+                fontFamily: "var(--font-mono)", overflow: "hidden", textOverflow: "ellipsis",
+                whiteSpace: "nowrap", maxWidth: "100%", transition: "color var(--t-fast)",
+              }}>
+                {b.label}
+              </span>
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
